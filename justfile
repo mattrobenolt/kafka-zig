@@ -30,7 +30,12 @@ fmt-check:
 [doc("Run ziglint")]
 [group("lint")]
 lint:
-    ziglint
+    # Z017: `return try` is not redundant when the return type is an optional
+    # error-union (e.g. `!?[]const u8`) and the callee returns `![]const u8` —
+    # the `try` unwraps so the payload coerces to the optional.
+    # Z023: method receivers (`self`) must come first; the rule does not
+    # exempt receivers, so `deinit(self, allocator)` is a false positive.
+    ziglint --ignore Z017 --ignore Z023
 
 [doc("Build the library and CLI")]
 [group("build")]

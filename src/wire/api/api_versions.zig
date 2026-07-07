@@ -80,9 +80,11 @@ pub const Request = struct {
 ///   api_keys: nullable COMPACT_ARRAY of { api_key: INT16, min_version: INT16, max_version: INT16, TAG_BUFFER }
 ///   throttle_time_ms: INT32
 ///   TAG_BUFFER — contains v3 tagged fields:
-///     tag 0: supported_features (COMPACT_ARRAY of { name: COMPACT_STRING, min_version: INT16, max_version: INT16, TAG_BUFFER })
+///     tag 0: supported_features (COMPACT_ARRAY of
+///        { name: COMPACT_STRING, min_version: INT16, max_version: INT16, TAG_BUFFER })
 ///     tag 1: finalized_features_epoch (INT64)
-///     tag 2: finalized_features (COMPACT_ARRAY of { name: COMPACT_STRING, max_version_level: INT16, min_version_level: INT16, TAG_BUFFER })
+///     tag 2: finalized_features (COMPACT_ARRAY of
+///        { name: COMPACT_STRING, max_version_level: INT16, min_version_level: INT16, TAG_BUFFER })
 ///     tag 3: zk_migration_ready (BOOLEAN)
 ///
 /// The v3 tagged fields are null when absent from the tag buffer (a broker
@@ -107,6 +109,7 @@ pub const Response = struct {
             for (ff) |f| allocator.free(f.name);
             allocator.free(ff);
         }
+        self.* = undefined;
     }
 };
 

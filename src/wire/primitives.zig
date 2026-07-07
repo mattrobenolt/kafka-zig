@@ -35,7 +35,7 @@ pub fn readInt(reader: *Reader, comptime T: type) error{EndOfStream}!T {
 }
 
 /// Write a big-endian integer of type `T` to `writer`.
-pub fn writeInt(writer: *std.Io.Writer, comptime T: type, value: T) std.Io.Writer.Error!void {
+pub fn writeInt(comptime T: type, writer: *std.Io.Writer, value: T) std.Io.Writer.Error!void {
     try writer.writeInt(T, value, be);
 }
 
@@ -62,10 +62,10 @@ pub fn readU16(r: *Reader) error{EndOfStream}!u16 {
     return readInt(r, u16);
 }
 pub fn writeI16(w: *std.Io.Writer, v: i16) std.Io.Writer.Error!void {
-    try writeInt(w, u16, @bitCast(v));
+    try writeInt(u16, w, @bitCast(v));
 }
 pub fn writeU16(w: *std.Io.Writer, v: u16) std.Io.Writer.Error!void {
-    try writeInt(w, u16, v);
+    try writeInt(u16, w, v);
 }
 
 pub fn readI32(r: *Reader) error{EndOfStream}!i32 {
@@ -75,17 +75,17 @@ pub fn readU32(r: *Reader) error{EndOfStream}!u32 {
     return readInt(r, u32);
 }
 pub fn writeI32(w: *std.Io.Writer, v: i32) std.Io.Writer.Error!void {
-    try writeInt(w, u32, @bitCast(v));
+    try writeInt(u32, w, @bitCast(v));
 }
 pub fn writeU32(w: *std.Io.Writer, v: u32) std.Io.Writer.Error!void {
-    try writeInt(w, u32, v);
+    try writeInt(u32, w, v);
 }
 
 pub fn readI64(r: *Reader) error{EndOfStream}!i64 {
     return @bitCast(try readInt(r, u64));
 }
 pub fn writeI64(w: *std.Io.Writer, v: i64) std.Io.Writer.Error!void {
-    try writeInt(w, u64, @bitCast(v));
+    try writeInt(u64, w, @bitCast(v));
 }
 
 // ---------------------------------------------------------------------------
@@ -246,7 +246,7 @@ pub fn varlongSize(value: i64) usize {
 pub fn readString(r: *Reader) error{ EndOfStream, Malformed }![]const u8 {
     const len = try readI16(r);
     if (len < 0) return error.Malformed;
-    return try r.readSlice(@intCast(len));
+    return r.readSlice(@intCast(len));
 }
 
 /// Like `readString` but distinguishes null from empty. Returns `null` only
@@ -284,7 +284,7 @@ pub fn readCompactString(r: *Reader) error{ EndOfStream, Malformed }![]const u8 
     const len_plus_one = try readUvarint(r);
     if (len_plus_one == 0) return error.Malformed;
     const len: usize = @intCast(len_plus_one - 1);
-    return try r.readSlice(len);
+    return r.readSlice(len);
 }
 
 /// Nullable compact string. Returns `null` only for `len_plus_one == 0`;
@@ -321,7 +321,7 @@ pub fn writeNullableCompactString(w: *std.Io.Writer, s: ?[]const u8) std.Io.Writ
 pub fn readBytes(r: *Reader) error{ EndOfStream, Malformed }![]const u8 {
     const len = try readI32(r);
     if (len < 0) return error.Malformed;
-    return try r.readSlice(@intCast(len));
+    return r.readSlice(@intCast(len));
 }
 
 /// Nullable bytes. Returns `null` only for length exactly -1; any other
@@ -357,7 +357,7 @@ pub fn readCompactBytes(r: *Reader) error{ EndOfStream, Malformed }![]const u8 {
     const len_plus_one = try readUvarint(r);
     if (len_plus_one == 0) return error.Malformed;
     const len: usize = @intCast(len_plus_one - 1);
-    return try r.readSlice(len);
+    return r.readSlice(len);
 }
 
 /// Nullable compact bytes. Returns `null` only for `len_plus_one == 0`.
@@ -585,7 +585,7 @@ pub const Reader = struct {
 fn roundtripInt(comptime T: type, value: T) !void {
     var buf: [16]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    try writeInt(&w, T, value);
+    try writeInt(T, &w, value);
     var r: Reader = .init(w.buffered());
     try testing.expectEqual(value, try readInt(&r, T));
 }

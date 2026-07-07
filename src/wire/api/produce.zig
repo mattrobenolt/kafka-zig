@@ -113,6 +113,7 @@ pub const PartitionResponse = struct {
         }
         allocator.free(self.record_errors);
         if (self.error_message) |msg| allocator.free(msg);
+        self.* = undefined;
     }
 };
 
@@ -125,6 +126,7 @@ pub const TopicResponse = struct {
         allocator.free(self.name);
         for (self.partition_responses) |*p| p.deinit(allocator);
         allocator.free(self.partition_responses);
+        self.* = undefined;
     }
 };
 
@@ -136,6 +138,7 @@ pub const Response = struct {
     pub fn deinit(self: *Response, allocator: std.mem.Allocator) void {
         for (self.responses) |*t| t.deinit(allocator);
         allocator.free(self.responses);
+        self.* = undefined;
     }
 };
 

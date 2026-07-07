@@ -113,10 +113,10 @@ pub const Compression = enum(u3) {
 };
 
 /// Attributes field bit positions.
-pub const ATTR_TIMESTAMP_TYPE: u16 = 1 << 3;
-pub const ATTR_TRANSACTIONAL: u16 = 1 << 4;
-pub const ATTR_CONTROL: u16 = 1 << 5;
-pub const ATTR_DELETE_HORIZON: u16 = 1 << 6;
+pub const attr_timestamp_type: u16 = 1 << 3;
+pub const attr_transactional: u16 = 1 << 4;
+pub const attr_control: u16 = 1 << 5;
+pub const attr_delete_horizon: u16 = 1 << 6;
 
 /// A decoded v2 record batch. Owned data (records, keys, values, headers) is
 /// allocated by `decodeBatch`. Call `deinit` to free.
@@ -143,6 +143,7 @@ pub const Batch = struct {
             allocator.free(r.headers);
         }
         allocator.free(self.records);
+        self.* = undefined;
     }
 
     /// The compression codec from the attributes field (bits 0–2).
@@ -152,12 +153,12 @@ pub const Batch = struct {
 
     /// Whether the batch is transactional (bit 4).
     pub fn isTransactional(self: Batch) bool {
-        return (self.attributes & ATTR_TRANSACTIONAL) != 0;
+        return (self.attributes & attr_transactional) != 0;
     }
 
     /// Whether this is a control batch (bit 5).
     pub fn isControl(self: Batch) bool {
-        return (self.attributes & ATTR_CONTROL) != 0;
+        return (self.attributes & attr_control) != 0;
     }
 };
 
@@ -257,7 +258,12 @@ pub fn encodeBatch(
         const uncompressed = written[records_region_off..];
         // Scratch is a documented caller contract for a compressed batch.
         const scratch = options.scratch.?;
-        const clen = compress.compress(codec, uncompressed, scratch, options.compression_level) catch |err| switch (err) {
+        const clen = compress.compress(
+            codec,
+            uncompressed,
+            scratch,
+            options.compression_level,
+        ) catch |err| switch (err) {
             error.NotImplemented => return error.CompressionNotImplemented,
             error.BufferTooSmall => return error.BufferTooSmall,
             error.CompressionFailed => return error.CompressionFailed,

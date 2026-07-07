@@ -9,7 +9,7 @@ const scram = @import("scram.zig");
 /// Incremental PBKDF2 state machine, generic over the HMAC type.
 pub const Pbkdf2 = @import("pbkdf2.zig").Pbkdf2;
 
-/// Generic SCRAM client constructor: `Scram(mechanism_name, Hmac, Sha)`.
+/// Generic SCRAM client constructor: `Scram(Hmac, Sha, mechanism_name)`.
 pub const Scram = scram.Scram;
 /// SCRAM-SHA-256 (RFC 7677).
 pub const ScramSha256 = scram.ScramSha256;

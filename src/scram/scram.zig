@@ -33,6 +33,7 @@ const mem = std.mem;
 const base64 = std.base64;
 const assert = std.debug.assert;
 
+const pbkdf2_mod = @import("pbkdf2.zig");
 const encoder = base64.standard.Encoder;
 const decoder = base64.standard.Decoder;
 
@@ -60,7 +61,7 @@ pub const Error = error{
 ///   ServerSignature = HMAC(ServerKey, AuthMessage)
 /// where AuthMessage = client-first-bare + "," + server-first + "," +
 /// client-final-without-proof.
-pub fn Scram(comptime mechanism_name: []const u8, comptime Hmac: type, comptime Sha: type) type {
+pub fn Scram(comptime Hmac: type, comptime Sha: type, comptime mechanism_name: []const u8) type {
     return struct {
         const Self = @This();
 
@@ -72,7 +73,7 @@ pub fn Scram(comptime mechanism_name: []const u8, comptime Hmac: type, comptime 
         pub const mechanism = mechanism_name;
 
         /// Incremental PBKDF2 state machine for this hash.
-        pub const Pbkdf2 = @import("pbkdf2.zig").Pbkdf2(Hmac);
+        pub const Pbkdf2 = pbkdf2_mod.Pbkdf2(Hmac);
 
         /// Digest length in bytes (32 for SHA-256, 64 for SHA-512).
         pub const hash_len = Sha.digest_length;
@@ -319,16 +320,16 @@ pub fn Scram(comptime mechanism_name: []const u8, comptime Hmac: type, comptime 
 
 /// SCRAM-SHA-256 (RFC 7677).
 pub const ScramSha256 = Scram(
-    "SCRAM-SHA-256",
     std.crypto.auth.hmac.sha2.HmacSha256,
     std.crypto.hash.sha2.Sha256,
+    "SCRAM-SHA-256",
 );
 
 /// SCRAM-SHA-512 (RFC 5802 construction over SHA-512; supported by Kafka).
 pub const ScramSha512 = Scram(
-    "SCRAM-SHA-512",
     std.crypto.auth.hmac.sha2.HmacSha512,
     std.crypto.hash.sha2.Sha512,
+    "SCRAM-SHA-512",
 );
 
 // --- shared byte-building helpers (no heap) ---

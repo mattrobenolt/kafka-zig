@@ -89,6 +89,7 @@ pub const Response = struct {
         if (self.cluster_id) |cid| allocator.free(cid);
         for (self.topics) |*t| t.deinit(allocator);
         allocator.free(self.topics);
+        self.* = undefined;
     }
 
     pub const Broker = struct {
@@ -100,6 +101,7 @@ pub const Response = struct {
         pub fn deinit(self: *Broker, allocator: std.mem.Allocator) void {
             allocator.free(self.host);
             if (self.rack) |r| allocator.free(r);
+            self.* = undefined;
         }
     };
 
@@ -116,6 +118,7 @@ pub const Response = struct {
             allocator.free(self.replica_nodes);
             allocator.free(self.isr_nodes);
             allocator.free(self.offline_replicas);
+            self.* = undefined;
         }
     };
 
@@ -131,6 +134,7 @@ pub const Response = struct {
             if (self.name) |n| allocator.free(n);
             for (self.partitions) |*p| p.deinit(allocator);
             allocator.free(self.partitions);
+            self.* = undefined;
         }
     };
 };
