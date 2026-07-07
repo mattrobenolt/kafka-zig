@@ -414,11 +414,33 @@ pub fn writeNullableCompactArrayCount(w: *std.Io.Writer, count: ?usize) std.Io.W
 // Tagged fields (flexible-version empty buffer)
 // ---------------------------------------------------------------------------
 
+/// A single tagged field: a tag ID and its raw data bytes. The data slice
+/// is borrowed from the reader's buffer — no allocation. Used by
+/// `readTaggedFields` to extract fields that the protocol spec marks with
+/// `<tag: N>` (flexible-version optional fields encoded in the TAG_BUFFER
+/// rather than inline). Spec: KIP-482.
+pub const TaggedField = struct {
+    tag: u64,
+    data: []const u8,
+};
+
 /// Kafka `TAG_BUFFER`: uvarint count of tagged fields followed by the
 /// fields. For now we only need the empty case (count = 0 → `0x00`), which
 /// is what a non-tagged struct emits. Spec: KIP-482.
 pub fn writeEmptyTagBuffer(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeByte(0x00);
+}
+
+/// Write a tag buffer containing the given tagged fields. Each field is
+/// encoded as uvarint(tag), uvarint(data.len), then the raw data bytes.
+/// Spec: KIP-482 — tagged fields in the TAG_BUFFER.
+pub fn writeTagBuffer(w: *std.Io.Writer, fields: []const TaggedField) std.Io.Writer.Error!void {
+    try writeUvarint(w, fields.len);
+    for (fields) |f| {
+        try writeUvarint(w, f.tag);
+        try writeUvarint(w, f.data.len);
+        try w.writeAll(f.data);
+    }
 }
 
 pub fn readTagBuffer(r: *Reader) error{ EndOfStream, Malformed }!void {
@@ -435,6 +457,38 @@ pub fn readTagBuffer(r: *Reader) error{ EndOfStream, Malformed }!void {
         if (len > std.math.maxInt(usize)) return error.Malformed;
         try r.skip(@intCast(len));
     }
+}
+
+/// Read tagged fields into a caller-provided buffer. Returns the number of
+/// tagged fields read. The `data` slices in `out` point into the reader's
+/// buffer (borrowed, valid until the reader's underlying buffer is freed).
+/// If the tag buffer contains more fields than `out` can hold, returns
+/// `error.Malformed` (the caller should size `out` to the expected maximum).
+///
+/// No allocation — the caller owns the `out` buffer. Use `findTaggedField`
+/// to look up a specific tag by ID. Spec: KIP-482 — tagged fields.
+pub fn readTaggedFields(r: *Reader, out: []TaggedField) error{ EndOfStream, Malformed }!usize {
+    const count = try readUvarint(r);
+    if (count > out.len) return error.Malformed;
+    var i: u64 = 0;
+    while (i < count) : (i += 1) {
+        const tag = try readUvarint(r);
+        const len = try readUvarint(r);
+        if (len > std.math.maxInt(usize)) return error.Malformed;
+        const data = try r.readSlice(@intCast(len));
+        out[@intCast(i)] = .{ .tag = tag, .data = data };
+    }
+    return @intCast(count);
+}
+
+/// Find a tagged field by tag ID in a slice returned by `readTaggedFields`.
+/// Returns the field's raw data bytes (borrowed from the reader's buffer), or
+/// null if the tag is not present.
+pub fn findTaggedField(fields: []const TaggedField, tag: u64) ?[]const u8 {
+    for (fields) |f| {
+        if (f.tag == tag) return f.data;
+    }
+    return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -820,6 +874,60 @@ test "empty tag buffer is 0x00" {
     var r: Reader = .init(w.buffered());
     try readTagBuffer(&r);
     try testing.expectEqual(@as(usize, 0), r.remaining().len);
+}
+
+test "writeTagBuffer with fields round-trips via readTaggedFields" {
+    // Two tagged fields: tag 0 with data [0x01, 0x02], tag 3 with data [0xff].
+    var buf: [16]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const fields = [_]TaggedField{
+        .{ .tag = 0, .data = &.{ 0x01, 0x02 } },
+        .{ .tag = 3, .data = &.{0xff} },
+    };
+    try writeTagBuffer(&w, &fields);
+
+    var r: Reader = .init(w.buffered());
+    var out: [4]TaggedField = undefined;
+    const n = try readTaggedFields(&r, &out);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(@as(u64, 0), out[0].tag);
+    try testing.expectEqualSlices(u8, &.{ 0x01, 0x02 }, out[0].data);
+    try testing.expectEqual(@as(u64, 3), out[1].tag);
+    try testing.expectEqualSlices(u8, &.{0xff}, out[1].data);
+    try testing.expectEqual(@as(usize, 0), r.remaining().len);
+}
+
+test "findTaggedField returns the right field" {
+    const fields = [_]TaggedField{
+        .{ .tag = 0, .data = &.{ 0x01, 0x02 } },
+        .{ .tag = 3, .data = &.{0xff} },
+    };
+    try testing.expectEqualSlices(u8, &.{ 0x01, 0x02 }, findTaggedField(&fields, 0).?);
+    try testing.expectEqualSlices(u8, &.{0xff}, findTaggedField(&fields, 3).?);
+    try testing.expectEqual(@as(?[]const u8, null), findTaggedField(&fields, 99));
+}
+
+test "readTaggedFields returns Malformed when out is too small" {
+    // Tag buffer with 3 fields, but out only has room for 2.
+    var buf: [32]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const fields = [_]TaggedField{
+        .{ .tag = 0, .data = &.{0x01} },
+        .{ .tag = 1, .data = &.{0x02} },
+        .{ .tag = 2, .data = &.{0x03} },
+    };
+    try writeTagBuffer(&w, &fields);
+
+    var r: Reader = .init(w.buffered());
+    var out: [2]TaggedField = undefined;
+    try testing.expectError(error.Malformed, readTaggedFields(&r, &out));
+}
+
+test "readTaggedFields with empty tag buffer returns 0" {
+    var r: Reader = .init(&.{0x00});
+    var out: [4]TaggedField = undefined;
+    const n = try readTaggedFields(&r, &out);
+    try testing.expectEqual(@as(usize, 0), n);
 }
 
 // --- reader ----------------------------------------------------------------

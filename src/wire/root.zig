@@ -10,6 +10,8 @@ pub const primitives = @import("primitives.zig");
 pub const frame = @import("frame.zig");
 pub const api_keys = @import("api/api_keys.zig");
 pub const metadata = @import("api/metadata.zig");
+pub const api_versions = @import("api/api_versions.zig");
+pub const sasl = @import("api/sasl.zig");
 
 test {
     std.testing.refAllDecls(@This());
