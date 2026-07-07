@@ -32,4 +32,4 @@ Read [`PLAN.md`](PLAN.md) for the design and phased roadmap.
 
 ## License
 
-TBD.
+Apache License 2.0; see [LICENSE](LICENSE).
