@@ -968,3 +968,37 @@ test "decode response v3: unknown tagged field alongside knowns (KIP-482 forward
     // The unknown tag was consumed — nothing remains in the buffer.
     try testing.expectEqual(@as(usize, 0), r.remaining().len);
 }
+
+// ---------------------------------------------------------------------------
+// Fuzz target
+// ---------------------------------------------------------------------------
+
+const api_versions_response_corpus: []const []const u8 = &.{
+    &.{}, // empty
+    // Two api_keys, no v3 features (empty tag buffer).
+    &.{
+        0x00, 0x00, // error_code = 0
+        0x03, // api_keys: compact array, count=2
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x09, 0x00, // Produce: key=0, min=0, max=9, tag=0x00
+        0x00, 0x03, 0x00, 0x00, 0x00, 0x0c, 0x00, // Metadata: key=3, min=0, max=12, tag=0x00
+        0x00, 0x00, 0x00, 0x00, // throttle_time_ms = 0
+        0x00, // trailing tag buffer (empty)
+    },
+    // Truncated mid-api_keys.
+    &.{ 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09 },
+    &([_]u8{0xff} ** 64), // all ones
+    &([_]u8{0x00} ** 64), // all zeros
+};
+
+test "fuzz ApiVersions v3 decodeResponse" {
+    try std.testing.fuzz(std.testing.allocator, fuzzApiVersionsResponse, .{ .corpus = api_versions_response_corpus });
+}
+
+fn fuzzApiVersionsResponse(allocator: std.mem.Allocator, input: []const u8) !void {
+    var r: Reader = .init(input);
+    var resp = decodeResponse(allocator, &r) catch |err| switch (err) {
+        error.EndOfStream, error.Malformed, error.OutOfMemory => return,
+        else => return err,
+    };
+    defer resp.deinit(allocator);
+}

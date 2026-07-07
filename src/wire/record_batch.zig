@@ -1126,3 +1126,118 @@ test "encodeBatch: zero heap allocation — bounded by caller buffer" {
     // the BufferTooSmall bound above are the guarantee — there is no heap
     // fallback for it to reach.)
 }
+
+// ---------------------------------------------------------------------------
+// Fuzz target
+// ---------------------------------------------------------------------------
+
+const record_batch_corpus: []const []const u8 = &.{
+    &.{}, // empty
+    // Valid 72-byte single-record batch from the hand-constructed fixture.
+    &.{
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // baseOffset = 0
+        0x00, 0x00, 0x00, 0x3c, // batchLength = 60
+        0xff, 0xff, 0xff, 0xff, // partitionLeaderEpoch = -1
+        0x02, // magic = 2
+        0xe1, 0x1f, 0x09, 0xe7, // crc32c
+        0x00, 0x00, // attributes = 0
+        0x00, 0x00, 0x00, 0x00, // lastOffsetDelta = 0
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // baseTimestamp = 0
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // maxTimestamp = 0
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // producerId = -1
+        0xff, 0xff, // producerEpoch = -1
+        0xff, 0xff, 0xff, 0xff, // baseSequence = -1
+        0x00, 0x00, 0x00, 0x01, // recordsCount = 1
+        0x14, // record length = 10
+        0x00, // record attributes = 0
+        0x00, // timestampDelta = 0
+        0x00, // offsetDelta = 0
+        0x04, 0x6b, 0x31, // keyLength=2, key="k1"
+        0x04, 0x76, 0x31, // valueLength=2, value="v1"
+        0x00, // headersCount = 0
+    },
+    // Truncated after batchLength.
+    &.{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3c },
+    // Bad magic: same as valid fixture but magic byte set to 0x01.
+    &.{
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x3c, 0xff, 0xff, 0xff, 0xff,
+        0x01, // magic = 1 (bad)
+        0xe1,
+        0x1f,
+        0x09,
+        0xe7,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0x00,
+        0x00,
+        0x00,
+        0x01,
+        0x14,
+        0x00,
+        0x00,
+        0x00,
+        0x04,
+        0x6b,
+        0x31,
+        0x04,
+        0x76,
+        0x31,
+        0x00,
+    },
+    &([_]u8{0x00} ** 64), // all zeros
+    &([_]u8{0xff} ** 64), // all ones
+};
+
+test "fuzz record_batch decodeBatch" {
+    try std.testing.fuzz(std.testing.allocator, fuzzDecodeBatch, .{ .corpus = record_batch_corpus });
+}
+
+fn fuzzDecodeBatch(allocator: std.mem.Allocator, input: []const u8) !void {
+    var r: Reader = .init(input);
+    var batch = decodeBatch(allocator, &r) catch |err| switch (err) {
+        error.EndOfStream,
+        error.Malformed,
+        error.CrcMismatch,
+        error.BadMagic,
+        error.CompressionNotImplemented,
+        error.OutOfMemory,
+        => return,
+        else => return err,
+    };
+    defer batch.deinit(allocator);
+}

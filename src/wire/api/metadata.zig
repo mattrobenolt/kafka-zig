@@ -1126,3 +1126,58 @@ test "TopicRequest.byName produces zero topic_id" {
     try testing.expectEqualSlices(u8, &@as(Uuid, @splat(0)), &t.topic_id);
     try testing.expectEqualStrings("events", t.name.?);
 }
+
+// ---------------------------------------------------------------------------
+// Fuzz target
+// ---------------------------------------------------------------------------
+
+const metadata_response_corpus: []const []const u8 = &.{
+    &.{}, // empty
+    // Minimal valid cluster: 1 broker, 1 topic, 1 partition.
+    &.{
+        0x00, 0x00, 0x00, 0x00, // throttle_time_ms = 0
+        0x02, // brokers: count=1
+        0x00, 0x00, 0x00, 0x01, // broker[0] node_id = 1
+        0x0a, 0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x68, 0x6f, 0x73, 0x74, // host = "localhost"
+        0x00, 0x00, 0x23, 0x84, // port = 9092
+        0x00, // rack = null
+        0x00, // broker tag buffer
+        0x00, // cluster_id = null
+        0x00, 0x00, 0x00, 0x01, // controller_id = 1
+        0x02, // topics: count=1
+        0x00, 0x00, // topic[0] error_code = 0
+        0x05, 0x74, 0x65, 0x73, 0x74, // name = "test"
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // topic_id
+        0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+        0x00, // is_internal = false
+        0x02, // partitions: count=1
+        0x00, 0x00, // partition[0] error_code = 0
+        0x00, 0x00, 0x00, 0x00, // partition_index = 0
+        0x00, 0x00, 0x00, 0x01, // leader_id = 1
+        0x00, 0x00, 0x00, 0x00, // leader_epoch = 0
+        0x02, 0x00, 0x00, 0x00, 0x01, // replica_nodes = [1]
+        0x02, 0x00, 0x00, 0x00, 0x01, // isr_nodes = [1]
+        0x01, // offline_replicas = []
+        0x00, // partition tag buffer
+        0x00, 0x00, 0x00, 0x00, // topic_authorized_operations = 0
+        0x00, // topic tag buffer
+        0x00, // trailing tag buffer
+    },
+    // Truncated after throttle.
+    &.{ 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x0a },
+    &([_]u8{0xff} ** 64), // all ones
+    &([_]u8{0x00} ** 64), // all zeros
+};
+
+test "fuzz Metadata v12 decodeResponse" {
+    try std.testing.fuzz(std.testing.allocator, fuzzMetadataResponse, .{ .corpus = metadata_response_corpus });
+}
+
+fn fuzzMetadataResponse(allocator: std.mem.Allocator, input: []const u8) !void {
+    var r: Reader = .init(input);
+    var resp = decodeResponse(allocator, &r) catch |err| switch (err) {
+        error.EndOfStream, error.Malformed, error.OutOfMemory => return,
+        else => return err,
+    };
+    defer resp.deinit(allocator);
+}

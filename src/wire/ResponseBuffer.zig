@@ -223,3 +223,56 @@ test "next: subsequent frame works after first" {
     const b2 = (try rb.next()).?;
     try testing.expectEqualSlices(u8, &.{0xbb}, b2);
 }
+
+// ---------------------------------------------------------------------------
+// Fuzz target
+// ---------------------------------------------------------------------------
+
+const response_buffer_corpus: []const []const u8 = &.{
+    &.{}, // empty
+    &.{ 0x00, 0x00, 0x00, 0x00 }, // zero length → malformed
+    &.{ 0xff, 0xff, 0xff, 0xff }, // negative length → malformed
+    &.{ 0x00, 0x00, 0x00, 0x05, 0x01, 0x02, 0x03, 0x04, 0x05 }, // valid frame
+    &.{ 0x00, 0x00, 0x00, 0x05, 0x01, 0x02 }, // truncated body
+    &.{ 0x00, 0x00, 0x00, 0x01, 0xaa, 0x00, 0x00, 0x00, 0x01, 0xbb }, // two frames
+    &.{ 0x7f, 0xff, 0xff, 0xff }, // max i32 length (huge)
+    &.{ 0x00, 0x00, 0x00, 0x01, 0xaa }, // valid single frame
+    &([_]u8{0xff} ** 64), // all ones
+    &([_]u8{0x00} ** 64), // all zeros
+};
+
+test "fuzz ResponseBuffer framing" {
+    try std.testing.fuzz(std.testing.allocator, fuzzResponseBuffer, .{ .corpus = response_buffer_corpus });
+}
+
+fn fuzzResponseBuffer(_: std.mem.Allocator, input: []const u8) !void {
+    var storage: [8192]u8 = undefined;
+    var rb: ResponseBuffer = .init(&storage);
+
+    var pos: usize = 0;
+    while (pos < input.len) {
+        const desired: usize = 1 + (input[pos] % 7);
+        const free = rb.writable();
+        const chunk_size = @min(desired, free.len, input.len - pos);
+        if (chunk_size == 0) return;
+        const chunk = input[pos .. pos + chunk_size];
+        @memcpy(free[0..chunk.len], chunk);
+        rb.advance(chunk.len);
+        pos += chunk_size;
+
+        while (true) {
+            const maybe = rb.next() catch |err| switch (err) {
+                error.Malformed => return,
+                else => return err,
+            };
+            if (maybe == null) break;
+        }
+    }
+    while (true) {
+        const maybe = rb.next() catch |err| switch (err) {
+            error.Malformed => return,
+            else => return err,
+        };
+        if (maybe == null) break;
+    }
+}

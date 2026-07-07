@@ -582,3 +582,72 @@ test "decode authenticate response with full frame: length + response header v0"
     try testing.expectEqualStrings("v=r=,", resp.auth_bytes);
     try testing.expectEqual(@as(usize, 0), body_reader.remaining().len);
 }
+
+// ---------------------------------------------------------------------------
+// Fuzz targets
+// ---------------------------------------------------------------------------
+
+const handshake_corpus: []const []const u8 = &.{
+    &.{}, // empty
+    // Two mechanisms, error_code = 0.
+    &.{
+        0x00, 0x00, // error_code = 0
+        0x00, 0x00, 0x00, 0x02, // mechanisms: count=2
+        0x00, 0x0d, 0x53, 0x43, 0x52, 0x41, 0x4d, 0x2d, 0x53, 0x48, 0x41, 0x2d, 0x35, 0x31, 0x32, // "SCRAM-SHA-512"
+        0x00, 0x0d, 0x53, 0x43, 0x52, 0x41, 0x4d, 0x2d, 0x53, 0x48, 0x41, 0x2d, 0x32, 0x35, 0x36, // "SCRAM-SHA-256"
+    },
+    // Truncated mid-mechanism.
+    &.{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x0d, 0x53, 0x43 },
+    &([_]u8{0xff} ** 64), // all ones
+    &([_]u8{0x00} ** 64), // all zeros
+};
+
+test "fuzz SaslHandshake v1 decodeResponse" {
+    try std.testing.fuzz(std.testing.allocator, fuzzHandshakeResponse, .{ .corpus = handshake_corpus });
+}
+
+fn fuzzHandshakeResponse(allocator: std.mem.Allocator, input: []const u8) !void {
+    var r: Reader = .init(input);
+    var resp = decodeHandshakeResponse(allocator, &r) catch |err| switch (err) {
+        error.EndOfStream, error.Malformed, error.OutOfMemory => return,
+        else => return err,
+    };
+    defer resp.deinit(allocator);
+}
+
+const authenticate_corpus: []const []const u8 = &.{
+    &.{}, // empty
+    // Success with server-first and session lifetime.
+    &.{
+        0x00, 0x00, // error_code = 0
+        0xff, 0xff, // error_message = null
+        0x00, 0x00, 0x00, 0x15, // auth_bytes length = 21
+        0x72, 0x3d, 0x61, 0x62, 0x63, 0x31, 0x32, 0x33, 0x2c, 0x73, 0x3d, 0x2e, 0x2e, 0x2e, 0x2c, // "r=abc123,s=...,"
+        0x69, 0x3d, 0x34, 0x30, 0x39, 0x36, // "i=4096"
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x36, 0xee, 0x80, // session_lifetime_ms = 3600000
+    },
+    // Error with message and empty auth_bytes.
+    &.{
+        0x00, 0x3a, // error_code = 58
+        0x00, 0x09, 0x62, 0x61, 0x64, 0x20, 0x63, 0x72, 0x65, 0x64, 0x73, // "bad creds"
+        0x00, 0x00, 0x00, 0x00, // auth_bytes = empty
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // session_lifetime_ms = 0
+    },
+    // Truncated mid-auth_bytes.
+    &.{ 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x10, 0x01, 0x02 },
+    &([_]u8{0xff} ** 64), // all ones
+    &([_]u8{0x00} ** 64), // all zeros
+};
+
+test "fuzz SaslAuthenticate v1 decodeResponse" {
+    try std.testing.fuzz(std.testing.allocator, fuzzAuthenticateResponse, .{ .corpus = authenticate_corpus });
+}
+
+fn fuzzAuthenticateResponse(allocator: std.mem.Allocator, input: []const u8) !void {
+    var r: Reader = .init(input);
+    var resp = decodeAuthenticateResponse(allocator, &r) catch |err| switch (err) {
+        error.EndOfStream, error.Malformed, error.OutOfMemory => return,
+        else => return err,
+    };
+    defer resp.deinit(allocator);
+}

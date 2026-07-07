@@ -1202,3 +1202,137 @@ test "skip with length near usize max is EndOfStream, not overflow" {
     var r: Reader = .init(&.{ 0x01, 0x02, 0x03 });
     try testing.expectError(error.EndOfStream, r.skip(std.math.maxInt(usize)));
 }
+
+// ---------------------------------------------------------------------------
+// Fuzz target
+// ---------------------------------------------------------------------------
+
+const primitive_corpus: []const []const u8 = &.{
+    &.{}, // empty
+    // readVarint
+    &.{ 0x00, 0x00 }, // 0
+    &.{ 0x00, 0x01 }, // -1
+    &.{ 0x00, 0xd8, 0x04 }, // 300
+    &.{ 0x00, 0x80, 0x80, 0x80, 0x80, 0x10 }, // 5th byte overflow
+    // readVarlong
+    &.{ 0x01, 0x00 }, // 0
+    &.{ 0x01, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01 }, // max i64
+    // readUvarint
+    &.{ 0x02, 0x00 }, // 0
+    &.{ 0x02, 0x80, 0x01 }, // 128
+    &.{ 0x02, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01 }, // max u64
+    &.{ 0x02, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02 }, // 10th byte overflow
+    // readString
+    &.{ 0x03, 0x00, 0x05, 0x68, 0x65, 0x6c, 0x6c, 0x6f }, // "hello"
+    // readNullableString
+    &.{ 0x04, 0xff, 0xff }, // null
+    &.{ 0x04, 0xff, 0xfe }, // malformed (-2)
+    // readBytes
+    &.{ 0x05, 0x00, 0x00, 0x00, 0x02, 0x01, 0x02 }, // 2 bytes
+    // readNullableBytes
+    &.{ 0x06, 0xff, 0xff, 0xff, 0xff }, // null
+    // readCompactString
+    &.{ 0x07, 0x01 }, // empty
+    &.{ 0x07, 0x02, 0x61 }, // "a"
+    &.{ 0x07, 0x00 }, // null sentinel (malformed for non-null)
+    // readNullableCompactString
+    &.{ 0x08, 0x00 }, // null
+    // readCompactBytes
+    &.{ 0x09, 0x01 }, // empty
+    &.{ 0x09, 0x03, 0x01, 0x02 }, // 2 bytes
+    // readNullableCompactBytes
+    &.{ 0x0a, 0x00 }, // null
+    // readArrayCount
+    &.{ 0x0b, 0xff, 0xff, 0xff, 0xff }, // null
+    &.{ 0x0b, 0xff, 0xff, 0xff, 0xfe }, // malformed (-2)
+    // readCompactArrayCount
+    &.{ 0x0c, 0x00 }, // null
+    &.{ 0x0c, 0x01 }, // empty
+    // readTagBuffer
+    &.{ 0x0d, 0x00 }, // empty
+    &.{ 0x0d, 0x01, 0x00, 0x01, 0x00 }, // one tag
+    &.{ 0x0d, 0x01, 0x00, 0x10 }, // truncated
+    // readTaggedFields
+    &.{ 0x0e, 0x01, 0x00, 0x01, 0x00 }, // one known tag
+    &.{ 0x0e, 0x02, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00 }, // out-of-order
+    // bulk sentinels
+    &([_]u8{0x00} ++ ([_]u8{0x00} ** 64)), // all zeros, selector 0
+    &([_]u8{0xff} ** 64), // all ones, selector 0
+};
+
+test "fuzz primitives: varint/uvarint/strings/bytes/arrays/tags" {
+    try std.testing.fuzz(std.testing.allocator, fuzzPrimitive, .{ .corpus = primitive_corpus });
+}
+
+fn fuzzPrimitive(_: std.mem.Allocator, input: []const u8) !void {
+    if (input.len == 0) return;
+    const selector = input[0] % 15;
+    var r: Reader = .init(input[1..]);
+    switch (selector) {
+        0 => _ = readVarint(&r) catch |err| switch (err) {
+            error.EndOfStream, error.Malformed => return,
+            else => return err,
+        },
+        1 => _ = readVarlong(&r) catch |err| switch (err) {
+            error.EndOfStream, error.Malformed => return,
+            else => return err,
+        },
+        2 => _ = readUvarint(&r) catch |err| switch (err) {
+            error.EndOfStream, error.Malformed => return,
+            else => return err,
+        },
+        3 => _ = readString(&r) catch |err| switch (err) {
+            error.EndOfStream, error.Malformed => return,
+            else => return err,
+        },
+        4 => _ = readNullableString(&r) catch |err| switch (err) {
+            error.EndOfStream, error.Malformed => return,
+            else => return err,
+        },
+        5 => _ = readBytes(&r) catch |err| switch (err) {
+            error.EndOfStream, error.Malformed => return,
+            else => return err,
+        },
+        6 => _ = readNullableBytes(&r) catch |err| switch (err) {
+            error.EndOfStream, error.Malformed => return,
+            else => return err,
+        },
+        7 => _ = readCompactString(&r) catch |err| switch (err) {
+            error.EndOfStream, error.Malformed => return,
+            else => return err,
+        },
+        8 => _ = readNullableCompactString(&r) catch |err| switch (err) {
+            error.EndOfStream, error.Malformed => return,
+            else => return err,
+        },
+        9 => _ = readCompactBytes(&r) catch |err| switch (err) {
+            error.EndOfStream, error.Malformed => return,
+            else => return err,
+        },
+        10 => _ = readNullableCompactBytes(&r) catch |err| switch (err) {
+            error.EndOfStream, error.Malformed => return,
+            else => return err,
+        },
+        11 => _ = readArrayCount(&r) catch |err| switch (err) {
+            error.EndOfStream, error.Malformed => return,
+            else => return err,
+        },
+        12 => _ = readCompactArrayCount(&r) catch |err| switch (err) {
+            error.EndOfStream, error.Malformed => return,
+            else => return err,
+        },
+        13 => readTagBuffer(&r) catch |err| switch (err) {
+            error.EndOfStream, error.Malformed => return,
+            else => return err,
+        },
+        14 => {
+            const expected_tags = [_]u64{ 0, 1, 2, 3 };
+            var out: [4]?[]const u8 = .{ null, null, null, null };
+            readTaggedFields(&r, &expected_tags, &out) catch |err| switch (err) {
+                error.EndOfStream, error.Malformed => return,
+                else => return err,
+            };
+        },
+        else => unreachable,
+    }
+}
