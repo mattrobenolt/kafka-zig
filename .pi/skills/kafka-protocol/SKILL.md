@@ -51,7 +51,20 @@ Non-flexible APIs (SaslHandshake v1, SaslAuthenticate v1) use:
 `header_version(api_key, version) -> {request, response}` table.
 
 **Classic gotcha:** the **ApiVersions response uses header version 0 even at
-v3** — the broker must parse it before it knows the client's flexibility. Get
+v3** — the broker must parse it before it knows the client's flexibility.
+
+**REQUEST-header client_id is NOT compact-encoded (critical gotcha).** The
+Kafka `RequestHeader.json` spec marks the `ClientId` field with
+`"flexibleVersions": "none"`, which means the client_id is ALWAYS serialized
+as a nullable_string (i16 length + bytes) — even in request header **v2**.
+The v2 header only adds a trailing tag buffer; it does NOT convert client_id
+to a compact_string. Writing it as a compact_string (uvarint length) makes the
+broker read the uvarint's first byte as the high byte of an i16 length →
+garbage length → `InvalidRequestException` / connection drop. (This bit us
+against a real broker in phase 7; the mock missed it because the mock had the
+same bug.) The same exemption applies to the response header v1's
+correlation_id? No — correlation_id is always i32. Only the client_id field
+is exempt from the compact-string rule. Get
 this wrong and the connection desyncs right after connect.
 
 ## v2 record batch (Produce payload)
