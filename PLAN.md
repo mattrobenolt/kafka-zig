@@ -386,7 +386,7 @@ config-time tradeoffs, not runtime surprises — document them on the config.
 src/
   root.zig              — public re-exports (Client, Config, Handle, errors)
   client.zig            — Client + network thread loop + metadata cache
-  connection.zig        — TCP + ztls + SCRAM auth → ready connection
+  Connection.zig       — TCP + ztls + SCRAM auth → ready connection
   producer.zig          — batching, Produce encode/ack, retry/reenqueue
   partitioner.zig       — round-robin / key-hash
   Ring.zig             — MPSC payload ring (ported from AtomicRingBuffer)
