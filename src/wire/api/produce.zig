@@ -1073,3 +1073,157 @@ test "decode response: huge record_errors count → Malformed" {
     var r: Reader = .init(written);
     try testing.expectError(error.Malformed, decodeResponse(testing.allocator, &r));
 }
+
+// ---------------------------------------------------------------------------
+// Fuzz target
+// ---------------------------------------------------------------------------
+
+const produce_response_corpus: []const []const u8 = &.{
+    &.{}, // empty
+    // One topic, one partition, success (error_code=0, null error_message).
+    &.{
+        0x02, // responses: count=1
+        0x05, 0x74, 0x65, 0x73, 0x74, // name = "test"
+        0x02, // partition_responses: count=1
+        0x00, 0x00, 0x00, 0x00, // index = 0
+        0x00, 0x00, // error_code = 0
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2a, // base_offset = 42
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // log_append_time_ms = -1
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // log_start_offset = 0
+        0x01, // record_errors: count=0
+        0x00, // error_message = null
+        0x00, // partition tag buffer
+        0x00, // topic tag buffer
+        0x00, 0x00, 0x00, 0x00, // throttle_time_ms = 0
+        0x00, // trailing tag buffer
+    },
+    // Nonzero error_code with a non-null error_message.
+    &.{
+        0x02, // responses: count=1
+        0x05, 0x74, 0x65, 0x73, 0x74, // name = "test"
+        0x02, // partition_responses: count=1
+        0x00, 0x00, 0x00, 0x00, // index = 0
+        0x00, 0x06, // error_code = 6 (NOT_LEADER_OR_FOLLOWER)
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // base_offset = -1
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // log_append_time_ms = -1
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // log_start_offset = 0
+        0x01, // record_errors: count=0
+        0x0b, 0x6e, 0x6f, 0x74, 0x20, 0x6c, 0x65, 0x61, 0x64, 0x65, 0x72, // error_message = "not leader"
+        0x00, // partition tag buffer
+        0x00, // topic tag buffer
+        0x00, 0x00, 0x00, 0x00, // throttle_time_ms = 0
+        0x00, // trailing tag buffer
+    },
+    // Record errors present; null partition error_message.
+    &.{
+        0x02, // responses: count=1
+        0x05, 0x74, 0x65, 0x73, 0x74, // name = "test"
+        0x02, // partition_responses: count=1
+        0x00, 0x00, 0x00, 0x00, // index = 0
+        0x00, 0x01, // error_code = 1
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64, // base_offset = 100
+        0x00, 0x00, 0x00, 0x00, 0x49, 0x96, 0x02, 0xd2, // log_append_time_ms = 1234567890
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // log_start_offset = 0
+        0x03, // record_errors: count=2
+        0x00, 0x00, 0x00, 0x03, // batch_index = 3
+        0x08, 0x74, 0x6f, 0x6f, 0x20, 0x6f, 0x6c, 0x64, // error_message = "too old"
+        0x00, // record_error tag buffer
+        0x00, 0x00, 0x00, 0x05, // batch_index = 5
+        0x00, // error_message = null
+        0x00, // record_error tag buffer
+        0x00, // partition error_message = null
+        0x00, // partition tag buffer
+        0x00, // topic tag buffer
+        0x00, 0x00, 0x00, 0x64, // throttle_time_ms = 100
+        0x00, // trailing tag buffer
+    },
+    // Multiple topics and partitions.
+    &.{
+        0x03, // responses: count=2
+        0x02, 0x61, // topic[0] name = "a"
+        0x03, // topic[0] partition_responses: count=2
+        0x00, 0x00, 0x00, 0x00, // p[0] index = 0
+        0x00, 0x00, // error_code = 0
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // base_offset = 0
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // log_append_time_ms = -1
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // log_start_offset = 0
+        0x01, // record_errors: count=0
+        0x00, // error_message = null
+        0x00, // tag buffer
+        0x00, 0x00, 0x00, 0x01, // p[1] index = 1
+        0x00, 0x00, // error_code = 0
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, // base_offset = 10
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // log_append_time_ms = -1
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, // log_start_offset = 5
+        0x01, // record_errors: count=0
+        0x00, // error_message = null
+        0x00, // tag buffer
+        0x00, // topic[0] tag buffer
+        0x02, 0x62, // topic[1] name = "b"
+        0x02, // topic[1] partition_responses: count=1
+        0x00, 0x00, 0x00, 0x00, // p[0] index = 0
+        0x00, 0x00, // error_code = 0
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, // base_offset = 20
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // log_append_time_ms = -1
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // log_start_offset = 0
+        0x01, // record_errors: count=0
+        0x00, // error_message = null
+        0x00, // tag buffer
+        0x00, // topic[1] tag buffer
+        0x00, 0x00, 0x00, 0x00, // throttle_time_ms = 0
+        0x00, // trailing tag buffer
+    },
+    // Empty responses array.
+    &.{
+        0x01, // responses: count=0
+        0x00, 0x00, 0x00, 0x00, // throttle_time_ms = 0
+        0x00, // trailing tag buffer
+    },
+    // Truncated mid-partition response.
+    &.{
+        0x02, // responses: count=1
+        0x05, 0x74, 0x65, 0x73, 0x74, // name = "test"
+        0x02, // partition_responses: count=1
+        0x00, 0x00, 0x00, 0x00, // index = 0
+        0x00, 0x00, // error_code = 0
+        // truncated: missing the rest of the partition response
+    },
+    // All-ones and all-zeros bulk sentinels.
+    &([_]u8{0xff} ** 64),
+    &([_]u8{0x00} ** 64),
+    // Huge array counts: the decoder's count cap must reject these as
+    // Malformed before allocating. The uvarint 0xc1 0x84 0x3d encodes
+    // 1_000_001 (i.e., compact-array count = 1_000_000).
+    &.{
+        0xc1, 0x84, 0x3d, // responses: huge count, no data
+    },
+    &.{
+        0x02, // responses: count=1
+        0x02, 0x74, // name = "t"
+        0xc1, 0x84, 0x3d, // partition_responses: huge count
+    },
+    &.{
+        0x02, // responses: count=1
+        0x02, 0x74, // name = "t"
+        0x02, // partition_responses: count=1
+        0x00, 0x00, 0x00, 0x00, // index = 0
+        0x00, 0x00, // error_code = 0
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // base_offset = 0
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // log_append_time_ms = -1
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // log_start_offset = 0
+        0xc1, 0x84, 0x3d, // record_errors: huge count
+    },
+};
+
+test "fuzz Produce v9 decodeResponse" {
+    try std.testing.fuzz(std.testing.allocator, fuzzProduceResponse, .{ .corpus = produce_response_corpus });
+}
+
+fn fuzzProduceResponse(allocator: std.mem.Allocator, input: []const u8) !void {
+    var r: Reader = .init(input);
+    const result: error{ EndOfStream, Malformed, OutOfMemory, BufferTooSmall }!Response = decodeResponse(allocator, &r);
+    var resp = result catch |err| switch (err) {
+        error.EndOfStream, error.Malformed, error.OutOfMemory, error.BufferTooSmall => return,
+    };
+    defer resp.deinit(allocator);
+}
