@@ -266,3 +266,59 @@ e2e: kafka-up
 
     echo "e2e: PASS — produced {{ e2e_msgs }}, consumed $COUNT"
     just kafka-down
+
+# Real-Kafka e2e with zstd-compressed batches. Builds the e2e binary with
+# -Dzstd=true, produces with --compression zstd, consumes back. Exercises the
+# full compression path against a real broker (the unit/mock tests cover the
+# codec; this proves it interops with kafka-console-consumer's zstd decode).
+[doc("Run the zstd-compression e2e against a real Kafka broker")]
+[group("e2e")]
+e2e-zstd: kafka-up
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "$(git rev-parse --show-toplevel)"
+
+    echo "e2e-zstd: building (with -Dzstd=true)..."
+    zig build e2e -Dzstd=true
+
+    # Create the zstd topic before producing (the e2e-events topic is created
+    # in kafka-up; this one needs its own).
+    printf '%s\n' \
+        'security.protocol=SASL_SSL' \
+        'sasl.mechanism=SCRAM-SHA-512' \
+        'sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="{{ scram_user }}" password="{{ scram_pass }}";' \
+        'ssl.truststore.type=PEM' \
+        'ssl.truststore.location={{ e2e_dir }}/rootCA.pem' \
+        'ssl.endpoint.identification.algorithm=' \
+        > {{ e2e_dir }}/consumer.properties
+    kafka-topics.sh --bootstrap-server localhost:{{ sasl_ssl_port }} \
+        --create --if-not-exists --topic {{ e2e_topic }}-zstd \
+        --partitions 4 --replication-factor 1 \
+        --command-config {{ e2e_dir }}/consumer.properties
+
+    echo "e2e-zstd: producing {{ e2e_msgs }} zstd-compressed messages via kafka-zig..."
+    zig-out/bin/e2e --broker localhost:{{ sasl_ssl_port }} \
+        --ca {{ e2e_dir }}/rootCA.pem \
+        --user {{ scram_user }} --pass {{ scram_pass }} \
+        --topic {{ e2e_topic }}-zstd --num {{ e2e_msgs }} --compression zstd
+
+    echo "e2e-zstd: consuming {{ e2e_msgs }} messages via kafka-console-consumer..."
+    OUTPUT="$(kafka-console-consumer.sh \
+        --bootstrap-server localhost:{{ sasl_ssl_port }} \
+        --topic {{ e2e_topic }}-zstd \
+        --from-beginning \
+        --max-messages {{ e2e_msgs }} \
+        --command-config {{ e2e_dir }}/consumer.properties \
+        --timeout-ms 10000 2>&1)"
+    COUNT="$(echo "$OUTPUT" | grep -c '^msg-' || true)"
+    echo "$OUTPUT" | tail -5
+    echo "e2e-zstd: consumed $COUNT messages"
+
+    if [ "$COUNT" -ne "{{ e2e_msgs }}" ]; then
+        echo "e2e-zstd: FAIL — expected {{ e2e_msgs }}, got $COUNT"
+        just kafka-down
+        exit 1
+    fi
+
+    echo "e2e-zstd: PASS — produced {{ e2e_msgs }} zstd, consumed $COUNT"
+    just kafka-down

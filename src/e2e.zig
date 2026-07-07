@@ -23,6 +23,7 @@ pub fn main() !void {
     var password: []const u8 = "";
     var topic: []const u8 = "e2e-events";
     var num_msgs: u32 = 20;
+    var compression: []const u8 = "none";
 
     // Cheap arg parser: --key value pairs.
     _ = args_iter.next(); // skip program name
@@ -41,6 +42,8 @@ pub fn main() !void {
             const num_str = args_iter.next() orelse fatal("missing value for --num", .{});
             num_msgs = std.fmt.parseInt(u32, num_str, 10) catch
                 fatal("invalid --num value: {s}", .{num_str});
+        } else if (std.mem.eql(u8, arg, "--compression")) {
+            compression = args_iter.next() orelse fatal("missing value for --compression", .{});
         } else {
             fatal("unknown argument: {s}", .{arg});
         }
@@ -81,6 +84,12 @@ pub fn main() !void {
             .password = password,
         } },
         .acks = .all,
+        .compression = if (std.mem.eql(u8, compression, "zstd"))
+            .zstd
+        else if (std.mem.eql(u8, compression, "none"))
+            .none
+        else
+            fatal("--compression must be none|zstd, got: {s}", .{compression}),
         .linger_ms = 100,
         .max_message_size = 4 * 1024,
         .max_key_len = 64,

@@ -82,6 +82,10 @@ pub const Options = struct {
     max_batch_bytes: u32,
     max_message_size: u32,
     strategy: partitioner.Strategy,
+    /// Record-batch compression applied to every batch. `.zstd` requires the
+    /// library to be built with `-Dzstd=true`; requesting it without that is
+    /// rejected at `Client.init` with `error.CompressionUnavailable`.
+    compression: record_batch.Compression = .none,
     /// Max in-place retries before a slot is failed with its last error code.
     max_retries: u8 = 8,
     /// Socket I/O timeout in ms (SO_RCVTIMEO + SO_SNDTIMEO), passed through to
@@ -188,6 +192,9 @@ encode_buf: []u8,
 /// per drain. Sized to fit a max Produce response (see `init`). Never touched
 /// by `self.allocator` — the whole produce response path is FBA-backed.
 resp_fba_buf: []u8,
+/// Scratch for the compressed records region (sized to compressBound(max_batch_bytes));
+/// empty when compression is .none.
+compress_scratch: []u8,
 /// Per physical slot: how many in-place retries so far, bound to a generation
 /// so a recycled slot resets its counter.
 attempts: []u8,
@@ -242,6 +249,17 @@ pub fn init(allocator: Allocator, ring: *Ring, options: Options) !Producer {
     errdefer allocator.free(encode_buf);
     const resp_fba_buf = try allocator.alloc(u8, resp_fba_len);
     errdefer allocator.free(resp_fba_buf);
+    // Scratch for the compressed records region, sized once to the worst-case
+    // bound of one max_batch_bytes batch. Only allocated when compression is
+    // enabled; empty slice otherwise (encodeBatch ignores scratch for .none).
+    const compress_scratch = if (options.compression != .none)
+        try allocator.alloc(u8, wire.compress.compressBound(
+            @enumFromInt(@intFromEnum(options.compression)),
+            options.max_batch_bytes,
+        ))
+    else
+        try allocator.alloc(u8, 0);
+    errdefer allocator.free(compress_scratch);
     const attempts = try allocator.alloc(u8, num_slots);
     errdefer allocator.free(attempts);
     const attempt_gen = try allocator.alloc(u32, num_slots);
@@ -260,6 +278,7 @@ pub fn init(allocator: Allocator, ring: *Ring, options: Options) !Producer {
         .group_scratch = group_scratch,
         .encode_buf = encode_buf,
         .resp_fba_buf = resp_fba_buf,
+        .compress_scratch = compress_scratch,
         .attempts = attempts,
         .attempt_gen = attempt_gen,
     };
@@ -285,6 +304,7 @@ pub fn deinit(self: *Producer) void {
     self.allocator.free(self.group_scratch);
     self.allocator.free(self.encode_buf);
     self.allocator.free(self.resp_fba_buf);
+    self.allocator.free(self.compress_scratch);
     self.allocator.free(self.attempts);
     self.allocator.free(self.attempt_gen);
     self.* = undefined;
@@ -485,7 +505,11 @@ fn sendLeader(self: *Producer, leader: i32, slots: []const Collected) !bool {
             const batch = record_batch.encodeBatch(
                 self.encode_buf[encode_off..],
                 self.records_scratch[0..rc],
-                .{ .base_timestamp = now_ms },
+                .{
+                    .base_timestamp = now_ms,
+                    .compression = self.options.compression,
+                    .scratch = self.compress_scratch,
+                },
             ) catch |err| switch (err) {
                 // The batch doesn't fit in the remaining encode buffer. If
                 // nothing has been built yet for this (topic, partition) run,

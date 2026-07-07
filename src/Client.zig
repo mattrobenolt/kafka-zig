@@ -32,6 +32,13 @@ const Ring = @import("Ring.zig");
 const Connection = @import("Connection.zig");
 const Producer = @import("Producer.zig");
 const partitioner = @import("partitioner.zig");
+const record_batch = @import("wire/record_batch.zig");
+const build_options = @import("build_options");
+
+/// Record-batch compression for produced batches. `.zstd` requires building
+/// with `-Dzstd=true`; requesting it otherwise is rejected at `init` with
+/// `error.CompressionUnavailable`.
+pub const Compression = record_batch.Compression;
 
 const Client = @This();
 
@@ -104,6 +111,9 @@ pub const Config = struct {
     /// SO_SNDTIMEO). A stalled broker hits this and triggers reconnect.
     io_timeout_ms: u32 = 30_000,
     max_retries: u8 = 8,
+    /// Record-batch compression. `.none` (default) sends plaintext batches;
+    /// `.zstd` compresses each batch (requires `-Dzstd=true` at build time).
+    compression: Compression = .none,
 };
 
 allocator: Allocator,
@@ -144,6 +154,14 @@ pub fn init(allocator: Allocator, config: Config) !*Client {
     });
     errdefer self.ring.deinit(allocator);
 
+    // zstd compression requires the library to be built with -Dzstd=true.
+    // Reject at init rather than failing per-batch at runtime.
+    if (config.compression == .zstd and
+        !build_options.zstd_enabled)
+    {
+        return error.CompressionUnavailable;
+    }
+
     self.producer = try Producer.init(allocator, &self.ring, .{
         .bootstrap = bootstrap,
         .sni = sni,
@@ -159,6 +177,7 @@ pub fn init(allocator: Allocator, config: Config) !*Client {
         .max_retries = config.max_retries,
         .retry_backoff_ns = @as(u64, config.linger_ms) * std.time.ns_per_ms,
         .io_timeout_ms = config.io_timeout_ms,
+        .compression = config.compression,
     });
     errdefer self.producer.deinit();
 
