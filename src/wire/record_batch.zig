@@ -45,11 +45,11 @@
 //!
 //! Compression ordering (non-negotiable, per PLAN §2.1):
 //!   1. Serialize the records region.
-//!   2. Compress it in place (when compression attr set). [Phase 2c]
+//!   2. Compress it (when compression attr set) via `compress.zig`.
 //!   3. Compute CRC32C over attributes→end (so over the compressed bytes).
 //!   4. Finalize batchLength.
-//! Compress BEFORE CRC. This slice uses plaintext only (compression attr = 0).
-//! The insertion point for phase-2c compression is marked in `encodeBatch`.
+//! Compress BEFORE CRC. v1 supports plaintext + zstd (zstd behind
+//! `-Dzstd=true`); the codec slot lives in `compress.zig`.
 //!
 //! Non-idempotent producer sentinels: producerId = -1, producerEpoch = -1,
 //! baseSequence = -1 (Java RecordBatch defaults). These are the values a
@@ -70,6 +70,7 @@ const testing = std.testing;
 
 const primitives = @import("primitives.zig");
 const Reader = primitives.Reader;
+const compress = @import("compress.zig");
 
 /// CRC-32C (Castagnoli). In Zig 0.15 std this is `std.hash.crc.Crc32Iscsi`,
 /// which uses polynomial 0x1edc6f41 with init=0xffffffff, reflected I/O, and
@@ -172,10 +173,22 @@ pub const EncodeOptions = struct {
     /// batch leaves this unset so the broker assigns the real epoch. It is
     /// excluded from the CRC, so the broker can overwrite it in place.
     partition_leader_epoch: i32 = -1,
-    /// Compression codec. This slice is PLAINTEXT ONLY: `encodeBatch` returns
-    /// `error.CompressionNotImplemented` for anything but `.none`. zstd lands
-    /// in phase 2c (compress records region before CRC, per PLAN §2.1).
+    /// Compression codec. `.none` writes the records region verbatim. `.zstd`
+    /// (requires `-Dzstd=true`) compresses the records region in place before
+    /// CRC/length finalize, per PLAN §2.1. gzip/snappy/lz4 return
+    /// `error.CompressionNotImplemented`.
     compression: Compression = .none,
+    /// zstd compression level, used only when `compression == .zstd`.
+    compression_level: i32 = compress.default_level,
+    /// Scratch buffer for the compressed records region, REQUIRED when
+    /// `compression != .none` and unused otherwise. Must be at least
+    /// `compress.compressBound(codec, uncompressed_records_len)` bytes. The
+    /// records region is compressed into `scratch`, then copied back into
+    /// `out`; `out` itself must therefore be sized for the compressed batch
+    /// (header + compressed records ≤ header + compressBound). Keeping the
+    /// compressed bytes in a caller-owned scratch buffer preserves the
+    /// zero-heap-allocation encode contract (no `std.heap.*` fallback).
+    scratch: ?[]u8 = null,
     /// Non-idempotent producer sentinels. Override only for idempotent mode
     /// (future phase). producerId=-1, producerEpoch=-1, baseSequence=-1.
     producer_id: i64 = -1,
@@ -199,10 +212,14 @@ pub const EncodeOptions = struct {
 ///   [17..21) crc                   ← patched: CRC32C over [21) to end
 ///   [21..)   CRC-covered region: attributes → recordsCount → records
 ///
-/// This slice is PLAINTEXT ONLY. `options.compression != .none` returns
-/// `error.CompressionNotImplemented` (the attribute bits would be written but
-/// the records are not actually compressed — a broker would reject that). The
-/// phase-2c insertion point below marks where compression will slot in.
+/// When `options.compression != .none`, the records region is compressed in
+/// place BEFORE the CRC/batchLength patches (PLAN §2.1 ordering). The codec
+/// writes into `options.scratch` (required for a compressed batch), then the
+/// compressed bytes are copied back into `out` — no heap allocation. `.zstd`
+/// requires `-Dzstd=true`; without it, compress returns
+/// `error.CompressionNotImplemented`. gzip/snappy/lz4 are unimplemented.
+/// recordsCount stays the ORIGINAL uncompressed count — Kafka keeps the record
+/// count even when the region is compressed.
 ///
 /// Spec: https://kafka.apache.org/43/implementation/message-format — "Record
 /// Batch".
@@ -210,32 +227,48 @@ pub fn encodeBatch(
     out: []u8,
     records: []const Record,
     options: EncodeOptions,
-) error{ BufferTooSmall, CompressionNotImplemented }![]u8 {
-    // Plaintext only: refuse to set a compression attribute without actually
-    // compressing the records region (Fix 2). zstd lands in phase 2c.
-    if (options.compression != .none) return error.CompressionNotImplemented;
-
+) error{ BufferTooSmall, CompressionNotImplemented, CompressionFailed }![]u8 {
     const crc_region_start = 21; // attributes field offset
     const batch_length_off = 8;
     const partition_leader_epoch_off = 12;
     const crc_off = 17;
+    // Records region offset within `out`: crc_region_start + the fixed header
+    // between attributes and recordsCount (attributes u16 + lastOffsetDelta i32
+    // + baseTimestamp i64 + maxTimestamp i64 + producerId i64 + producerEpoch
+    // i16 + baseSequence i32 + recordsCount i32 = 40 bytes).
+    const records_region_off = crc_region_start + 40;
 
     // Serialize header (with placeholder batchLength/crc) + CRC-covered region
     // directly into `out`. A fixed writer returns error.WriteFailed when it
-    // runs out of room; we map that to BufferTooSmall. No heap fallback.
+    // runs out of room; we map that to BufferTooSmall. No heap fallback. The
+    // attributes field carries the compression bits (writeBatch writes
+    // @intFromEnum(options.compression)); for a compressed codec we replace the
+    // records region below so the attribute matches the on-wire bytes.
     var w: std.Io.Writer = .fixed(out);
     writeBatch(&w, records, options) catch |err| switch (err) {
         error.WriteFailed => return error.BufferTooSmall,
     };
-    const written = w.buffered();
-    assert(written.len >= crc_region_start);
+    var written = w.buffered();
+    assert(written.len >= records_region_off);
 
-    // --- Phase-2c compression insertion point ---
-    // Here the records region (written[crc_region_start + 21 ..]) would be
-    // compressed in place and `written` re-sliced to the compressed length,
-    // BEFORE the CRC/batchLength patches below. Compress-before-CRC is
-    // non-negotiable (PLAN §2.1). This slice writes plaintext only.
-    // --- End phase-2c insertion point ---
+    // --- Compression: compress records region BEFORE CRC (PLAN §2.1) ---
+    if (options.compression != .none) {
+        const codec: compress.Codec = @enumFromInt(@intFromEnum(options.compression));
+        const uncompressed = written[records_region_off..];
+        // Scratch is a documented caller contract for a compressed batch.
+        const scratch = options.scratch.?;
+        const clen = compress.compress(codec, uncompressed, scratch, options.compression_level) catch |err| switch (err) {
+            error.NotImplemented => return error.CompressionNotImplemented,
+            error.BufferTooSmall => return error.BufferTooSmall,
+            error.CompressionFailed => return error.CompressionFailed,
+        };
+        // Copy the compressed records back over the uncompressed region. No
+        // overlap: scratch is a separate caller-owned buffer.
+        assert(records_region_off + clen <= out.len);
+        @memcpy(out[records_region_off..][0..clen], scratch[0..clen]);
+        written = out[0 .. records_region_off + clen];
+    }
+    // --- End compression ---
 
     // Patch batchLength = bytes from partitionLeaderEpoch (offset 12) to end.
     const batch_length: i32 = @intCast(written.len - partition_leader_epoch_off);
@@ -374,6 +407,7 @@ pub const DecodeError = error{
     Malformed,
     CrcMismatch,
     BadMagic,
+    CompressionNotImplemented,
     OutOfMemory,
 };
 
@@ -428,6 +462,32 @@ pub fn decodeBatch(allocator: std.mem.Allocator, reader: *Reader) (DecodeError |
     const records_count = try primitives.readI32(&sub);
     if (records_count < 0) return error.Malformed;
 
+    // When the compression bits are set, the records region (everything after
+    // recordsCount) is a compressed blob. Decompress it into an allocated
+    // buffer (decode is the cold mock-broker/test path, so an allocator is
+    // permitted per the module allocator policy) and parse records from there.
+    // recordsCount is the ORIGINAL uncompressed count, unchanged by compression.
+    const codec: compress.Codec = @enumFromInt(@as(u3, @truncate(attributes)));
+    var records_reader: *Reader = &sub;
+    var decompressed_reader: Reader = undefined;
+    var decompressed: ?[]u8 = null;
+    defer if (decompressed) |d| allocator.free(d);
+    if (codec != .none) {
+        const compressed = sub.buf[sub.pos..];
+        const dlen = compress.decompressedLen(codec, compressed) catch |err| switch (err) {
+            error.NotImplemented => return error.CompressionNotImplemented,
+            else => return error.Malformed,
+        };
+        const buf = try allocator.alloc(u8, dlen);
+        decompressed = buf;
+        _ = compress.decompress(codec, compressed, buf) catch |err| switch (err) {
+            error.NotImplemented => return error.CompressionNotImplemented,
+            else => return error.Malformed,
+        };
+        decompressed_reader = .init(buf);
+        records_reader = &decompressed_reader;
+    }
+
     const records = try allocator.alloc(Record, @intCast(records_count));
     var records_len: usize = 0;
     errdefer {
@@ -443,7 +503,7 @@ pub fn decodeBatch(allocator: std.mem.Allocator, reader: *Reader) (DecodeError |
         allocator.free(records);
     }
     while (records_len < @as(usize, @intCast(records_count))) : (records_len += 1) {
-        records[records_len] = try decodeRecord(allocator, &sub);
+        records[records_len] = try decodeRecord(allocator, records_reader);
     }
 
     return .{
@@ -929,10 +989,10 @@ test "encodeBatch: partition_leader_epoch is set" {
     try testing.expectEqual(@as(i32, 42), batch.partition_leader_epoch);
 }
 
-test "encodeBatch: rejects unimplemented compression" {
-    // Fix 2: this slice is plaintext only. Setting a compression attribute
-    // without actually compressing the records would produce a batch the
-    // broker rejects, so encodeBatch refuses it. zstd lands in phase 2c.
+test "encodeBatch: rejects gzip/snappy/lz4 (unimplemented codecs)" {
+    // gzip/snappy/lz4 are out of v1 scope; the codec slot returns
+    // NotImplemented and encodeBatch surfaces it as CompressionNotImplemented
+    // regardless of the -Dzstd flag.
     const records = [_]Record{.{
         .offset_delta = 0,
         .timestamp_delta = 0,
@@ -942,14 +1002,93 @@ test "encodeBatch: rejects unimplemented compression" {
     }};
 
     var buf: [256]u8 = undefined;
+    var scratch: [256]u8 = undefined;
+    inline for (.{ Compression.gzip, Compression.snappy, Compression.lz4 }) |codec| {
+        try testing.expectError(
+            error.CompressionNotImplemented,
+            encodeBatch(&buf, &records, .{ .compression = codec, .scratch = &scratch }),
+        );
+    }
+}
+
+test "encodeBatch: zstd without -Dzstd=true returns CompressionNotImplemented" {
+    // When the build did NOT enable zstd, requesting zstd compression is a
+    // runtime error (the codec slot returns NotImplemented). This test only
+    // runs in the default build; the enabled build exercises the round-trip.
+    if (compress.zstd_enabled) return;
+    const records = [_]Record{.{
+        .offset_delta = 0,
+        .timestamp_delta = 0,
+        .key = "k1",
+        .value = "v1",
+        .headers = &.{},
+    }};
+    var buf: [256]u8 = undefined;
+    var scratch: [256]u8 = undefined;
     try testing.expectError(
         error.CompressionNotImplemented,
-        encodeBatch(&buf, &records, .{ .compression = .zstd }),
+        encodeBatch(&buf, &records, .{ .compression = .zstd, .scratch = &scratch }),
     );
-    try testing.expectError(
-        error.CompressionNotImplemented,
-        encodeBatch(&buf, &records, .{ .compression = .gzip }),
-    );
+}
+
+test "encodeBatch + decodeBatch: zstd round-trip (records region compressed)" {
+    if (!compress.zstd_enabled) return;
+    // Repetitive payloads so zstd actually shrinks the region; verifies the
+    // compress-before-CRC ordering (decode recomputes CRC over the compressed
+    // bytes) and that recordsCount stays the uncompressed count.
+    const v1 = "payload-payload-payload-payload-payload" ** 4;
+    const v2 = "another-record-value-another-record-value" ** 4;
+    const records = [_]Record{
+        .{ .offset_delta = 0, .timestamp_delta = 0, .key = "k1", .value = v1, .headers = &.{} },
+        .{ .offset_delta = 1, .timestamp_delta = 5, .key = "k2", .value = v2, .headers = &.{} },
+    };
+
+    var buf: [2048]u8 = undefined;
+    var scratch: [2048]u8 = undefined;
+    const bytes = try encodeBatch(&buf, &records, .{ .compression = .zstd, .scratch = &scratch });
+
+    // The attributes field (offset 21, u16 big-endian) must carry zstd bits (4).
+    try testing.expectEqual(@as(u16, 4), std.mem.readInt(u16, bytes[21..23], .big));
+
+    var r: Reader = .init(bytes);
+    var batch = try decodeBatch(testing.allocator, &r);
+    defer batch.deinit(testing.allocator);
+
+    try testing.expectEqual(Compression.zstd, batch.compression());
+    try testing.expectEqual(@as(usize, 2), batch.records.len);
+    try testing.expectEqualStrings("k1", batch.records[0].key.?);
+    try testing.expectEqualStrings(v1, batch.records[0].value.?);
+    try testing.expectEqualStrings("k2", batch.records[1].key.?);
+    try testing.expectEqualStrings(v2, batch.records[1].value.?);
+    try testing.expectEqual(@as(i32, 1), batch.last_offset_delta);
+    // All bytes consumed.
+    try testing.expectEqual(@as(usize, 0), r.remaining().len);
+}
+
+test "encodeBatch: zstd CRC verifies over compressed bytes" {
+    if (!compress.zstd_enabled) return;
+    const records = [_]Record{.{
+        .offset_delta = 0,
+        .timestamp_delta = 0,
+        .key = "k1",
+        .value = "compressible-compressible-compressible" ** 4,
+        .headers = &.{},
+    }};
+    var buf: [1024]u8 = undefined;
+    var scratch: [1024]u8 = undefined;
+    const bytes = try encodeBatch(&buf, &records, .{ .compression = .zstd, .scratch = &scratch });
+    // Recompute CRC over attributes→end (offset 21) and compare to the stored
+    // crc at offset 17 — must match, proving CRC was taken over compressed bytes.
+    const stored = std.mem.readInt(u32, bytes[17..21], .big);
+    const recomputed = Crc32C.hash(bytes[21..]);
+    try testing.expectEqual(recomputed, stored);
+
+    // Flip a byte in the compressed region → decode must reject on CRC.
+    var corrupt: [1024]u8 = undefined;
+    @memcpy(corrupt[0..bytes.len], bytes);
+    corrupt[bytes.len - 1] ^= 0xff;
+    var r: Reader = .init(corrupt[0..bytes.len]);
+    try testing.expectError(error.CrcMismatch, decodeBatch(testing.allocator, &r));
 }
 
 test "encodeBatch: zero heap allocation — bounded by caller buffer" {
