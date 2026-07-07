@@ -9,6 +9,7 @@ const std = @import("std");
 pub const primitives = @import("primitives.zig");
 pub const frame = @import("frame.zig");
 pub const api_keys = @import("api/api_keys.zig");
+pub const metadata = @import("api/metadata.zig");
 
 test {
     std.testing.refAllDecls(@This());
