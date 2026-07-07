@@ -7,6 +7,7 @@
 const std = @import("std");
 
 pub const primitives = @import("primitives.zig");
+pub const request = @import("request.zig");
 pub const ResponseBuffer = @import("ResponseBuffer.zig");
 pub const record_batch = @import("record_batch.zig");
 pub const compress = @import("compress.zig");
