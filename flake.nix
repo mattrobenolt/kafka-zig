@@ -45,6 +45,9 @@
               (zstd.override { enableStatic = true; })
               apacheKafka
               jdk
+              # mkcert: generate locally-trusted dev certificates (used by phase 7
+              # e2e for the SASL_SSL broker — preferred over ad-hoc self-signed).
+              mkcert
             ];
 
             shellHook = ''
