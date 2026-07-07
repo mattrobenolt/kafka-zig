@@ -1446,7 +1446,7 @@ test "stress: multi-producer + consumer with randomized ack/retry/reclaim/shutdo
 
     var iter: u32 = 0;
     while (iter < 20) : (iter += 1) {
-        var ring = try Ring.init(testing.allocator, tinyConfig(16));
+        var ring = try Ring.init(testing.allocator, tinyConfig(4));
         defer ring.deinit(testing.allocator);
 
         var acked: atomic.Value(u32) = .init(0);

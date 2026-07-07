@@ -244,12 +244,18 @@ review):**
    Design: track a per-slot `status` done flag and reclaim via a separate scan
    (or a free-list) rather than a single monotonic `read_head`. `read_head` is
    only the low-water mark for the acquire-full check.
-3. **Handle identity across retry.** "Re-acquire slots at the tail" on retriable
-   error moves a message to a new physical slot, but `m.await()` is keyed to the
-   slot. Decide explicitly: the handle is a **stable token** decoupled from
-   physical slot (small indirection table mapping handle→current slot), so a
-   retried message keeps its handle. Without this, `await()` can't follow a
-   retried message. Specify the indirection in the ring section.
+3. **Handle identity across retry.** Retry is **in-place**: the message
+   stays in its slot (still `pending`, same generation, same handle binding),
+   clears `err`, and re-notifies the consumer. The handle never moves, so
+   `await()` trivially follows it. (An earlier draft proposed moving the
+   message to a new tail slot with a stable indirection-table handle; that
+   deadlocks when the ring is full and every slot needs re-enqueue — there's
+   no free slot to claim until a retry succeeds, and no retry succeeds until a
+   slot frees. In-place retry breaks the cycle with zero new resource and
+   preserves the handle binding.) A consequence: the producer loop must not
+   retry speculatively while an older Produce request for the same slot may
+   still complete — retry only after a terminal retriable response or a
+   reconnect.
 
 **Completion signaling for `await()`:** a futex per slot is too expensive at
 8K+ slots. Use a single (or few) global completion futex plus an acked-bitmap
@@ -283,10 +289,12 @@ Loop:
 4. Read ProduceResponse. For each partition: on success, mark those slots
    `acked` and advance `read_head`; reduce `in_flight_bytes`. On retriable
    error (NotLeader/LeaderNotAvailable/…), invalidate metadata for that
-   partition, re-enqueue the descriptors (re-acquire slots at the tail), and
-   trigger a metadata refresh. On non-retriable error, mark `failed`.
-5. Wake the producer threads waiting on the affected handles (futex per
-   handle, or a shared "completion queue" the producer polls).
+   partition, retry the slots **in place** (same slot, same generation, same
+   handle; status stays `pending`, `err` cleared, consumer re-notifies — see
+   §2.4 point 3), and trigger a metadata refresh. On non-retriable error,
+   mark `failed`.
+5. Wake the producer threads waiting on the affected handles (single global
+   completion futex + acked-bitmap; see §2.4).
 6. Periodically / on invalidation: send `Metadata`, refresh the cache.
 
 Metadata cache: `[]TopicInfo` where `TopicInfo` has `[]PartitionInfo{ leader,
@@ -381,7 +389,7 @@ src/
   connection.zig        — TCP + ztls + SCRAM auth → ready connection
   producer.zig          — batching, Produce encode/ack, retry/reenqueue
   partitioner.zig       — round-robin / key-hash
-  ring.zig              — MPSC payload ring (ported from AtomicRingBuffer)
+  Ring.zig             — MPSC payload ring (ported from AtomicRingBuffer)
   scram/
     scram.zig           — generic SCRAM client (sha256/sha512)
     pbkdf2.zig          — incremental PBKDF2 (ported)
