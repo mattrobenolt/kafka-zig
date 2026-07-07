@@ -139,7 +139,18 @@ pub fn dial(allocator: std.mem.Allocator, config: Config) !*Connection {
     const self = try allocator.create(Connection);
     errdefer allocator.destroy(self);
 
-    const stream = try std.net.tcpConnectToHost(allocator, config.host, config.port);
+    // Prefer a direct connect to a parsed IP literal (no getaddrinfo/DNS):
+    // determinism + avoids an observed `AddressNotAvailable` from the
+    // resolver on IP literals. Fall back to tcpConnectToHost only for real
+    // hostnames (DNS). MSK bootstrap endpoints are hostnames, so the fallback
+    // path still covers production; tests and IP brokers take the fast path.
+    const stream = blk: {
+        if (std.net.Address.parseIp(config.host, config.port)) |addr| {
+            break :blk try std.net.tcpConnectToAddress(addr);
+        } else |_| {
+            break :blk try std.net.tcpConnectToHost(allocator, config.host, config.port);
+        }
+    };
     errdefer stream.close();
 
     self.* = .{

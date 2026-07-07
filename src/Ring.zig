@@ -595,6 +595,13 @@ pub fn slotGeneration(self: *Ring, index: u64) u32 {
     return self.slotAt(index).generation.load(.acquire);
 }
 
+/// Whether the slot at `index` is currently pending (committed by a producer,
+/// awaiting broker ack). Encapsulates the internal status constant so callers
+/// (the producer drain loop) don't reach into the slot's atomic directly.
+pub fn slotIsPending(self: *Ring, index: u64) bool {
+    return self.slotAt(index).status.load(.acquire) == status_pending;
+}
+
 /// Mark a slot's message acked. No-op (stale) if the slot was recycled since it
 /// was sent — detected by `generation`. Stores the result into the *handle* so
 /// `await()` observes it immediately, independent of physical reclaim.
