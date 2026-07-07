@@ -1,0 +1,7 @@
+.direnv/
+.zig-cache/
+zig-out/
+.pi/sessions/
+.pi/history/
+*.o
+.DS_Store
