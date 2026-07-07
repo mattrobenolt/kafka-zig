@@ -65,15 +65,14 @@ pub fn compress(codec: Codec, input: []const u8, out: []u8, level: i32) Compress
         },
         .zstd => {
             if (!zstd_enabled) return error.NotImplemented;
+            // Check the dst bound up front via compressBound so a too-small
+            // `out` is reported as BufferTooSmall without relying on
+            // ZSTD_getErrorCode (not exported by all libzstd headers, e.g.
+            // older Ubuntu libzstd-dev — broke CI). ZSTD_compress itself
+            // also returns an error on too-small dst, caught by ZSTD_isError.
+            if (out.len < c.ZSTD_compressBound(input.len)) return error.BufferTooSmall;
             const written = c.ZSTD_compress(out.ptr, out.len, input.ptr, input.len, level);
-            if (c.ZSTD_isError(written) != 0) {
-                // A too-small dst is reported as an error by ZSTD_compress; map
-                // it to BufferTooSmall so callers can distinguish from a real
-                // codec failure.
-                const code = c.ZSTD_getErrorCode(written);
-                if (code == c.ZSTD_error_dstSize_tooSmall) return error.BufferTooSmall;
-                return error.CompressionFailed;
-            }
+            if (c.ZSTD_isError(written) != 0) return error.CompressionFailed;
             assert(written <= out.len);
             return written;
         },
@@ -109,12 +108,13 @@ pub fn decompress(codec: Codec, input: []const u8, out: []u8) DecompressError!us
         },
         .zstd => {
             if (!zstd_enabled) return error.NotImplemented;
+            // Size `out` via decompressedLen; a too-small dst is reported as
+            // BufferTooSmall without ZSTD_getErrorCode (portability — see
+            // compress). ZSTD_isError catches any other decompression failure.
+            const need = decompressedLen(.zstd, input) catch return error.DecompressionFailed;
+            if (out.len < need) return error.BufferTooSmall;
             const written = c.ZSTD_decompress(out.ptr, out.len, input.ptr, input.len);
-            if (c.ZSTD_isError(written) != 0) {
-                const code = c.ZSTD_getErrorCode(written);
-                if (code == c.ZSTD_error_dstSize_tooSmall) return error.BufferTooSmall;
-                return error.DecompressionFailed;
-            }
+            if (c.ZSTD_isError(written) != 0) return error.DecompressionFailed;
             return written;
         },
         .gzip, .snappy, .lz4 => return error.NotImplemented,

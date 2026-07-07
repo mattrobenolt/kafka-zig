@@ -4,7 +4,10 @@
     .fingerprint = 0x5bbc75172c5960fb, // Changing this has security and trust implications.
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
-        // Path dep during development; switch to git+hash for publish.
+        // TODO: switch to the published tarball once mattrobenolt/ztls#66 is
+        // fixed (the tarball currently omits src/test_fixtures/, which library
+        // source references at top level). CI checks ztls out into _ztls and
+        // symlinks it to ../ztls so this path dep resolves.
         .ztls = .{ .path = "../ztls" },
     },
     .paths = .{
