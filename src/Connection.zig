@@ -294,7 +294,21 @@ fn driveHandshake(self: *Connection) !void {
             },
             .none, .new_session_ticket => {},
             .key_update => |ku| try self.handleKeyUpdate(ku),
-            .application_data, .closed => return Error.ConnectionClosed,
+            // After the handshake completes (isConnected true), the broker may
+            // coalesce the first application_data record in the same TCP read
+            // as the server Finished. Drain it into resp_buf instead of
+            // treating it as a protocol error — it is the ApiVersions response.
+            .application_data => |data| {
+                if (self.hs.isConnected()) {
+                    const dst = self.resp_buf.writable();
+                    if (data.len > dst.len) return Error.ResponseTooLarge;
+                    @memcpy(dst[0..data.len], data);
+                    self.resp_buf.advance(data.len);
+                } else {
+                    return Error.ConnectionClosed;
+                }
+            },
+            .closed => return Error.ConnectionClosed,
         };
     }
 }
@@ -798,10 +812,13 @@ const MockServer = struct {
         const api_key = try ApiKey.fromU16(@intCast(api_key_raw));
         const hv = api_keys.headerVersion(api_key, api_version);
         // Skip (or capture) request-header client_id + tag buffer.
+        // The request header's client_id is ALWAYS a nullable_string (i16
+        // length), even in flexible header v2 — see RequestHeader.json:
+        // flexibleVersions: "none" for the ClientId field.
         switch (hv.request) {
             1 => _ = try primitives.readNullableString(&r),
             2 => {
-                const cid = try primitives.readNullableCompactString(&r);
+                const cid = try primitives.readNullableString(&r);
                 if (ctx.capture_client_id) if (cid) |c| {
                     @memcpy(ctx.captured_client_id[0..c.len], c);
                     ctx.captured_client_id_len = c.len;

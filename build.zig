@@ -63,6 +63,24 @@ pub fn build(b: *Build) void {
     if (b.args) |args| run_cmd.addArgs(args);
     run_step.dependOn(&run_cmd.step);
 
+    // --- e2e binary (phase 7: real Kafka smoke, not in the unit test suite) ---
+    const e2e_mod = b.createModule(.{
+        .root_source_file = b.path("src/e2e.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "kafka", .module = kafka_mod },
+        },
+    });
+    const e2e_exe = b.addExecutable(.{
+        .name = "e2e",
+        .root_module = e2e_mod,
+    });
+    b.installArtifact(e2e_exe);
+
+    const e2e_step = b.step("e2e", "Build the e2e smoke binary (requires a running broker)");
+    e2e_step.dependOn(b.getInstallStep());
+
     // --- test step ---
     const test_step = b.step("test", "Run tests");
 

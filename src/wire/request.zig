@@ -65,8 +65,13 @@ pub fn frameRequest(
     switch (hv.request) {
         0 => {},
         1 => try primitives.writeNullableString(&w, client_id),
+        // Header v2 (flexible) adds a trailing tag buffer, but the client_id
+        // is STILL a nullable_string (i16 length + bytes), NOT a compact_string.
+        // The RequestHeader.json spec marks ClientId as flexibleVersions: "none" —
+        // the old-style two-byte length prefix is retained so older brokers can
+        // read the header for any ApiVersionsRequest regardless of version.
         2 => {
-            try primitives.writeNullableCompactString(&w, client_id);
+            try primitives.writeNullableString(&w, client_id);
             try primitives.writeEmptyTagBuffer(&w);
         },
         else => unreachable, // no request header version above 2 exists
@@ -142,25 +147,26 @@ test "frameRequest: v1 header with null client_id" {
     try testing.expectEqualSlices(u8, &want, framed[4..]);
 }
 
-test "frameRequest: v2 header (Metadata), compact client_id + tag buffer" {
+test "frameRequest: v2 header (Metadata), nullable_string client_id + tag buffer" {
     // Metadata v12 → request header v2. api_key=3, version=12.
-    // client_id = "kz" (COMPACT_NULLABLE_STRING = uvarint(len+1)=3, then bytes),
+    // client_id = "kz" (NULLABLE_STRING = i16 length 2, then bytes),
     // trailing TAG_BUFFER = 0x00. body = empty.
+    //
+    // The request header's client_id is ALWAYS a nullable_string (i16 length),
+    // even in flexible header v2 — see RequestHeader.json: flexibleVersions: "none"
+    // for the ClientId field. The v2 header only adds a trailing tag buffer.
     var buf: [64]u8 = undefined;
     const body: RawBody = .{ .bytes = "" };
     const framed = try frameRequest(&buf, .metadata, 12, 42, "kz", body);
     const expected = [_]u8{
-        0x00, 0x00, 0x00, 0x0b, // length = 2+2+4 + (1+2) + 1 = 12? compute below
+        0x00, 0x00, 0x00, 0x0d, // length = 2+2+4 + (2+2) + 1 = 13
         0x00, 0x03, // api_key = 3
         0x00, 0x0c, // api_version = 12
         0x00, 0x00, 0x00, 0x2a, // correlation_id = 42
-        0x03, 0x6b, 0x7a, // client_id compact: uvarint 3, "kz"
+        0x00, 0x02, 0x6b, 0x7a, // client_id = "kz" (nullable_string: i16 len + bytes)
         0x00, // tag buffer
     };
-    // payload = 2+2+4 + 3 + 1 = 12 = 0x0c
-    var fixed = expected;
-    fixed[3] = 0x0c;
-    try testing.expectEqualSlices(u8, &fixed, framed);
+    try testing.expectEqualSlices(u8, &expected, framed);
 }
 
 test "frameRequest: EmptyBody produces header only" {

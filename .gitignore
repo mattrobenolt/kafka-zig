@@ -3,5 +3,6 @@
 zig-out/
 .pi/sessions/
 .pi/history/
+.kafka-e2e/
 *.o
 .DS_Store

@@ -763,8 +763,14 @@ fn brokerAddr(self: *Producer, node_id: i32) ?BrokerInfo {
 fn refreshMetadata(self: *Producer) !void {
     const conn = try self.metadataConnection();
     const body: MetadataBody = .{};
-    const corr = try conn.sendRequest(.metadata, 12, body);
-    const resp_body = try conn.readResponse();
+    const corr = conn.sendRequest(.metadata, 12, body) catch |err| {
+        self.dropMetadataConnection();
+        return err;
+    };
+    const resp_body = conn.readResponse() catch |err| {
+        self.dropMetadataConnection();
+        return err;
+    };
     var payload = try stripHeaderV1(resp_body, corr);
     var resp = try metadata.decodeResponse(self.allocator, &payload);
     defer resp.deinit(self.allocator);
@@ -877,6 +883,19 @@ fn dropLeaderConnection(self: *Producer, leader: i32) void {
     const addr = self.brokerAddr(leader) orelse return;
     var key_buf: [280]u8 = undefined;
     const key = std.fmt.bufPrint(&key_buf, "{s}:{d}", .{ addr.host, addr.port }) catch return;
+    if (self.connections.fetchRemove(key)) |kv| {
+        kv.value.close();
+        self.allocator.free(kv.key);
+    }
+}
+
+/// Drop the bootstrap metadata connection (v1: always bootstrap[0]). Called
+/// when a metadata request fails so the next retry dials a fresh connection
+/// instead of reusing a dead/broken one.
+fn dropMetadataConnection(self: *Producer) void {
+    const b = self.options.bootstrap[0];
+    var key_buf: [280]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "{s}:{d}", .{ b.host, b.port }) catch return;
     if (self.connections.fetchRemove(key)) |kv| {
         kv.value.close();
         self.allocator.free(kv.key);

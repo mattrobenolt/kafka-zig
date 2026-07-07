@@ -186,7 +186,9 @@ const Session = struct {
         switch (hv.request) {
             1 => _ = try primitives.readNullableString(&r),
             2 => {
-                _ = try primitives.readNullableCompactString(&r);
+                // client_id is ALWAYS nullable_string (i16 length) even in v2 —
+                // see RequestHeader.json: flexibleVersions: "none" for ClientId.
+                _ = try primitives.readNullableString(&r);
                 try primitives.readTagBuffer(&r);
             },
             else => {},
