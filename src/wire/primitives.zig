@@ -433,10 +433,22 @@ pub fn writeEmptyTagBuffer(w: *std.Io.Writer) std.Io.Writer.Error!void {
 
 /// Write a tag buffer containing the given tagged fields. Each field is
 /// encoded as uvarint(tag), uvarint(data.len), then the raw data bytes.
+///
+/// **KIP-482 invariant:** tagged fields MUST be serialized in strictly
+/// ascending tag-ID order. This function enforces the invariant with a debug
+/// assertion — callers must pass `fields` sorted ascending by `tag`. The
+/// assertion catches malformed-frame bugs in Debug builds without adding
+/// runtime sorting overhead on the encode path.
+///
 /// Spec: KIP-482 — tagged fields in the TAG_BUFFER.
 pub fn writeTagBuffer(w: *std.Io.Writer, fields: []const TaggedField) std.Io.Writer.Error!void {
     try writeUvarint(w, fields.len);
+    var prev_tag: u64 = 0;
+    var first = true;
     for (fields) |f| {
+        if (!first) assert(f.tag > prev_tag);
+        prev_tag = f.tag;
+        first = false;
         try writeUvarint(w, f.tag);
         try writeUvarint(w, f.data.len);
         try w.writeAll(f.data);
@@ -459,36 +471,55 @@ pub fn readTagBuffer(r: *Reader) error{ EndOfStream, Malformed }!void {
     }
 }
 
-/// Read tagged fields into a caller-provided buffer. Returns the number of
-/// tagged fields read. The `data` slices in `out` point into the reader's
-/// buffer (borrowed, valid until the reader's underlying buffer is freed).
-/// If the tag buffer contains more fields than `out` can hold, returns
-/// `error.Malformed` (the caller should size `out` to the expected maximum).
+/// Read tagged fields, filling known tags and skipping unknown ones.
 ///
-/// No allocation — the caller owns the `out` buffer. Use `findTaggedField`
-/// to look up a specific tag by ID. Spec: KIP-482 — tagged fields.
-pub fn readTaggedFields(r: *Reader, out: []TaggedField) error{ EndOfStream, Malformed }!usize {
+/// `expected_tags` is the list of tag IDs the caller knows how to handle.
+/// `out` is a parallel array of `?[]const u8` (one slot per expected tag)
+/// that the caller MUST initialize to `null`. For each tagged field on the
+/// wire: if its tag ID matches `expected_tags[i]`, `out[i]` is set to the
+/// field's data bytes (borrowed from the reader's buffer). Unknown tag IDs
+/// (not in `expected_tags`) are skipped — their bytes are consumed and
+/// discarded. This is the KIP-482 forward-compatibility invariant: receivers
+/// MUST skip unknown tagged fields so brokers can add tagged fields without
+/// bumping the protocol version.
+///
+/// **KIP-482 ascending-order invariant:** tagged fields on the wire MUST
+/// appear in strictly ascending tag-ID order. A violation (out-of-order or
+/// duplicate tag) returns `error.Malformed`.
+///
+/// `out.len` must equal `expected_tags.len`. No allocation — the caller owns
+/// both arrays. The `data` slices in `out` point into the reader's buffer.
+///
+/// Spec: KIP-482 — tagged fields.
+pub fn readTaggedFields(
+    r: *Reader,
+    expected_tags: []const u64,
+    out: []?[]const u8,
+) error{ EndOfStream, Malformed }!void {
+    assert(out.len == expected_tags.len);
     const count = try readUvarint(r);
-    if (count > out.len) return error.Malformed;
+    var prev_tag: ?u64 = null;
     var i: u64 = 0;
     while (i < count) : (i += 1) {
         const tag = try readUvarint(r);
         const len = try readUvarint(r);
         if (len > std.math.maxInt(usize)) return error.Malformed;
         const data = try r.readSlice(@intCast(len));
-        out[@intCast(i)] = .{ .tag = tag, .data = data };
+        // KIP-482: tags must be strictly ascending on the wire.
+        if (prev_tag) |prev| {
+            if (tag <= prev) return error.Malformed;
+        }
+        prev_tag = tag;
+        // Match against the caller's expected tags. Linear search is fine —
+        // expected_tags is small (typically ≤4 entries).
+        for (expected_tags, 0..) |et, j| {
+            if (tag == et) {
+                out[j] = data;
+                break;
+            }
+        }
+        // If no match, the tag is unknown — skip (bytes already consumed).
     }
-    return @intCast(count);
-}
-
-/// Find a tagged field by tag ID in a slice returned by `readTaggedFields`.
-/// Returns the field's raw data bytes (borrowed from the reader's buffer), or
-/// null if the tag is not present.
-pub fn findTaggedField(fields: []const TaggedField, tag: u64) ?[]const u8 {
-    for (fields) |f| {
-        if (f.tag == tag) return f.data;
-    }
-    return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -878,6 +909,7 @@ test "empty tag buffer is 0x00" {
 
 test "writeTagBuffer with fields round-trips via readTaggedFields" {
     // Two tagged fields: tag 0 with data [0x01, 0x02], tag 3 with data [0xff].
+    // Tags 1 and 2 are expected but absent on the wire → out slots stay null.
     var buf: [16]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     const fields = [_]TaggedField{
@@ -887,47 +919,140 @@ test "writeTagBuffer with fields round-trips via readTaggedFields" {
     try writeTagBuffer(&w, &fields);
 
     var r: Reader = .init(w.buffered());
-    var out: [4]TaggedField = undefined;
-    const n = try readTaggedFields(&r, &out);
-    try testing.expectEqual(@as(usize, 2), n);
-    try testing.expectEqual(@as(u64, 0), out[0].tag);
-    try testing.expectEqualSlices(u8, &.{ 0x01, 0x02 }, out[0].data);
-    try testing.expectEqual(@as(u64, 3), out[1].tag);
-    try testing.expectEqualSlices(u8, &.{0xff}, out[1].data);
+    const expected = [_]u64{ 0, 1, 2, 3 };
+    var out: [4]?[]const u8 = .{ null, null, null, null };
+    try readTaggedFields(&r, &expected, &out);
+    try testing.expectEqualSlices(u8, &.{ 0x01, 0x02 }, out[0].?);
+    try testing.expectEqual(@as(?[]const u8, null), out[1]);
+    try testing.expectEqual(@as(?[]const u8, null), out[2]);
+    try testing.expectEqualSlices(u8, &.{0xff}, out[3].?);
     try testing.expectEqual(@as(usize, 0), r.remaining().len);
 }
 
-test "findTaggedField returns the right field" {
+test "readTaggedFields skips unknown tags and fills knowns" {
+    // KIP-482: receivers MUST skip unknown tagged fields. A tag section with
+    // known tags 0 and 3 plus an unknown tag 99 (ascending: 0, 3, 99) must
+    // decode successfully — known slots filled, unknown skipped, decoding
+    // continues past the unknown tag's bytes.
+    var buf: [32]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
     const fields = [_]TaggedField{
-        .{ .tag = 0, .data = &.{ 0x01, 0x02 } },
+        .{ .tag = 0, .data = &.{0x01} },
         .{ .tag = 3, .data = &.{0xff} },
+        .{ .tag = 99, .data = &.{ 0xde, 0xad, 0xbe, 0xef } },
     };
-    try testing.expectEqualSlices(u8, &.{ 0x01, 0x02 }, findTaggedField(&fields, 0).?);
-    try testing.expectEqualSlices(u8, &.{0xff}, findTaggedField(&fields, 3).?);
-    try testing.expectEqual(@as(?[]const u8, null), findTaggedField(&fields, 99));
+    try writeTagBuffer(&w, &fields);
+
+    var r: Reader = .init(w.buffered());
+    const expected = [_]u64{ 0, 1, 2, 3 };
+    var out: [4]?[]const u8 = .{ null, null, null, null };
+    try readTaggedFields(&r, &expected, &out);
+    try testing.expectEqualSlices(u8, &.{0x01}, out[0].?);
+    try testing.expectEqual(@as(?[]const u8, null), out[1]);
+    try testing.expectEqual(@as(?[]const u8, null), out[2]);
+    try testing.expectEqualSlices(u8, &.{0xff}, out[3].?);
+    // The unknown tag's bytes were consumed — nothing remains.
+    try testing.expectEqual(@as(usize, 0), r.remaining().len);
 }
 
-test "readTaggedFields returns Malformed when out is too small" {
-    // Tag buffer with 3 fields, but out only has room for 2.
+test "readTaggedFields rejects out-of-order tags" {
+    // KIP-482 invariant: tags must be in strictly ascending order on the wire.
+    // Tag 3 followed by tag 1 is malformed.
+    var buf: [32]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    // Manually write out-of-order tags (writeTagBuffer would assert).
+    try writeUvarint(&w, 2); // count=2
+    try writeUvarint(&w, 3); // tag 3
+    try writeUvarint(&w, 1); // size=1
+    try w.writeByte(0xff);
+    try writeUvarint(&w, 1); // tag 1 (out of order!)
+    try writeUvarint(&w, 1); // size=1
+    try w.writeByte(0x01);
+
+    var r: Reader = .init(w.buffered());
+    const expected = [_]u64{ 0, 1, 2, 3 };
+    var out: [4]?[]const u8 = .{ null, null, null, null };
+    try testing.expectError(error.Malformed, readTaggedFields(&r, &expected, &out));
+}
+
+test "readTaggedFields rejects duplicate tags" {
+    // KIP-482: strictly ascending means no duplicates. Tag 0 twice is malformed.
+    var buf: [32]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeUvarint(&w, 2); // count=2
+    try writeUvarint(&w, 0); // tag 0
+    try writeUvarint(&w, 1); // size=1
+    try w.writeByte(0xaa);
+    try writeUvarint(&w, 0); // tag 0 again (duplicate!)
+    try writeUvarint(&w, 1); // size=1
+    try w.writeByte(0xbb);
+
+    var r: Reader = .init(w.buffered());
+    const expected = [_]u64{ 0, 1, 2, 3 };
+    var out: [4]?[]const u8 = .{ null, null, null, null };
+    try testing.expectError(error.Malformed, readTaggedFields(&r, &expected, &out));
+}
+
+test "readTaggedFields rejects field_size exceeding remaining buffer" {
+    // Tag claims 10 bytes of data but only 1 byte follows → EndOfStream.
+    var buf: [16]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeUvarint(&w, 1); // count=1
+    try writeUvarint(&w, 0); // tag 0
+    try writeUvarint(&w, 10); // size=10 (but only 1 byte follows)
+    try w.writeByte(0x01);
+
+    var r: Reader = .init(w.buffered());
+    const expected = [_]u64{0};
+    var out: [1]?[]const u8 = .{null};
+    try testing.expectError(error.EndOfStream, readTaggedFields(&r, &expected, &out));
+}
+
+test "readTaggedFields with empty tag buffer leaves all slots null" {
+    var r: Reader = .init(&.{0x00});
+    const expected = [_]u64{ 0, 1, 2, 3 };
+    var out: [4]?[]const u8 = .{ null, null, null, null };
+    try readTaggedFields(&r, &expected, &out);
+    try testing.expectEqual(@as(?[]const u8, null), out[0]);
+    try testing.expectEqual(@as(?[]const u8, null), out[1]);
+    try testing.expectEqual(@as(?[]const u8, null), out[2]);
+    try testing.expectEqual(@as(?[]const u8, null), out[3]);
+}
+
+test "readTaggedFields with no expected tags skips all wire tags" {
+    // Caller expects zero tags but the wire has 2 unknown tags — must skip
+    // both and succeed (KIP-482 forward-compat).
+    var buf: [16]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const fields = [_]TaggedField{
+        .{ .tag = 5, .data = &.{0xaa} },
+        .{ .tag = 10, .data = &.{0xbb} },
+    };
+    try writeTagBuffer(&w, &fields);
+
+    var r: Reader = .init(w.buffered());
+    var out: [0]?[]const u8 = .{};
+    try readTaggedFields(&r, &.{}, &out);
+    try testing.expectEqual(@as(usize, 0), r.remaining().len);
+}
+
+test "writeTagBuffer accepts strictly ascending tags" {
     var buf: [32]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     const fields = [_]TaggedField{
         .{ .tag = 0, .data = &.{0x01} },
         .{ .tag = 1, .data = &.{0x02} },
-        .{ .tag = 2, .data = &.{0x03} },
+        .{ .tag = 5, .data = &.{0x03} },
     };
     try writeTagBuffer(&w, &fields);
-
+    // Verify the wire bytes: count=3, tag0+data, tag1+data, tag5+data.
     var r: Reader = .init(w.buffered());
-    var out: [2]TaggedField = undefined;
-    try testing.expectError(error.Malformed, readTaggedFields(&r, &out));
-}
-
-test "readTaggedFields with empty tag buffer returns 0" {
-    var r: Reader = .init(&.{0x00});
-    var out: [4]TaggedField = undefined;
-    const n = try readTaggedFields(&r, &out);
-    try testing.expectEqual(@as(usize, 0), n);
+    const expected = [_]u64{ 0, 1, 5 };
+    var out: [3]?[]const u8 = .{ null, null, null };
+    try readTaggedFields(&r, &expected, &out);
+    try testing.expectEqualSlices(u8, &.{0x01}, out[0].?);
+    try testing.expectEqualSlices(u8, &.{0x02}, out[1].?);
+    try testing.expectEqualSlices(u8, &.{0x03}, out[2].?);
 }
 
 // --- reader ----------------------------------------------------------------

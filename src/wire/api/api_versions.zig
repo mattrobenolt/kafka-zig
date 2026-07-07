@@ -155,11 +155,13 @@ pub fn decodeResponse(allocator: std.mem.Allocator, reader: *Reader) !Response {
 
     const throttle_time_ms = try primitives.readI32(reader);
 
-    // Read the trailing tag buffer and extract v3 tagged fields. At most 4
-    // tagged fields (tags 0-3), so a 4-element stack array suffices.
-    var tagged_buf: [4]primitives.TaggedField = undefined;
-    const n_tagged = try primitives.readTaggedFields(reader, &tagged_buf);
-    const tagged = tagged_buf[0..n_tagged];
+    // Read the trailing tag buffer and extract v3 tagged fields. The v3 spec
+    // marks tags 0-3 (supported_features, finalized_features_epoch,
+    // finalized_features, zk_migration_ready). Unknown tags are skipped by
+    // readTaggedFields per KIP-482 forward-compatibility.
+    const v3_tags = [_]u64{ 0, 1, 2, 3 };
+    var tag_data: [4]?[]const u8 = .{ null, null, null, null };
+    try primitives.readTaggedFields(reader, &v3_tags, &tag_data);
 
     // Parse tagged fields. Each tag's data is a borrowed slice into the
     // reader's buffer; we parse it with a sub-Reader and copy owned data.
@@ -178,15 +180,21 @@ pub fn decodeResponse(allocator: std.mem.Allocator, reader: *Reader) !Response {
     var finalized_features_epoch: ?i64 = null;
     var zk_migration_ready: ?bool = null;
 
-    for (tagged) |tf| {
-        var sub: Reader = .init(tf.data);
-        switch (tf.tag) {
-            0 => supported_features = try decodeSupportedFeatures(allocator, &sub),
-            1 => finalized_features_epoch = try primitives.readI64(&sub),
-            2 => finalized_features = try decodeFinalizedFeatures(allocator, &sub),
-            3 => zk_migration_ready = try primitives.readBool(&sub),
-            else => {}, // Skip unknown tagged fields.
-        }
+    if (tag_data[0]) |data| {
+        var sub: Reader = .init(data);
+        supported_features = try decodeSupportedFeatures(allocator, &sub);
+    }
+    if (tag_data[1]) |data| {
+        var sub: Reader = .init(data);
+        finalized_features_epoch = try primitives.readI64(&sub);
+    }
+    if (tag_data[2]) |data| {
+        var sub: Reader = .init(data);
+        finalized_features = try decodeFinalizedFeatures(allocator, &sub);
+    }
+    if (tag_data[3]) |data| {
+        var sub: Reader = .init(data);
+        zk_migration_ready = try primitives.readBool(&sub);
     }
 
     return .{
@@ -896,5 +904,64 @@ test "decode response: finalized_features_epoch = -1 (unknown epoch)" {
     defer resp.deinit(testing.allocator);
 
     try testing.expectEqual(@as(i64, -1), resp.finalized_features_epoch.?);
+    try testing.expectEqual(@as(usize, 0), r.remaining().len);
+}
+
+test "decode response v3: unknown tagged field alongside knowns (KIP-482 forward-compat)" {
+    // KIP-482: receivers MUST skip unknown tagged fields. A future broker may
+    // add tagged fields without bumping the protocol version. This fixture has
+    // the 4 known v3 tags (0-3) plus an unknown tag 99 after them (ascending
+    // order is required on the wire). The decode must succeed, fill the known
+    // v3 fields, and silently skip tag 99.
+    //
+    //   error_code=0, api_keys=[1 entry], throttle=0
+    //   TAG_BUFFER: count=5 (tags 0, 1, 2, 3, 99)
+    //     tag 0: supported_features (1 feature: "kraft.version", min=0, max=1)
+    //     tag 1: finalized_features_epoch = 42
+    //     tag 2: finalized_features (1 feature: "kraft.version", max=1, min=0)
+    //     tag 3: zk_migration_ready = true
+    //     tag 99: unknown, data = [0xde, 0xad, 0xbe, 0xef]
+    const supported_features_data = [_]u8{
+        0x02, // compact array count=1
+        0x0e, 0x6b, 0x72, 0x61, 0x66, 0x74, 0x2e, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, // "kraft.version"
+        0x00, 0x00, // min_version = 0
+        0x00, 0x01, // max_version = 1
+        0x00, // tag buffer
+    };
+    const finalized_features_data = [_]u8{
+        0x02, // compact array count=1
+        0x0e, 0x6b, 0x72, 0x61, 0x66, 0x74, 0x2e, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, // "kraft.version"
+        0x00, 0x01, // max_version_level = 1
+        0x00, 0x00, // min_version_level = 0
+        0x00, // tag buffer
+    };
+    const fixture = [_]u8{
+        0x00, 0x00, // error_code = 0
+        0x02, // api_keys: compact array, count=1
+        0x00, 0x12, 0x00, 0x00, 0x00, 0x03, 0x00, // key=18, min=0, max=3, tag=0x00
+        0x00, 0x00, 0x00, 0x00, // throttle_time_ms = 0
+        0x05, // TAG_BUFFER: count=5 (4 known + 1 unknown)
+        0x00, 0x14, // tag 0, size=20
+    } ++ supported_features_data ++ [_]u8{
+        0x01, 0x08, // tag 1, size=8
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2a, // INT64 = 42
+        0x02, 0x14, // tag 2, size=20
+    } ++ finalized_features_data ++ [_]u8{
+        0x03, 0x01, 0x01, // tag 3, size=1, BOOLEAN true
+        0x63, 0x04, // tag 99 (0x63), size=4 — UNKNOWN
+        0xde, 0xad, 0xbe, 0xef, // unknown tag's data (skipped)
+    };
+
+    var r: Reader = .init(&fixture);
+    var resp = try decodeResponse(testing.allocator, &r);
+    defer resp.deinit(testing.allocator);
+
+    // Known v3 fields are populated.
+    try testing.expectEqual(@as(usize, 1), resp.supported_features.?.len);
+    try testing.expectEqualStrings("kraft.version", resp.supported_features.?[0].name);
+    try testing.expectEqual(@as(i64, 42), resp.finalized_features_epoch.?);
+    try testing.expectEqual(@as(usize, 1), resp.finalized_features.?.len);
+    try testing.expectEqual(true, resp.zk_migration_ready.?);
+    // The unknown tag was consumed — nothing remains in the buffer.
     try testing.expectEqual(@as(usize, 0), r.remaining().len);
 }
