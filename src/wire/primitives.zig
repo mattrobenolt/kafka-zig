@@ -257,7 +257,7 @@ pub fn readNullableString(r: *Reader) error{ EndOfStream, Malformed }!?[]const u
     const len = try readI16(r);
     if (len == -1) return null;
     if (len < 0) return error.Malformed;
-    return try r.readSlice(@intCast(len));
+    return try r.readSlice(@intCast(len)); // ziglint-ignore: Z017
 }
 
 pub fn writeString(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
@@ -294,7 +294,7 @@ pub fn readNullableCompactString(r: *Reader) error{ EndOfStream, Malformed }!?[]
     const len_plus_one = try readUvarint(r);
     if (len_plus_one == 0) return null;
     const len: usize = @intCast(len_plus_one - 1);
-    return try r.readSlice(len);
+    return try r.readSlice(len); // ziglint-ignore: Z017
 }
 
 pub fn writeCompactString(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
@@ -332,7 +332,7 @@ pub fn readNullableBytes(r: *Reader) error{ EndOfStream, Malformed }!?[]const u8
     const len = try readI32(r);
     if (len == -1) return null;
     if (len < 0) return error.Malformed;
-    return try r.readSlice(@intCast(len));
+    return try r.readSlice(@intCast(len)); // ziglint-ignore: Z017
 }
 
 pub fn writeBytes(w: *std.Io.Writer, b: []const u8) std.Io.Writer.Error!void {
@@ -366,7 +366,7 @@ pub fn readNullableCompactBytes(r: *Reader) error{ EndOfStream, Malformed }!?[]c
     const len_plus_one = try readUvarint(r);
     if (len_plus_one == 0) return null;
     const len: usize = @intCast(len_plus_one - 1);
-    return try r.readSlice(len);
+    return try r.readSlice(len); // ziglint-ignore: Z017
 }
 
 pub fn writeCompactBytes(w: *std.Io.Writer, b: []const u8) std.Io.Writer.Error!void {

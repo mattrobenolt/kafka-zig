@@ -98,7 +98,7 @@ pub const Response = struct {
         port: i32,
         rack: ?[]const u8,
 
-        pub fn deinit(self: *Broker, allocator: std.mem.Allocator) void {
+        pub fn deinit(self: *Broker, allocator: std.mem.Allocator) void { // ziglint-ignore: Z023
             allocator.free(self.host);
             if (self.rack) |r| allocator.free(r);
             self.* = undefined;
@@ -114,7 +114,7 @@ pub const Response = struct {
         isr_nodes: []i32,
         offline_replicas: []i32,
 
-        pub fn deinit(self: *Partition, allocator: std.mem.Allocator) void {
+        pub fn deinit(self: *Partition, allocator: std.mem.Allocator) void { // ziglint-ignore: Z023
             allocator.free(self.replica_nodes);
             allocator.free(self.isr_nodes);
             allocator.free(self.offline_replicas);
@@ -130,7 +130,7 @@ pub const Response = struct {
         partitions: []Partition,
         topic_authorized_operations: i32,
 
-        pub fn deinit(self: *Topic, allocator: std.mem.Allocator) void {
+        pub fn deinit(self: *Topic, allocator: std.mem.Allocator) void { // ziglint-ignore: Z023
             if (self.name) |n| allocator.free(n);
             for (self.partitions) |*p| p.deinit(allocator);
             allocator.free(self.partitions);
