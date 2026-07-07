@@ -470,6 +470,11 @@ test "max_batch_bytes splits batches across drains: all eventually ack" {
 
     // Every message must have been acked (no loss despite the capacity split).
     try testing.expectEqual(@as(u32, n), broker.produced.load(.acquire));
+    // And no single Produce request exceeded max_batch_bytes: the broker
+    // records the max total records bytes it saw, which must stay <= the cap.
+    // (Without this, the test would pass even if both batches shipped in one
+    // over-cap request.)
+    try testing.expect(broker.max_produce_records_bytes.load(.acquire) <= cfg.max_batch_bytes);
 }
 
 test "single batch exceeding max_batch_bytes fails MESSAGE_TOO_LARGE" {

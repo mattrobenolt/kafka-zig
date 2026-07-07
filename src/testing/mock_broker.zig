@@ -57,6 +57,9 @@ pub const Broker = struct {
     thread: std.Thread = undefined,
     /// Records the broker acked (error_code 0). The test asserts no loss.
     produced: std.atomic.Value(u32) = .init(0),
+    /// Max total records bytes observed in any single Produce request — lets
+    /// the max_batch_bytes test assert no over-cap request reached the broker.
+    max_produce_records_bytes: std.atomic.Value(u32) = .init(0),
     /// Metadata requests served (the retry test asserts a refresh happened).
     metadata_requests: std.atomic.Value(u32) = .init(0),
     /// Per-partition "already injected a retriable error" flags (mock thread
@@ -308,6 +311,7 @@ const Session = struct {
         var pr_scratch: [max_partitions]produce.PartitionResponse = undefined;
         var tr_scratch: [8]produce.TopicResponse = undefined;
         var tr_len: usize = 0;
+        var total_records_bytes: u32 = 0;
 
         for (0..topic_count) |_| {
             const name = try primitives.readCompactString(&r);
@@ -316,6 +320,7 @@ const Session = struct {
             for (0..part_count) |_| {
                 const index = try primitives.readI32(&r);
                 const records = (try primitives.readNullableCompactBytes(&r)) orelse &.{};
+                total_records_bytes += @intCast(records.len);
                 try primitives.readTagBuffer(&r); // partition tag buffer
 
                 const record_count = recordsCount(records);
@@ -337,6 +342,10 @@ const Session = struct {
             tr_scratch[tr_len] = .{ .name = name, .partition_responses = pr_scratch[0..pr_len] };
             tr_len += 1;
         }
+
+        // Track the max total records bytes in any single Produce request so
+        // the max_batch_bytes test can assert no over-cap request arrived.
+        _ = self.broker.max_produce_records_bytes.fetchMax(total_records_bytes, .acq_rel);
 
         var body: [16 * 1024]u8 = undefined;
         var w: std.Io.Writer = .fixed(&body);
