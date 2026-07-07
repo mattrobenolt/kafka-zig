@@ -29,12 +29,15 @@
 //!      later slot's `await()` — it only delays physical slot reuse. See
 //!      `markAcked` / `markFailed` / `reclaim`.
 //!
-//!   3. Stable handle across retry. A retried message moves to a *new* physical
-//!      slot, but `await()` is keyed to a handle, not a slot. Handles are a
-//!      small pool decoupled from slots; `retry()` claims a new slot, copies the
-//!      payload, and repoints the handle. A per-slot `generation` counter guards
-//!      attribution so a recycled slot's stale ack is never misapplied. See
-//!      `Handle`, `retry`, `markAcked`.
+//!   3. Stable handle across retry. `await()` is keyed to a handle, not a slot.
+//!      Handles are a small pool decoupled from slots. `retry()` re-arms the
+//!      message *in place* (same slot, still pending) and re-notifies the
+//!      network thread — no new slot, so a full ring can never deadlock the
+//!      retry path (the earlier move-to-a-new-slot design, sketched in PLAN
+//!      §2.4, deadlocks when every slot is pending and needs re-enqueue). A
+//!      per-slot `generation` counter still guards attribution so a *recycled*
+//!      slot's stale ack is never misapplied, and `completeSlot` no-ops on any
+//!      non-pending slot. See `Handle`, `retry`, `markAcked`, `completeSlot`.
 //!
 //!   4. Completion signaling. A futex per slot is too expensive at 8K+ slots.
 //!      The completion result lives in the handle (survives slot reclaim), and a
@@ -82,6 +85,17 @@ const result_failed: u32 = status_failed;
 
 // Sentinel free-list link terminator (no valid handle has this index).
 const handle_nil: u32 = math.maxInt(u32);
+
+// Bounded re-check interval for the two cursor waits (`waitNotFull`,
+// `waitForData`). Those futex words (read_head/write_head low bits) can't be
+// perturbed on shutdown without corrupting the cursor, so a waiter that races
+// `requestShutdown` (passes its shutdown re-check, then parks before the wake
+// lands) would sleep on an unchanged word forever. A bounded `timedWait` makes
+// the surrounding loop re-check `shutdown` at worst this often, self-healing
+// any missed wake. The counter waits (`completions`, `handle_freed`) don't need
+// this — `requestShutdown` bumps those words, which self-heals via the value
+// guard.
+const shutdown_poll_ns: u64 = 20 * std.time.ns_per_ms;
 
 // Sentinel partition meaning "let the partitioner decide at batch time".
 pub const partition_unassigned: u32 = math.maxInt(u32);
@@ -139,13 +153,17 @@ const Handle = struct {
     result: atomic.Value(u32),
     /// Broker error code when `result == result_failed`.
     err: atomic.Value(u32),
-    /// Current physical slot (updated by `retry`). Bookkeeping / debugging only;
-    /// not on the `await()` critical path.
+    /// Current physical slot. Bookkeeping / debugging only; not on the
+    /// `await()` critical path.
     slot_index: u32,
     /// Generation of the current (handle <-> slot) binding.
     generation: u32,
-    /// Free-list link; only meaningful while the handle is free.
-    next: u32,
+    /// Treiber free-list link; only meaningful while the handle is free. Read
+    /// in `poolAlloc` and written in `poolFree` concurrently, so it is atomic
+    /// (monotonic) to avoid a data race on the field itself. The head CAS
+    /// (acq_rel) carries the actual synchronization; a stale `next` read just
+    /// loses the CAS and retries.
+    next: atomic.Value(u32),
 };
 
 /// The producer-facing token: acquire returns one, you write into it, commit
@@ -153,9 +171,14 @@ const Handle = struct {
 pub const Message = struct {
     ring: *Ring,
     handle_index: u32,
-    /// The slot claimed at acquire. Valid for the write phase (set*/value/
-    /// commit), which all happen before any retry can move the message.
+    /// The slot claimed at acquire. Retry re-arms in place, so this stays valid
+    /// for the whole lifetime of the message.
     slot_index: u32,
+    /// Broker error code cached out of the handle by `await`/`tryAwait` *before*
+    /// the handle is freed. `failureCode()` reads this, never the handle — the
+    /// handle can be recycled by another producer the instant it is freed, which
+    /// would race a read of `handle.err`. See `finishAwait`.
+    err_code: u32 = 0,
 
     pub fn setTopic(self: Message, name: []const u8) Error!void {
         try self.ring.setTopic(self.slot_index, name);
@@ -187,20 +210,22 @@ pub const Message = struct {
 
     /// Block until the broker acks (or fails) this message. Returns
     /// `error.SendFailed` on a non-retriable broker error, `error.Shutdown` if
-    /// the ring is torn down first.
-    pub fn await(self: Message) Error!void {
-        return self.ring.awaitHandle(self.handle_index);
+    /// the ring is torn down first. Takes `*Message` because it caches the
+    /// failure code into `err_code` before freeing the handle.
+    pub fn await(self: *Message) Error!void {
+        return self.ring.awaitHandle(self.handle_index, &self.err_code);
     }
 
     /// Non-blocking `await`: `error.WouldBlock` if still in flight.
-    pub fn tryAwait(self: Message) Error!void {
-        return self.ring.tryAwaitHandle(self.handle_index);
+    pub fn tryAwait(self: *Message) Error!void {
+        return self.ring.tryAwaitHandle(self.handle_index, &self.err_code);
     }
 
-    /// The broker error code for a failed send (valid after `await` returned
-    /// `error.SendFailed`).
+    /// The broker error code for a failed send (valid after `await`/`tryAwait`
+    /// returned `error.SendFailed`). Reads the value cached into this token, not
+    /// the (possibly-recycled) handle.
     pub fn failureCode(self: Message) u32 {
-        return self.ring.handleAt(self.handle_index).err.load(.acquire);
+        return self.err_code;
     }
 };
 
@@ -276,7 +301,7 @@ pub fn init(gpa: Allocator, config: Config) !Ring {
         handle.err = .init(0);
         handle.slot_index = handle_nil;
         handle.generation = 0;
-        handle.next = if (i + 1 < num_slots) @intCast(i + 1) else handle_nil;
+        handle.next = .init(if (i + 1 < num_slots) @intCast(i + 1) else handle_nil);
     }
 
     assert(math.isPowerOfTwo(num_slots));
@@ -316,15 +341,27 @@ pub fn deinit(self: *Ring, gpa: Allocator) void {
 
 /// Acquire a slot, blocking (futex) while the ring is full. This is the sole
 /// backpressure path. Returns `error.Shutdown` if the ring is torn down.
+///
+/// A handle is claimed FIRST (blocking on the handle pool if exhausted), then
+/// the slot. Claiming the slot advances `write_head`, which publishes the slot
+/// to the consumer as "data available"; doing that before we own a handle would
+/// leave a phantom `status_free` slot below `write_head` with no bound handle
+/// (breaks the invariant and spins the consumer). Handle-first keeps the
+/// invariant: every claimed slot has a bound handle.
 pub fn acquire(self: *Ring) Error!Message {
+    const handle_index = try self.poolAlloc(.block);
+    errdefer self.poolFree(handle_index);
     const pos = try self.claimSlot(.block);
-    return self.bindMessage(pos);
+    return self.bindMessage(pos, handle_index);
 }
 
-/// Non-blocking `acquire`: `error.WouldBlock` when the ring is full.
+/// Non-blocking `acquire`: `error.WouldBlock` when the ring is full or handles
+/// are exhausted.
 pub fn tryAcquire(self: *Ring) Error!Message {
+    const handle_index = try self.poolAlloc(.no_block);
+    errdefer self.poolFree(handle_index);
     const pos = try self.claimSlot(.no_block);
-    return self.bindMessage(pos);
+    return self.bindMessage(pos, handle_index);
 }
 
 const ClaimMode = enum { block, no_block };
@@ -374,18 +411,22 @@ fn waitNotFull(self: *Ring, read_head_seen: u64) Error!void {
     // Re-verify still full against the value we intend to wait on.
     const r = self.read_head.load(.acquire);
     if (r != read_head_seen) return; // moved; go retry the claim.
-    Futex.wait(readHeadLow(self), @truncate(read_head_seen));
+    // Bounded wait so a missed shutdown wake (read_head word can't be bumped)
+    // is recovered by the caller's loop re-checking `shutdown`.
+    // ziglint-ignore: Z026 — Timeout is the intended recovery: the caller loops and re-checks shutdown.
+    Futex.timedWait(readHeadLow(self), @truncate(read_head_seen), shutdown_poll_ns) catch {};
 }
 
-/// Bind a handle to the claimed slot and return the producer token.
-fn bindMessage(self: *Ring, pos: u64) Error!Message {
+/// Bind an already-owned handle to the claimed slot and return the producer
+/// token. The handle is acquired by the caller (`acquire`/`tryAcquire`) before
+/// the slot is claimed — see `acquire` for why.
+fn bindMessage(self: *Ring, pos: u64, handle_index: u32) Message {
     const slot_index: u32 = @intCast(pos & self.mask);
     const slot = &self.slots[slot_index];
     // Generation left by the reclaim that last freed this physical slot,
     // published to us via the read_head acquire-load in `claimSlot`.
     const generation = slot.generation.load(.acquire);
 
-    const handle_index = try self.poolAlloc();
     const handle = &self.handles[handle_index];
     handle.result.store(result_in_flight, .monotonic);
     handle.err.store(0, .monotonic);
@@ -430,15 +471,15 @@ fn commit(self: *Ring, slot_index: u32, value_len: u32) Error!void {
     self.notifyConsumer();
 }
 
-fn awaitHandle(self: *Ring, handle_index: u32) Error!void {
+fn awaitHandle(self: *Ring, handle_index: u32, err_out: *u32) Error!void {
     const handle = &self.handles[handle_index];
     while (true) {
         const result = handle.result.load(.acquire);
-        if (result != result_in_flight) return self.finishAwait(handle_index, result);
+        if (result != result_in_flight) return self.finishAwait(handle_index, result, err_out);
         if (self.shutdown.load(.acquire)) {
             // One last look in case the completion landed before shutdown.
             const final = handle.result.load(.acquire);
-            if (final != result_in_flight) return self.finishAwait(handle_index, final);
+            if (final != result_in_flight) return self.finishAwait(handle_index, final, err_out);
             self.poolFree(handle_index);
             return error.Shutdown;
         }
@@ -453,15 +494,22 @@ fn awaitHandle(self: *Ring, handle_index: u32) Error!void {
     }
 }
 
-fn tryAwaitHandle(self: *Ring, handle_index: u32) Error!void {
+fn tryAwaitHandle(self: *Ring, handle_index: u32, err_out: *u32) Error!void {
     const result = self.handles[handle_index].result.load(.acquire);
     if (result == result_in_flight) return error.WouldBlock;
-    return self.finishAwait(handle_index, result);
+    return self.finishAwait(handle_index, result, err_out);
 }
 
-/// Translate a terminal result into the public return, then free the handle.
-fn finishAwait(self: *Ring, handle_index: u32, result: u32) Error!void {
+/// Translate a terminal result into the public return. Caches the broker error
+/// code into the caller's token *before* freeing the handle: once freed, the
+/// handle can be re-bound by another producer (which resets `err` to 0), so
+/// reading `handle.err` after the free is a data race / use-after-free. The
+/// err read here is safe because we already observed `result != in_flight` via
+/// an acquire-load, which synchronizes-with the network thread's release-store
+/// of `result` that was sequenced after its `err` write in `completeSlot`.
+fn finishAwait(self: *Ring, handle_index: u32, result: u32, err_out: *u32) Error!void {
     assert(result != result_in_flight);
+    err_out.* = self.handles[handle_index].err.load(.acquire);
     self.poolFree(handle_index);
     if (result == result_failed) return error.SendFailed;
     assert(result == result_acked);
@@ -490,7 +538,10 @@ pub fn waitForData(self: *Ring, read_pos: u64) bool {
         defer self.data_waiter.store(false, .monotonic);
         if (self.shutdown.load(.acquire)) return false;
         if (read_pos < self.write_head.load(.acquire)) return true;
-        Futex.wait(writeHeadLow(self), @truncate(head));
+        // Bounded wait: the write_head word can't be perturbed on shutdown, so
+        // recover any missed wake by looping back to the shutdown re-check.
+        // ziglint-ignore: Z026 — Timeout is the intended recovery: the outer loop re-checks shutdown.
+        Futex.timedWait(writeHeadLow(self), @truncate(head), shutdown_poll_ns) catch {};
     }
 }
 
@@ -557,8 +608,14 @@ pub fn markFailed(self: *Ring, index: u64, generation: u32, err: u32) void {
 
 fn completeSlot(self: *Ring, index: u64, generation: u32, status: u32, result: u32, err: u32) void {
     const slot = self.slotAt(index);
+    // Status check FIRST, before the generation check. A slot that is not
+    // currently pending (already acked/failed/stale/free) must never be
+    // completed: a duplicate or late ack for a superseded/reclaimed occupant
+    // could otherwise misapply a completion to whatever handle the slot now
+    // records. This replaces a debug-only assert that silently corrupted in
+    // ReleaseFast.
+    if (slot.status.load(.acquire) != status_pending) return;
     if (slot.generation.load(.acquire) != generation) return; // stale: recycled.
-    assert(slot.status.load(.monotonic) == status_pending);
 
     const handle = &self.handles[slot.handle_index];
     slot.err = err;
@@ -611,43 +668,39 @@ pub fn reclaim(self: *Ring) u64 {
     return reclaimed;
 }
 
-/// Move a still-pending message to a fresh slot and repoint its handle, for the
-/// network thread's retry path. Returns the new logical position, or
-/// `error.WouldBlock` if the ring is momentarily full (caller retries later),
-/// or `error.Shutdown`. The old slot becomes `status_stale` (reclaimable, no
-/// completion). This is a cold path — the payload copy here is not the produce
-/// hot path.
+/// Re-arm a still-pending message *in place* for the network thread's retry
+/// path, and re-notify the consumer to re-send it. Returns the (unchanged)
+/// logical position, or `error.WouldBlock` if the slot is stale/no longer
+/// pending (a late ack won the race — caller drops the retry).
+///
+/// In-place is deliberate. The earlier design (PLAN §2.4) claimed a *new* slot
+/// and marked the old one stale, but that deadlocks when the ring is full and
+/// every slot needs re-enqueue: no old slot can become reclaimable until a
+/// retry succeeds, and no retry can succeed until a slot is free. Staying in
+/// place needs no new slot, keeps the handle<->slot binding and generation
+/// intact (so the eventual ack still matches), and reclaim leaves the slot
+/// alone because it is still pending. This is a cold path.
 pub fn retry(self: *Ring, index: u64, generation: u32) Error!u64 {
-    const old = self.slotAt(index);
-    if (old.generation.load(.acquire) != generation) return error.WouldBlock; // stale.
-    assert(old.status.load(.monotonic) == status_pending);
-    const handle_index = old.handle_index;
-
-    const new_pos = try self.claimSlot(.no_block);
-    const new_index: u32 = @intCast(new_pos & self.mask);
-    const new = &self.slots[new_index];
-
-    self.copyPayload(@intCast(index & self.mask), new_index);
-    new.handle_index = handle_index;
-    new.partition = old.partition;
-    new.timestamp_ms = old.timestamp_ms;
-    new.topic_len = old.topic_len;
-    new.key_len = old.key_len;
-    new.value_len = old.value_len;
-    new.err = 0;
-
-    const handle = &self.handles[handle_index];
-    handle.slot_index = new_index;
-    handle.generation = new.generation.load(.acquire);
-
-    new.status.store(status_pending, .release);
-    old.status.store(status_stale, .release);
+    const slot = self.slotAt(index);
+    if (slot.status.load(.acquire) != status_pending) return error.WouldBlock;
+    if (slot.generation.load(.acquire) != generation) return error.WouldBlock; // stale.
+    // Slot stays pending in place; clear any stale error and re-notify the
+    // network thread to re-send. The handle result is still `in_flight`, so
+    // there is nothing to reset there.
+    slot.err = 0;
     self.notifyConsumer();
-    return new_pos;
+    return index;
 }
 
 pub fn requestShutdown(self: *Ring) void {
     self.shutdown.store(true, .release);
+    // Bump the two dedicated counter words BEFORE waking them. A waiter that
+    // snapshotted the old value and races into `Futex.wait` finds the word
+    // changed and returns immediately (value-guard self-heal) — no lost wakeup.
+    // The two cursor words (read_head/write_head) can't be bumped without
+    // corrupting the cursor, so their waiters use a bounded `timedWait`.
+    _ = self.completions.fetchAdd(1, .release);
+    _ = self.handle_freed.fetchAdd(1, .release);
     // Wake every kind of waiter so nobody is stuck.
     if (self.data_waiter.load(.acquire)) Futex.wake(writeHeadLow(self), 1);
     Futex.wake(readHeadLow(self), math.maxInt(u32));
@@ -663,17 +716,25 @@ pub fn isShutdown(self: *const Ring) bool {
 // Handle pool (Treiber stack, ABA-tagged via a 32-bit generation in the head)
 // ---------------------------------------------------------------------------
 
-fn poolAlloc(self: *Ring) Error!u32 {
+fn poolAlloc(self: *Ring, mode: ClaimMode) Error!u32 {
     while (true) {
         const head = self.pool_head.load(.acquire);
         const index: u32 = @truncate(head);
         if (index == handle_nil) {
             if (self.shutdown.load(.acquire)) return error.Shutdown;
-            try self.waitPool();
-            continue;
+            switch (mode) {
+                .no_block => return error.WouldBlock,
+                .block => {
+                    try self.waitPool();
+                    continue;
+                },
+            }
         }
         const tag: u32 = @truncate(head >> 32);
-        const next = self.handles[index].next;
+        // Monotonic: the head CAS below carries the real synchronization; this
+        // load only needs to be race-free, not ordered. A stale read loses the
+        // CAS and retries.
+        const next = self.handles[index].next.load(.monotonic);
         const new_head: u64 = (@as(u64, tag +% 1) << 32) | next;
         if (self.pool_head.cmpxchgWeak(head, new_head, .acq_rel, .monotonic) == null) {
             return index;
@@ -686,7 +747,7 @@ fn poolFree(self: *Ring, index: u32) void {
         const head = self.pool_head.load(.acquire);
         const head_index: u32 = @truncate(head);
         const tag: u32 = @truncate(head >> 32);
-        self.handles[index].next = head_index;
+        self.handles[index].next.store(head_index, .monotonic);
         const new_head: u64 = (@as(u64, tag +% 1) << 32) | index;
         if (self.pool_head.cmpxchgWeak(head, new_head, .acq_rel, .monotonic) == null) break;
     }
@@ -709,10 +770,6 @@ fn waitPool(self: *Ring) Error!void {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-fn handleAt(self: *Ring, handle_index: u32) *Handle {
-    return &self.handles[handle_index];
-}
-
 /// Base offset of slot `i`'s payload region.
 fn payloadBase(self: *Ring, i: u32) usize {
     return @as(usize, i) * self.bytes_per_slot;
@@ -731,15 +788,6 @@ fn keyBuf(self: *Ring, i: u32) []u8 {
 fn valueBuf(self: *Ring, i: u32) []u8 {
     const base = self.payloadBase(i) + self.max_topic_len + self.max_key_len;
     return self.payload[base..][0..self.max_message_size];
-}
-
-fn copyPayload(self: *Ring, src: u32, dst: u32) void {
-    const src_base = self.payloadBase(src);
-    const dst_base = self.payloadBase(dst);
-    @memcpy(
-        self.payload[dst_base..][0..self.bytes_per_slot],
-        self.payload[src_base..][0..self.bytes_per_slot],
-    );
 }
 
 /// Low 32 bits of the 64-bit cursors, for futex ops. Little-endian only
@@ -931,7 +979,7 @@ test "partial ack: a stuck head slot delays reclaim but not later completions" {
     try testing.expectEqual(@as(u64, 4), ring.reclaim());
 }
 
-test "stable handle across retry: message follows to a new slot" {
+test "stable handle across retry: message re-armed in place, ack completes it" {
     var ring = try Ring.init(testing.allocator, tinyConfig(4));
     defer ring.deinit(testing.allocator);
 
@@ -943,21 +991,47 @@ test "stable handle across retry: message follows to a new slot" {
     try m.commit(3);
     try testing.expectEqual(@as(u32, 0), m.slot_index);
 
-    // Network thread decides to retry: move to a new slot.
-    const new_pos = try ring.retry(0, ring.slotGeneration(0));
-    try testing.expect(new_pos != 0);
-    // Old slot is stale (reclaimable, no completion); payload moved intact.
-    try testing.expectEqual(status_stale, ring.slotAt(0).status.load(.acquire));
-    try testing.expectEqualStrings("orders", ring.slotTopic(new_pos));
-    try testing.expectEqualStrings("abc", ring.slotValueCommitted(new_pos));
+    // Network thread decides to retry: in place, same slot, same generation.
+    const gen0 = ring.slotGeneration(0);
+    const new_pos = try ring.retry(0, gen0);
+    try testing.expectEqual(@as(u64, 0), new_pos); // same slot.
+    try testing.expectEqual(status_pending, ring.slotAt(0).status.load(.acquire));
+    try testing.expectEqual(gen0, ring.slotGeneration(0)); // no generation churn.
+    try testing.expectEqualStrings("orders", ring.slotTopic(0));
+    try testing.expectEqualStrings("abc", ring.slotValueCommitted(0));
 
-    // The message is still in flight (handle followed the move).
+    // Still in flight after retry.
     try testing.expectError(error.WouldBlock, m.tryAwait());
 
-    // Ack the NEW slot; the handle observes it.
-    ring.markAcked(new_pos, ring.slotGeneration(new_pos));
+    // Ack the (unchanged) slot; the handle observes it.
+    ring.markAcked(0, ring.slotGeneration(0));
     ring.wakeCompletions();
     try m.await();
+}
+
+test "completeSlot no-ops on a non-pending slot (stale/double ack)" {
+    var ring = try Ring.init(testing.allocator, tinyConfig(4));
+    defer ring.deinit(testing.allocator);
+
+    var m = try ring.acquire();
+    try m.setTopic("t");
+    try m.commit(1);
+    const gen0 = ring.slotGeneration(0);
+
+    // First ack completes the message and marks the slot acked.
+    ring.markAcked(0, gen0);
+    ring.wakeCompletions();
+    try m.await();
+    try testing.expectEqual(status_acked, ring.slotAt(0).status.load(.acquire));
+
+    // A second (duplicate/late) ack with the SAME generation must no-op — the
+    // slot is no longer pending. The status check runs before the generation
+    // check precisely to catch this; the old assert would have corrupted in
+    // ReleaseFast by re-completing whatever handle the slot records.
+    ring.markAcked(0, gen0);
+    ring.markFailed(0, gen0, 99);
+    try testing.expectEqual(status_acked, ring.slotAt(0).status.load(.acquire));
+    try testing.expectEqual(@as(u32, 0), ring.slotAt(0).err); // untouched.
 }
 
 test "generation counter rejects a recycled slot's stale ack" {
@@ -1105,20 +1179,27 @@ test "multi-producer, single consumer: no loss, all acked" {
     try testing.expectEqual(@as(u32, total), seen.load(.acquire));
 }
 
-test "shutdown unblocks a parked acquire" {
-    var ring = try Ring.init(testing.allocator, tinyConfig(2));
-    defer ring.deinit(testing.allocator);
+// Fix 3: these shutdown tests deliberately do NOT sleep to "ensure the waiter
+// is parked first" — that only proves the easy case (waiter already asleep when
+// the wake lands). The hard case is the lost-wakeup race: the waiter passes its
+// shutdown re-check, then parks *after* `requestShutdown`'s wake already fired.
+// We trigger shutdown immediately after spawning and require the waiter to
+// unblock within a bounded deadline, over many iterations, so a regression
+// (removing the counter bump / the timedWait) would hang and fail the deadline.
 
-    var msgs: [2]Message = undefined;
-    for (&msgs) |*m| {
-        m.* = try ring.acquire();
-        try m.setTopic("t");
-        try m.commit(1);
+fn expectUnblocksBy(result: *atomic.Value(u32), want: u32, deadline_ns: u64) !void {
+    var waited: u64 = 0;
+    const step = 1 * std.time.ns_per_ms;
+    while (result.load(.acquire) == 0) {
+        if (waited >= deadline_ns) return error.TestWaiterStuck;
+        Thread.sleep(step);
+        waited += step;
     }
+    try testing.expectEqual(want, result.load(.acquire));
+}
 
+test "shutdown unblocks an in-flight acquire (no park-first assumption)" {
     const Waiter = struct {
-        ring: *Ring,
-        result: *atomic.Value(u32),
         fn run(r: *Ring, result: *atomic.Value(u32)) void {
             if (r.acquire()) |_| {
                 result.store(1, .release); // unexpected success
@@ -1128,29 +1209,35 @@ test "shutdown unblocks a parked acquire" {
             }
         }
     };
-    var result: atomic.Value(u32) = .init(0);
-    const t = try Thread.spawn(.{}, Waiter.run, .{ &ring, &result });
 
-    Thread.sleep(20 * std.time.ns_per_ms);
-    try testing.expectEqual(@as(u32, 0), result.load(.acquire)); // still parked.
+    var iter: u32 = 0;
+    while (iter < 200) : (iter += 1) {
+        var ring = try Ring.init(testing.allocator, tinyConfig(2));
+        defer ring.deinit(testing.allocator);
+        // Fill the ring so acquire must block on the full futex.
+        var msgs: [2]Message = undefined;
+        for (&msgs) |*m| {
+            m.* = try ring.acquire();
+            try m.setTopic("t");
+            try m.commit(1);
+        }
 
-    ring.requestShutdown();
-    t.join();
-    try testing.expectEqual(@as(u32, 2), result.load(.acquire)); // saw Shutdown.
+        var result: atomic.Value(u32) = .init(0);
+        const t = try Thread.spawn(.{}, Waiter.run, .{ &ring, &result });
+        // No sleep: race the wake against the waiter parking.
+        ring.requestShutdown();
+        expectUnblocksBy(&result, 2, 2 * std.time.ns_per_s) catch |e| {
+            t.join();
+            return e;
+        };
+        t.join();
+    }
 }
 
-test "shutdown unblocks a parked await" {
-    var ring = try Ring.init(testing.allocator, tinyConfig(4));
-    defer ring.deinit(testing.allocator);
-
-    var m = try ring.acquire();
-    try m.setTopic("t");
-    try m.commit(1);
-
+test "shutdown unblocks an in-flight await (no park-first assumption)" {
     const Waiter = struct {
-        msg: Message,
-        result: *atomic.Value(u32),
-        fn run(msg: Message, result: *atomic.Value(u32)) void {
+        fn run(msg_in: Message, result: *atomic.Value(u32)) void {
+            var msg = msg_in;
             if (msg.await()) |_| {
                 result.store(1, .release);
             } else |err| switch (err) {
@@ -1159,15 +1246,221 @@ test "shutdown unblocks a parked await" {
             }
         }
     };
-    var result: atomic.Value(u32) = .init(0);
-    const t = try Thread.spawn(.{}, Waiter.run, .{ m, &result });
+
+    var iter: u32 = 0;
+    while (iter < 200) : (iter += 1) {
+        var ring = try Ring.init(testing.allocator, tinyConfig(4));
+        defer ring.deinit(testing.allocator);
+        var m = try ring.acquire();
+        try m.setTopic("t");
+        try m.commit(1);
+
+        var result: atomic.Value(u32) = .init(0);
+        const t = try Thread.spawn(.{}, Waiter.run, .{ m, &result });
+        // No sleep: shutdown must bump `completions` so a not-yet-parked waiter
+        // re-checks and returns.
+        ring.requestShutdown();
+        expectUnblocksBy(&result, 2, 2 * std.time.ns_per_s) catch |e| {
+            t.join();
+            return e;
+        };
+        t.join();
+    }
+}
+
+test "failureCode survives the handle being recycled by another producer (Fix 1)" {
+    // One physical slot + one handle: the moment the failing message frees its
+    // handle, a second producer re-binds it and resets `handle.err` to 0. If
+    // failureCode read the handle (not the cached token value), it would race
+    // to 0. Loop enough to expose the race were it present.
+    var iter: u32 = 0;
+    while (iter < 2000) : (iter += 1) {
+        var ring = try Ring.init(testing.allocator, tinyConfig(1));
+        defer ring.deinit(testing.allocator);
+
+        var a = try ring.acquire();
+        try a.setTopic("t");
+        try a.commit(1);
+        ring.markFailed(0, ring.slotGeneration(0), 42);
+        ring.wakeCompletions();
+
+        // A second producer that will grab the freed handle + reclaimed slot
+        // the instant they are available, resetting err to 0.
+        const Grabber = struct {
+            fn run(r: *Ring, started: *atomic.Value(bool)) void {
+                started.store(true, .release);
+                var b = r.acquire() catch return;
+                b.setTopic("t") catch return;
+                b.commit(1) catch return;
+                r.markAcked(b.slot_index, r.slotGeneration(b.slot_index));
+                r.wakeCompletions();
+                b.await() catch {}; // ziglint-ignore: Z026 — grabber only churns the handle; outcome irrelevant.
+            }
+        };
+        var started: atomic.Value(bool) = .init(false);
+
+        try testing.expectError(error.SendFailed, a.await());
+        // Free the slot so the grabber can proceed, then let it race.
+        try testing.expectEqual(@as(u64, 1), ring.reclaim());
+        const t = try Thread.spawn(.{}, Grabber.run, .{ &ring, &started });
+        // Read failureCode while the grabber is actively re-binding the handle.
+        try testing.expectEqual(@as(u32, 42), a.failureCode());
+        t.join();
+        try testing.expectEqual(@as(u32, 42), a.failureCode());
+    }
+}
+
+test "full ring: every slot fails retriably, retry all in place, then ack all (Fix 5)" {
+    // The move-to-a-new-slot retry deadlocks here: no slot is reclaimable until
+    // a retry succeeds, and no retry can claim a slot because all are pending.
+    // In-place retry must not deadlock.
+    var ring = try Ring.init(testing.allocator, tinyConfig(8));
+    defer ring.deinit(testing.allocator);
+
+    var msgs: [8]Message = undefined;
+    for (&msgs) |*m| {
+        m.* = try ring.acquire();
+        try m.setTopic("t");
+        try m.commit(1);
+    }
+    // Ring is full; retry every slot in place — must all succeed, no WouldBlock.
+    for (0..8) |pos| {
+        const new_pos = try ring.retry(pos, ring.slotGeneration(pos));
+        try testing.expectEqual(@as(u64, pos), new_pos);
+        try testing.expectEqual(status_pending, ring.slotAt(pos).status.load(.acquire));
+    }
+    // Still all in flight.
+    for (&msgs) |*m| try testing.expectError(error.WouldBlock, m.tryAwait());
+    // Now ack all; every await returns.
+    for (0..8) |pos| ring.markAcked(pos, ring.slotGeneration(pos));
+    ring.wakeCompletions();
+    for (&msgs) |*m| try m.await();
+    try testing.expectEqual(@as(u64, 8), ring.reclaim());
+}
+
+test "acquire blocks on handle exhaustion, not a phantom write_head slot (Fix 6)" {
+    var ring = try Ring.init(testing.allocator, tinyConfig(2));
+    defer ring.deinit(testing.allocator);
+
+    // Fill the ring, ack + reclaim every slot, but DON'T await — handles stay
+    // owned. Ring is now empty (read_head caught up) yet 0 handles are free.
+    var msgs: [2]Message = undefined;
+    for (&msgs) |*m| {
+        m.* = try ring.acquire();
+        try m.setTopic("t");
+        try m.commit(1);
+    }
+    for (0..2) |pos| ring.markAcked(pos, ring.slotGeneration(pos));
+    ring.wakeCompletions();
+    try testing.expectEqual(@as(u64, 2), ring.reclaim());
+    const wh_before = ring.writeHead();
+
+    // acquire() must block on the handle pool (all handles owned) and must NOT
+    // advance write_head into a phantom, handle-less slot.
+    const Waiter = struct {
+        fn run(r: *Ring, done: *atomic.Value(bool)) void {
+            var m = r.acquire() catch return;
+            m.setTopic("t") catch return;
+            m.commit(1) catch return;
+            done.store(true, .release);
+        }
+    };
+    var done: atomic.Value(bool) = .init(false);
+    const t = try Thread.spawn(.{}, Waiter.run, .{ &ring, &done });
 
     Thread.sleep(20 * std.time.ns_per_ms);
-    try testing.expectEqual(@as(u32, 0), result.load(.acquire));
+    try testing.expect(!done.load(.acquire)); // blocked on handle exhaustion.
+    try testing.expectEqual(wh_before, ring.writeHead()); // no phantom slot.
 
-    ring.requestShutdown();
+    // Await one owned handle — frees it — and the blocked acquire proceeds.
+    try msgs[0].await();
     t.join();
-    try testing.expectEqual(@as(u32, 2), result.load(.acquire));
+    try testing.expect(done.load(.acquire));
+    try testing.expectEqual(wh_before + 1, ring.writeHead());
+
+    // Drain the tail so the ring is quiescent.
+    try msgs[1].await();
+    const tail = wh_before; // logical pos of the waiter's slot.
+    try testing.expect(ackOne(&ring, tail));
+    ring.wakeCompletions();
+    _ = ring.reclaim();
+}
+
+test "stress: multi-producer + consumer with randomized ack/retry/reclaim/shutdown" {
+    // The committed stress harness. Small ring + many producers forces heavy
+    // backpressure (acquire blocking on full and on handle exhaustion), while a
+    // single consumer randomly acks or retries-in-place and reclaims. This is
+    // what exercises fixes 1/2/3/4/6 under contention across optimize modes.
+    // Runs under whatever `-Doptimize` the test suite is built with.
+    const num_producers = 6;
+    const per_producer = 60;
+    const total: u32 = num_producers * per_producer;
+
+    const Producer = struct {
+        fn run(r: *Ring, acked: *atomic.Value(u32), seed: u64) void {
+            var prng = std.Random.DefaultPrng.init(seed);
+            const rng = prng.random();
+            var i: u32 = 0;
+            while (i < per_producer) : (i += 1) {
+                var m = r.acquire() catch return;
+                m.setTopic("t") catch return;
+                const dst = m.value();
+                dst[0] = @truncate(i);
+                m.commit(1) catch return;
+                m.await() catch return; // any completion (ack) is success here.
+                _ = acked.fetchAdd(1, .acq_rel);
+                if (rng.boolean()) std.atomic.spinLoopHint();
+            }
+        }
+    };
+
+    const Consumer = struct {
+        fn run(r: *Ring, seed: u64) void {
+            var prng = std.Random.DefaultPrng.init(seed);
+            const rng = prng.random();
+            while (true) {
+                const w = r.writeHead();
+                var pos = r.readHead();
+                while (pos < w) : (pos += 1) {
+                    const slot = r.slotAt(pos);
+                    if (slot.status.load(.acquire) != status_pending) continue;
+                    const gen = r.slotGeneration(pos);
+                    // ~1 in 4 pending slots gets a retry-in-place instead of an
+                    // ack this pass; it stays pending and is acked on a later
+                    // pass, so completion is guaranteed to terminate.
+                    if (rng.uintLessThan(u8, 4) == 0) {
+                        // ziglint-ignore: Z026 — WouldBlock/Shutdown here: nothing to do, ack it next pass.
+                        _ = r.retry(pos, gen) catch {};
+                    } else {
+                        r.markAcked(pos, gen);
+                    }
+                }
+                r.wakeCompletions();
+                _ = r.reclaim();
+                if (r.readHead() >= w) {
+                    if (!r.waitForData(r.readHead())) return;
+                }
+            }
+        }
+    };
+
+    var iter: u32 = 0;
+    while (iter < 20) : (iter += 1) {
+        var ring = try Ring.init(testing.allocator, tinyConfig(16));
+        defer ring.deinit(testing.allocator);
+
+        var acked: atomic.Value(u32) = .init(0);
+        const consumer = try Thread.spawn(.{}, Consumer.run, .{ &ring, 0x5eed ^ iter });
+        var producers: [num_producers]Thread = undefined;
+        for (&producers, 0..) |*p, k| {
+            p.* = try Thread.spawn(.{}, Producer.run, .{ &ring, &acked, iter *% 131 +% k });
+        }
+        for (&producers) |*p| p.join();
+
+        ring.requestShutdown();
+        consumer.join();
+        try testing.expectEqual(total, acked.load(.acquire));
+    }
 }
 
 test "init rounds slot count up to a power of two" {
