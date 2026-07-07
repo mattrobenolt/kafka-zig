@@ -502,7 +502,7 @@ The e2e is a smoke test, not the primary signal. The mock broker is.
     and `mod.link_libc = true` (libzstd needs libc). Pass a build option
     (`build_options.zstd_enabled`) into the module so `compress.zig` can
     `@import("build_options").zstd_enabled` and either expose the zstd codec or
-    return `error.CompressionUnavailable` at runtime. Default build links no
+    return `error.CompressionNotImplemented` at runtime. Default build links no
     extra library.
 - `flake.nix`: add `apache-kafka` (and `openjdk` if transitively needed) and
   `zstd` (for the `-Dzstd=true` path) to the devshell. Keep `zig_0_15`/`zls_0_15`.
