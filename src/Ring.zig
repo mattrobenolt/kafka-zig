@@ -212,18 +212,36 @@ pub const Message = struct {
     /// `error.SendFailed` on a non-retriable broker error, `error.Shutdown` if
     /// the ring is torn down first. Takes `*Message` because it caches the
     /// failure code into `err_code` before freeing the handle.
+    ///
+    /// A `Message` is single-use: exactly one `await` (or `tryAwait` that
+    /// completes). A double-await is a caller contract violation that would
+    /// double-free the handle pool; the `handle_nil` sentinel catches it in
+    /// Debug/ReleaseSafe. `failureCode` remains valid after await.
     pub fn await(self: *Message) Error!void {
-        return self.ring.awaitHandle(self.handle_index, &self.err_code);
+        assert(self.handle_index != handle_nil); // double-await guard.
+        self.ring.awaitHandle(self.handle_index, &self.err_code) catch |err| {
+            // On Shutdown, awaitHandle already freed the handle; mark it nil
+            // so a second call hits the assert instead of double-freeing.
+            self.handle_index = handle_nil;
+            return err;
+        };
+        self.handle_index = handle_nil;
     }
 
     /// Non-blocking `await`: `error.WouldBlock` if still in flight.
     pub fn tryAwait(self: *Message) Error!void {
-        return self.ring.tryAwaitHandle(self.handle_index, &self.err_code);
+        assert(self.handle_index != handle_nil); // double-await guard.
+        self.ring.tryAwaitHandle(self.handle_index, &self.err_code) catch |err| {
+            if (err != error.WouldBlock) self.handle_index = handle_nil;
+            return err;
+        };
+        self.handle_index = handle_nil;
     }
 
     /// The broker error code for a failed send (valid after `await`/`tryAwait`
     /// returned `error.SendFailed`). Reads the value cached into this token, not
-    /// the (possibly-recycled) handle.
+    /// the (possibly-recycled) handle. Does NOT assert the guard — it is valid
+    /// after await has completed and set the sentinel.
     pub fn failureCode(self: Message) u32 {
         return self.err_code;
     }
@@ -1468,6 +1486,63 @@ test "stress: multi-producer + consumer with randomized ack/retry/reclaim/shutdo
         consumer.join();
         try testing.expectEqual(total, acked.load(.acquire));
     }
+}
+
+test "double-await guard: handle_index is handle_nil after await" {
+    // A Message is single-use: exactly one await. A second await would
+    // double-free the handle pool. The `await`/`tryAwait`/`failureCode` methods
+    // assert `handle_index != handle_nil` on entry, catching the misuse in
+    // Debug/ReleaseSafe. This test verifies the observable contract: after
+    // a successful await, handle_index is the sentinel. (The assert itself
+    // panics rather than returning an error, so it can't be caught with
+    // expectError — the sentinel state is the testable surface.)
+    var ring = try Ring.init(testing.allocator, tinyConfig(4));
+    defer ring.deinit(testing.allocator);
+
+    var m = try ring.acquire();
+    try m.setTopic("t");
+    try m.commit(1);
+
+    try testing.expect(ackOne(&ring, 0));
+    ring.wakeCompletions();
+    try m.await();
+
+    try testing.expectEqual(handle_nil, m.handle_index);
+}
+
+test "handle_index is handle_nil after failed await" {
+    var ring = try Ring.init(testing.allocator, tinyConfig(4));
+    defer ring.deinit(testing.allocator);
+
+    var m = try ring.acquire();
+    try m.setTopic("t");
+    try m.commit(1);
+
+    ring.markFailed(0, ring.slotGeneration(0), 42);
+    ring.wakeCompletions();
+    try testing.expectError(error.SendFailed, m.await());
+
+    try testing.expectEqual(handle_nil, m.handle_index);
+}
+
+test "handle_index is NOT handle_nil after tryAwait WouldBlock" {
+    // tryAwait returning WouldBlock must NOT set the sentinel — the message
+    // is still in flight and can be awaited later.
+    var ring = try Ring.init(testing.allocator, tinyConfig(4));
+    defer ring.deinit(testing.allocator);
+
+    var m = try ring.acquire();
+    try m.setTopic("t");
+    try m.commit(1);
+
+    try testing.expectError(error.WouldBlock, m.tryAwait());
+    try testing.expect(m.handle_index != handle_nil);
+
+    // Now complete and await normally.
+    try testing.expect(ackOne(&ring, 0));
+    ring.wakeCompletions();
+    try m.await();
+    try testing.expectEqual(handle_nil, m.handle_index);
 }
 
 test "init rounds slot count up to a power of two" {

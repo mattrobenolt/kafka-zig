@@ -200,6 +200,8 @@ pub fn decodeResponse(allocator: std.mem.Allocator, reader: *Reader) !Response {
     // responses: COMPACT_ARRAY.
     const resp_count = try primitives.readCompactArrayCount(reader);
     const n_responses = resp_count orelse return error.Malformed;
+    // Cap: every response element is ≥1 byte on the wire.
+    if (n_responses > reader.remaining().len) return error.Malformed;
     const responses = try allocator.alloc(TopicResponse, n_responses);
     var responses_len: usize = 0;
     errdefer {
@@ -228,6 +230,8 @@ fn decodeTopicResponse(allocator: std.mem.Allocator, reader: *Reader) !TopicResp
 
     const part_count = try primitives.readCompactArrayCount(reader);
     const n_parts = part_count orelse return error.Malformed;
+    // Cap: every partition_response element is ≥1 byte on the wire.
+    if (n_parts > reader.remaining().len) return error.Malformed;
     const partitions = try allocator.alloc(PartitionResponse, n_parts);
     var parts_len: usize = 0;
     errdefer {
@@ -256,6 +260,8 @@ fn decodePartitionResponse(allocator: std.mem.Allocator, reader: *Reader) !Parti
     // record_errors: COMPACT_ARRAY.
     const re_count = try primitives.readCompactArrayCount(reader);
     const n_re = re_count orelse return error.Malformed;
+    // Cap: every record_error element is ≥1 byte on the wire.
+    if (n_re > reader.remaining().len) return error.Malformed;
     const record_errors = try allocator.alloc(RecordError, n_re);
     var re_len: usize = 0;
     errdefer {
@@ -1019,4 +1025,51 @@ test "decode response: truncation during record_errors leaks nothing" {
         error.EndOfStream,
         decodeResponse(testing.allocator, &r),
     );
+}
+
+test "decode response: huge responses count with few bytes → Malformed (no huge alloc)" {
+    // A frame claiming a massive responses array count but with only a few
+    // bytes of data. The count cap must reject it as Malformed before any alloc.
+    const huge_count: u64 = 1_000_000 + 1;
+    var fixture: [16]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&fixture);
+    try primitives.writeUvarint(&w, huge_count); // responses: huge count
+    const written = w.buffered();
+
+    var r: Reader = .init(written);
+    try testing.expectError(error.Malformed, decodeResponse(testing.allocator, &r));
+}
+
+test "decode response: huge partition_responses count → Malformed" {
+    // Topic name decodes, then partition_responses claims a huge count.
+    const huge_count: u64 = 1_000_000 + 1;
+    var fixture: [32]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&fixture);
+    try primitives.writeUvarint(&w, 2); // responses: count=1
+    try primitives.writeCompactString(&w, "t"); // name
+    try primitives.writeUvarint(&w, huge_count); // partition_responses: huge
+    const written = w.buffered();
+
+    var r: Reader = .init(written);
+    try testing.expectError(error.Malformed, decodeResponse(testing.allocator, &r));
+}
+
+test "decode response: huge record_errors count → Malformed" {
+    // Partition fields decode up to record_errors, which claims a huge count.
+    const huge_count: u64 = 1_000_000 + 1;
+    var fixture: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&fixture);
+    try primitives.writeUvarint(&w, 2); // responses: count=1
+    try primitives.writeCompactString(&w, "t"); // name
+    try primitives.writeUvarint(&w, 2); // partition_responses: count=1
+    try primitives.writeI32(&w, 0); // index
+    try primitives.writeI16(&w, 0); // error_code
+    try primitives.writeI64(&w, 0); // base_offset
+    try primitives.writeI64(&w, -1); // log_append_time_ms
+    try primitives.writeI64(&w, 0); // log_start_offset
+    try primitives.writeUvarint(&w, huge_count); // record_errors: huge
+    const written = w.buffered();
+
+    var r: Reader = .init(written);
+    try testing.expectError(error.Malformed, decodeResponse(testing.allocator, &r));
 }

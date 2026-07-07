@@ -73,6 +73,11 @@ pub const Config = struct {
     insecure_skip_verify: bool = false,
     scram: ScramConfig,
     client_id: ?[]const u8 = null,
+    /// Socket I/O timeout in milliseconds (SO_RCVTIMEO + SO_SNDTIMEO). A
+    /// slow/malicious broker that completes TLS then stalls will hit this and
+    /// map to `error.ConnectionClosed` so the drop-and-reconnect path handles
+    /// it. 0 = no timeout (block indefinitely, the pre-hardening behavior).
+    io_timeout_ms: u32 = 30_000,
 };
 
 pub const Error = error{
@@ -129,6 +134,9 @@ correlation_id: i32,
 /// `client_id_len == null` means no client_id (encode as a null string).
 client_id_storage: [max_client_id_len]u8 = undefined,
 client_id_len: ?usize = null,
+/// Socket I/O timeout in ms (0 = none). Set via SO_RCVTIMEO/SO_SNDTIMEO at
+/// dial. A timed-out read/write maps to `error.ConnectionClosed`.
+io_timeout_ms: u32 = 0,
 
 /// Dial, TLS-handshake, and SASL-authenticate a broker connection.
 ///
@@ -153,6 +161,17 @@ pub fn dial(allocator: std.mem.Allocator, config: Config) !*Connection {
     };
     errdefer stream.close();
 
+    // Set socket I/O timeouts (SO_RCVTIMEO + SO_SNDTIMEO) so a slow/malicious
+    // broker that completes TLS then stalls cannot hang the network thread
+    // indefinitely (liveness DoS: ring fills, all acquire/await hang). A
+    // timed-out read/write returns EAGAIN → error.WouldBlock, which `read`/
+    // `writeAll` map to `error.ConnectionClosed` so the drop-and-reconnect path
+    // handles it. On macOS and Linux, SO_RCVTIMEO/SO_SNDTIMEO use a `timeval`
+    // with {sec, usec}. A timeout of 0 means no timeout (skip the syscall).
+    if (config.io_timeout_ms > 0) {
+        try setSocketTimeout(stream, config.io_timeout_ms);
+    }
+
     self.* = .{
         .allocator = allocator,
         .stream = stream,
@@ -167,6 +186,7 @@ pub fn dial(allocator: std.mem.Allocator, config: Config) !*Connection {
         .correlation_id = 0,
         .client_id_storage = undefined,
         .client_id_len = null,
+        .io_timeout_ms = config.io_timeout_ms,
     };
 
     // Own a copy of client_id before anything else can borrow the Config; the
@@ -276,6 +296,30 @@ fn setClientId(self: *Connection, client_id: ?[]const u8) !void {
 }
 
 // ---------------------------------------------------------------------------
+// Socket I/O timeout (SO_RCVTIMEO + SO_SNDTIMEO)
+// ---------------------------------------------------------------------------
+
+/// Set SO_RCVTIMEO and SO_SNDTIMEO on the stream's socket so a stalled broker
+/// cannot hang the network thread indefinitely. `timeout_ms` is the timeout for
+/// both directions. On timeout, read/write return EAGAIN → `error.WouldBlock`,
+/// which `read`/`writeAll` map to `error.ConnectionClosed`.
+///
+/// Platform note: both macOS and Linux use `struct timeval` {sec, usec} for
+/// SO_RCVTIMEO/SO_SNDTIMEO. The `std.posix.setsockopt` wrapper takes a
+/// `[]const u8` opt slice, so we serialize the timeval to bytes. This is cold
+/// path (dial time, once per connection).
+fn setSocketTimeout(stream: std.net.Stream, timeout_ms: u32) !void {
+    const posix = std.posix;
+    const tv: posix.timeval = .{
+        .sec = @intCast(timeout_ms / std.time.ms_per_s),
+        .usec = @intCast((timeout_ms % std.time.ms_per_s) * std.time.us_per_ms),
+    };
+    const opt = std.mem.asBytes(&tv);
+    try posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, opt);
+    try posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, opt);
+}
+
+// ---------------------------------------------------------------------------
 // TLS drive loop
 // ---------------------------------------------------------------------------
 
@@ -357,22 +401,31 @@ fn handleKeyUpdate(self: *Connection, ku: ztls.ClientHandshake.KeyUpdateEvent) !
     }
 }
 
-/// `stream.read`, normalizing "peer went away" transport errors into
-/// `Error.ConnectionClosed` so a broker that vanishes mid-exchange yields one
-/// deterministic error regardless of whether the OS reports EOF or a reset.
+/// `stream.read`, normalizing "peer went away" and timeout errors into
+/// `Error.ConnectionClosed` so a broker that vanishes or stalls mid-exchange
+/// yields one deterministic error regardless of whether the OS reports EOF,
+/// a reset, or an EAGAIN from SO_RCVTIMEO. The `WouldBlock` prong covers the
+/// timeout case: SO_RCVTIMEO expires → EAGAIN → error.WouldBlock. (ETIMEDOUT
+/// from keepalive is also mapped, though SO_RCVTIMEO produces EAGAIN on both
+/// macOS and Linux.)
 fn read(self: *Connection, buf: []u8) !usize {
     return self.stream.read(buf) catch |err| switch (err) {
-        error.ConnectionResetByPeer, error.BrokenPipe, error.ConnectionTimedOut => Error.ConnectionClosed,
+        error.ConnectionResetByPeer,
+        error.BrokenPipe,
+        error.ConnectionTimedOut,
+        error.WouldBlock,
+        => Error.ConnectionClosed,
         else => err,
     };
 }
 
-/// `stream.writeAll`, normalizing peer-gone errors like `read`. Note the write
-/// error set has no `ConnectionTimedOut` (that only arises on `read`), so
-/// unlike `read` there is no timeout prong to fold in here.
+/// `stream.writeAll`, normalizing peer-gone and timeout errors like `read`.
+/// SO_SNDTIMEO expiry produces EAGAIN → error.WouldBlock on both macOS and
+/// Linux. `ConnectionTimedOut` is not in the write error set (it only arises
+/// from keepalive on read), so it is not mapped here.
 fn writeAll(self: *Connection, bytes: []const u8) !void {
     self.stream.writeAll(bytes) catch |err| switch (err) {
-        error.ConnectionResetByPeer, error.BrokenPipe => return Error.ConnectionClosed,
+        error.ConnectionResetByPeer, error.BrokenPipe, error.WouldBlock => return Error.ConnectionClosed,
         else => return err,
     };
 }
@@ -445,7 +498,7 @@ fn scramExchange(self: *Connection, comptime S: type, cfg: ScramConfig) !void {
     sf.deinit(self.allocator);
     if (sf_err != 0) return Error.SaslAuthenticationFailed;
 
-    const result = try S.processServerFirstWithPassword(server_first, &client_first, cfg.password);
+    const result = try S.processServerFirstWithPassword(server_first, &client_first, cfg.password, null);
 
     // client-final → server-final
     var ff = try self.saslAuthenticate(result.client_final_message.bytes());
@@ -610,6 +663,27 @@ test "dial: broker closes mid-handshake → ConnectionClosed" {
         Error.ConnectionClosed,
         runAuthTest(.{ .mode = .close_after_tls, .password = mock_password }),
     );
+}
+
+test "setSocketTimeout: setsockopt succeeds on a loopback stream" {
+    // Verify the SO_RCVTIMEO + SO_SNDTIMEO setsockopt calls succeed on a
+    // freshly-dialed loopback TCP stream. This exercises the exact syscall
+    // path used at dial time. A deterministic timeout-triggered read test
+    // would require a slow broker; the setsockopt success is the minimum bar.
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{ .reuse_address = true });
+    defer server.deinit();
+
+    const port = server.listen_address.getPort();
+    const conn = try std.net.tcpConnectToAddress(try std.net.Address.parseIp("127.0.0.1", port));
+    defer conn.close();
+
+    // Accept on the server side so the connect completes.
+    const accepted = try server.accept();
+    defer accepted.stream.close();
+
+    // Must not error.
+    try setSocketTimeout(conn, 5_000);
 }
 
 // --- test harness ---------------------------------------------------------

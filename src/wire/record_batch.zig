@@ -494,6 +494,13 @@ pub fn decodeBatch(allocator: std.mem.Allocator, reader: *Reader) (DecodeError |
         records_reader = &decompressed_reader;
     }
 
+    // Cap: every record is ≥1 byte on the wire, so a count > remaining bytes
+    // is malformed. This prevents a huge alloc from a small/corrupt frame.
+    // NOTE: record_batch decode is not reachable from broker input in this
+    // producer-only lib (the producer encodes, never decodes from a broker),
+    // but the cap is cheap defense-in-depth for the mock-broker/test path.
+    if (@as(usize, @intCast(records_count)) > records_reader.remaining().len) return error.Malformed;
+
     const records = try allocator.alloc(Record, @intCast(records_count));
     var records_len: usize = 0;
     errdefer {
@@ -560,6 +567,8 @@ fn decodeRecord(allocator: std.mem.Allocator, reader: *Reader) !Record {
     // headersCount: varint (zigzag i32, 0 = no headers)
     const headers_count = try primitives.readVarint(reader);
     if (headers_count < 0) return error.Malformed;
+    // Cap: every header is ≥1 byte on the wire (key length varint + key bytes).
+    if (@as(usize, @intCast(headers_count)) > reader.remaining().len) return error.Malformed;
     const headers = try allocator.alloc(Header, @intCast(headers_count));
     var headers_len: usize = 0;
     errdefer {
@@ -1222,6 +1231,34 @@ const record_batch_corpus: []const []const u8 = &.{
     &([_]u8{0x00} ** 64), // all zeros
     &([_]u8{0xff} ** 64), // all ones
 };
+
+test "decodeBatch: huge records_count with few bytes → Malformed (no huge alloc)" {
+    // A valid batch header with records_count inflated to a huge value. The
+    // CRC is recomputed so the CRC gate passes, then the count cap rejects
+    // before the alloc. This proves the cap fires on the record-allocation
+    // path (not just the CRC gate).
+    const records = [_]Record{.{
+        .offset_delta = 0,
+        .timestamp_delta = 0,
+        .key = "k1",
+        .value = "v1",
+        .headers = &.{},
+    }};
+
+    var buf: [256]u8 = undefined;
+    const bytes = try encodeBatch(&buf, &records, .{});
+
+    // Inflate recordsCount from 1 to 1_000_000 and recompute the CRC.
+    const records_count_off = 57;
+    const crc_region_start = 21;
+    const crc_off = 17;
+    std.mem.writeInt(u32, bytes[records_count_off..][0..4], 1_000_000, .big);
+    const fixed_crc = Crc32C.hash(bytes[crc_region_start..]);
+    std.mem.writeInt(u32, bytes[crc_off..][0..4], fixed_crc, .big);
+
+    var r: Reader = .init(bytes);
+    try testing.expectError(error.Malformed, decodeBatch(testing.allocator, &r));
+}
 
 test "fuzz record_batch decodeBatch" {
     try std.testing.fuzz(std.testing.allocator, fuzzDecodeBatch, .{ .corpus = record_batch_corpus });

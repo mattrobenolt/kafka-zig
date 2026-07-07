@@ -100,6 +100,9 @@ pub const Config = struct {
     client_id: ?[]const u8 = null,
     /// Produce request timeout (ms) sent to the broker.
     request_timeout_ms: i32 = 30_000,
+    /// Socket I/O timeout (ms) for broker reads/writes (SO_RCVTIMEO +
+    /// SO_SNDTIMEO). A stalled broker hits this and triggers reconnect.
+    io_timeout_ms: u32 = 30_000,
     max_retries: u8 = 8,
 };
 
@@ -155,6 +158,7 @@ pub fn init(allocator: Allocator, config: Config) !*Client {
         .strategy = config.partitioner,
         .max_retries = config.max_retries,
         .retry_backoff_ns = @as(u64, config.linger_ms) * std.time.ns_per_ms,
+        .io_timeout_ms = config.io_timeout_ms,
     });
     errdefer self.producer.deinit();
 
@@ -163,11 +167,21 @@ pub fn init(allocator: Allocator, config: Config) !*Client {
 }
 
 /// Shut down: signal the ring, join the network thread, close connections, and
-/// free everything. Any `Message` still in flight is abandoned (its `await`
-/// returns `error.Shutdown`).
+/// free everything. Any `Message` still in flight is abandoned (its `await`/// returns `error.Shutdown`).
 pub fn deinit(self: *Client) void { // ziglint-ignore: Z030 -- self is heap-owned, destroyed here
     self.ring.requestShutdown();
     self.thread.join();
+    // Zeroize the SCRAM credentials (username/password) that were duped into
+    // the arena, so they don't linger in freed heap for the process lifetime.
+    // Must run BEFORE producer.deinit (which sets self.* = undefined, wiping
+    // the scram slice pointers) and before arena.deinit (which frees the
+    // backing memory the slices point into).
+    const scram = self.producer.options.scram;
+    // Cast away const: the arena owns mutable memory; the slices are `[]const
+    // u8` only because ScramConfig declares them so. secureZero needs
+    // `[]volatile u8` to prevent the store from being optimized out.
+    std.crypto.secureZero(u8, @as([*]u8, @ptrCast(@constCast(scram.username.ptr)))[0..scram.username.len]);
+    std.crypto.secureZero(u8, @as([*]u8, @ptrCast(@constCast(scram.password.ptr)))[0..scram.password.len]);
     self.producer.deinit();
     self.ring.deinit(self.allocator);
     self.arena.deinit();

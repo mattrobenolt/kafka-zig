@@ -190,6 +190,9 @@ pub fn decodeResponse(allocator: std.mem.Allocator, reader: *Reader) !Response {
     // the partial slot's strings unowned, so we never deinit past `brokers_len`.
     const broker_count = try primitives.readCompactArrayCount(reader);
     const n_brokers = broker_count orelse return error.Malformed;
+    // Cap: every broker element is ≥1 byte on the wire, so a count > remaining
+    // bytes is malformed. This prevents a huge alloc from a small frame.
+    if (n_brokers > reader.remaining().len) return error.Malformed;
     const brokers = try allocator.alloc(Response.Broker, n_brokers);
     var brokers_len: usize = 0;
     errdefer {
@@ -212,6 +215,8 @@ pub fn decodeResponse(allocator: std.mem.Allocator, reader: *Reader) !Response {
     // here, and the errdefer frees the topics decoded so far plus the brokers.
     const topic_count = try primitives.readCompactArrayCount(reader);
     const n_topics = topic_count orelse return error.Malformed;
+    // Cap: every topic element is ≥1 byte on the wire.
+    if (n_topics > reader.remaining().len) return error.Malformed;
     const topics = try allocator.alloc(Response.Topic, n_topics);
     var topics_len: usize = 0;
     errdefer {
@@ -270,6 +275,8 @@ fn decodeTopic(allocator: std.mem.Allocator, reader: *Reader) !Response.Topic {
     // the partial slot (its node arrays are either all owned or all unset).
     const partition_count = try primitives.readCompactArrayCount(reader);
     const n_partitions = partition_count orelse return error.Malformed;
+    // Cap: every partition element is ≥1 byte on the wire.
+    if (n_partitions > reader.remaining().len) return error.Malformed;
     const partitions = try allocator.alloc(Response.Partition, n_partitions);
     var partitions_len: usize = 0;
     errdefer {
@@ -323,6 +330,10 @@ fn decodePartition(allocator: std.mem.Allocator, reader: *Reader) !Response.Part
 fn decodeI32Array(allocator: std.mem.Allocator, reader: *Reader) ![]i32 {
     const count = try primitives.readCompactArrayCount(reader);
     const n = count orelse return error.Malformed;
+    // Cap: each INT32 element is 4 bytes on the wire, so a count > remaining/4
+    // is malformed (remaining is a conservative upper bound since count*4
+    // might overflow; checking against remaining first avoids the multiply).
+    if (n > reader.remaining().len) return error.Malformed;
     const arr = try allocator.alloc(i32, n);
     errdefer allocator.free(arr);
     for (arr) |*v| {
@@ -1168,6 +1179,76 @@ const metadata_response_corpus: []const []const u8 = &.{
     &([_]u8{0xff} ** 64), // all ones
     &([_]u8{0x00} ** 64), // all zeros
 };
+
+test "decode response: huge brokers count with few bytes → Malformed (no huge alloc)" {
+    // A frame claiming a massive broker count but with only a few bytes of
+    // data. The count cap must reject it as Malformed before any alloc, so
+    // std.testing.allocator never sees a huge allocation request.
+    //
+    //   throttle_time_ms: 0 → 00 00 00 00
+    //   brokers: compact array count = 0x7FFFFFFF (uvarint of ~268M)
+    //     ...but only 0 bytes of broker data follow.
+    //
+    // uvarint(268435455 + 1) = uvarint(268435456). Let's use a simpler huge
+    // count: uvarint(1000001) for count=1000000 (still >> remaining bytes).
+    const huge_count: u64 = 1_000_000 + 1;
+    var fixture: [16]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&fixture);
+    try primitives.writeI32(&w, 0); // throttle_time_ms
+    try primitives.writeUvarint(&w, huge_count); // brokers: compact array count
+    const written = w.buffered();
+
+    var r: Reader = .init(written);
+    try testing.expectError(error.Malformed, decodeResponse(testing.allocator, &r));
+}
+
+test "decode response: huge topics count with few bytes → Malformed" {
+    // Brokers decode (count=0), then topics claims a huge count with no data.
+    const huge_count: u64 = 1_000_000 + 1;
+    var fixture: [32]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&fixture);
+    try primitives.writeI32(&w, 0); // throttle_time_ms
+    try primitives.writeUvarint(&w, 1); // brokers: count=0
+    try primitives.writeUvarint(&w, 0); // cluster_id: null
+    try primitives.writeI32(&w, 1); // controller_id
+    try primitives.writeUvarint(&w, huge_count); // topics: huge count
+    const written = w.buffered();
+
+    var r: Reader = .init(written);
+    try testing.expectError(error.Malformed, decodeResponse(testing.allocator, &r));
+}
+
+test "decode response: huge I32 array count with few bytes → Malformed" {
+    // A partition with a replica_nodes array claiming a huge count but no data.
+    //   brokers: count=0, cluster_id=null, controller_id=1
+    //   topics: count=1
+    //     topic: error=0, name="t", topic_id=zeros, is_internal=false
+    //     partitions: count=1
+    //       partition: error=0, idx=0, leader=1, epoch=0
+    //         replica_nodes: compact array count=huge → Malformed
+    const huge_count: u64 = 1_000_000 + 1;
+    var fixture: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&fixture);
+    try primitives.writeI32(&w, 0); // throttle_time_ms
+    try primitives.writeUvarint(&w, 1); // brokers: count=0
+    try primitives.writeUvarint(&w, 0); // cluster_id: null
+    try primitives.writeI32(&w, 1); // controller_id
+    try primitives.writeUvarint(&w, 2); // topics: count=1
+    try primitives.writeI16(&w, 0); // error_code
+    try primitives.writeNullableCompactString(&w, "t"); // name
+    try w.writeAll(&@as(Uuid, @splat(0))); // topic_id
+    try primitives.writeBool(&w, false); // is_internal
+    try primitives.writeUvarint(&w, 2); // partitions: count=1
+    try primitives.writeI16(&w, 0); // error_code
+    try primitives.writeI32(&w, 0); // partition_index
+    try primitives.writeI32(&w, 1); // leader_id
+    try primitives.writeI32(&w, 0); // leader_epoch
+    try primitives.writeUvarint(&w, huge_count); // replica_nodes: huge count
+    const written = w.buffered();
+
+    var r: Reader = .init(written);
+    try testing.expectError(error.Malformed, decodeResponse(testing.allocator, &r));
+}
 
 test "fuzz Metadata v12 decodeResponse" {
     try std.testing.fuzz(std.testing.allocator, fuzzMetadataResponse, .{ .corpus = metadata_response_corpus });

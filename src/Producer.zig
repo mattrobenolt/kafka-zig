@@ -84,6 +84,9 @@ pub const Options = struct {
     strategy: partitioner.Strategy,
     /// Max in-place retries before a slot is failed with its last error code.
     max_retries: u8 = 8,
+    /// Socket I/O timeout in ms (SO_RCVTIMEO + SO_SNDTIMEO), passed through to
+    /// each `Connection.dial`. 0 = no timeout.
+    io_timeout_ms: u32 = 30_000,
     /// Backoff between drains that made no forward progress (only retries /
     /// transient connection failures), so a persistently-unhealthy cluster
     /// does not spin the CPU.
@@ -870,6 +873,7 @@ fn connectionFor(self: *Producer, host: []const u8, port: u16) !*Connection {
         .insecure_skip_verify = self.options.insecure_skip_verify,
         .scram = self.options.scram,
         .client_id = self.options.client_id,
+        .io_timeout_ms = self.options.io_timeout_ms,
     });
     errdefer conn.close();
 

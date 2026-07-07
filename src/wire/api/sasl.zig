@@ -81,6 +81,9 @@ pub fn decodeHandshakeResponse(allocator: std.mem.Allocator, reader: *Reader) !H
     // mechanisms: non-flexible ARRAY (i32 count) of STRING.
     const count = try primitives.readArrayCount(reader);
     const n = count orelse return error.Malformed;
+    // Cap: every mechanism string is ≥1 byte on the wire (i16 length + bytes),
+    // so a count > remaining bytes is malformed.
+    if (n > reader.remaining().len) return error.Malformed;
     const mechanisms = try allocator.alloc([]const u8, n);
     var len: usize = 0;
     errdefer {
@@ -601,6 +604,18 @@ const handshake_corpus: []const []const u8 = &.{
     &([_]u8{0xff} ** 64), // all ones
     &([_]u8{0x00} ** 64), // all zeros
 };
+
+test "decode handshake response: huge mechanisms count with few bytes → Malformed" {
+    // error_code=0, then mechanisms array claims a huge i32 count but no data.
+    // The count cap must reject before any alloc.
+    const fixture = [_]u8{
+        0x00, 0x00, // error_code = 0
+        0x00, 0x0f, 0x42, 0x40, // mechanisms: count = 1_000_000 (i32)
+    };
+
+    var r: Reader = .init(&fixture);
+    try testing.expectError(error.Malformed, decodeHandshakeResponse(testing.allocator, &r));
+}
 
 test "fuzz SaslHandshake v1 decodeResponse" {
     try std.testing.fuzz(std.testing.allocator, fuzzHandshakeResponse, .{ .corpus = handshake_corpus });

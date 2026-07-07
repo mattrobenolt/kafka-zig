@@ -46,7 +46,18 @@ pub const Error = error{
     ServerSignatureMismatch,
     /// A message did not fit the compiled fixed-capacity buffers.
     BufferOverflow,
+    /// The server's PBKDF2 iteration count exceeded `max_iterations`, refusing
+    /// a potential auth-time DoS (a malicious broker pinning the network
+    /// thread in blocking PBKDF2 with i=4294967295).
+    IterationCountTooHigh,
 };
+
+/// Conservative default upper bound on the SCRAM PBKDF2 iteration count. AWS
+/// MSK uses ~4096–12000 for SCRAM; this is well above that but bounded so a
+/// malicious broker cannot pin the network thread in blocking PBKDF2 for an
+/// unbounded time (auth-time DoS). Callers can override via the `max_iterations`
+/// parameter on the server-first functions.
+pub const default_max_iterations: u32 = 100_000;
 
 /// SCRAM client for the given HMAC/hash pair and mechanism name.
 ///
@@ -174,12 +185,20 @@ pub fn Scram(comptime Hmac: type, comptime Sha: type, comptime mechanism_name: [
 
         /// Parse server-first and start incremental PBKDF2. Drive with
         /// `result.pbkdf2.step()`, then call `completeServerFirst()`.
+        ///
+        /// `max_iterations` caps the server-supplied PBKDF2 iteration count to
+        /// guard against an auth-time DoS (a malicious broker sending
+        /// `i=4294967295` to pin the network thread in blocking PBKDF2). A count
+        /// above the cap returns `error.IterationCountTooHigh`. Defaults to
+        /// `default_max_iterations` (100_000) when null.
         pub fn parseServerFirst(
             server_first: []const u8,
             client_first: *const ClientFirstMessage,
             password: []const u8,
+            max_iterations: ?u32,
         ) Error!ParsedServerFirst {
-            const fields = try parseServerFirstFields(server_first, client_first);
+            const cap = max_iterations orelse default_max_iterations;
+            const fields = try parseServerFirstFields(server_first, client_first, cap);
             var salt_buf: [max_salt_len]u8 = undefined;
             const salt = try decodeSalt(&salt_buf, fields.salt_b64);
             return .{ .pbkdf2 = .init(password, salt, fields.iterations) };
@@ -187,12 +206,20 @@ pub fn Scram(comptime Hmac: type, comptime Sha: type, comptime mechanism_name: [
 
         /// Blocking convenience: parse server-first, derive keys via std PBKDF2,
         /// and build the client-final message + expected server signature.
+        ///
+        /// `max_iterations` caps the server-supplied PBKDF2 iteration count to
+        /// guard against an auth-time DoS (a malicious broker sending
+        /// `i=4294967295` to pin the network thread in blocking PBKDF2). A count
+        /// above the cap returns `error.IterationCountTooHigh`. Defaults to
+        /// `default_max_iterations` (100_000) when null.
         pub fn processServerFirstWithPassword(
             server_first: []const u8,
             client_first: *const ClientFirstMessage,
             password: []const u8,
+            max_iterations: ?u32,
         ) Error!ServerFirstResult {
-            const fields = try parseServerFirstFields(server_first, client_first);
+            const cap = max_iterations orelse default_max_iterations;
+            const fields = try parseServerFirstFields(server_first, client_first, cap);
             var salt_buf: [max_salt_len]u8 = undefined;
             const salt = try decodeSalt(&salt_buf, fields.salt_b64);
 
@@ -215,8 +242,10 @@ pub fn Scram(comptime Hmac: type, comptime Sha: type, comptime mechanism_name: [
 
             // ClientKey / ServerKey = HMAC(SaltedPassword, "...").
             var client_key: Hash = undefined;
+            defer std.crypto.secureZero(u8, &client_key);
             Hmac.create(&client_key, "Client Key", salted_password);
             var server_key: Hash = undefined;
+            defer std.crypto.secureZero(u8, &server_key);
             Hmac.create(&server_key, "Server Key", salted_password);
 
             // AuthMessage = client-first-bare "," server-first "," client-final-without-proof.
@@ -230,14 +259,17 @@ pub fn Scram(comptime Hmac: type, comptime Sha: type, comptime mechanism_name: [
 
             // StoredKey = H(ClientKey); ClientSignature = HMAC(StoredKey, AuthMessage).
             var stored_key: Hash = undefined;
+            defer std.crypto.secureZero(u8, &stored_key);
             Sha.hash(&client_key, &stored_key, .{});
             var client_sig: Hash = undefined;
+            defer std.crypto.secureZero(u8, &client_sig);
             Hmac.create(&client_sig, auth_message, &stored_key);
 
             // ClientProof = ClientKey XOR ClientSignature.
             const key_vec: HashVec = client_key;
             const sig_vec: HashVec = client_sig;
-            const proof: Hash = key_vec ^ sig_vec;
+            var proof: Hash = key_vec ^ sig_vec;
+            defer std.crypto.secureZero(u8, &proof);
 
             // client-final = "c=biws,r=" server_nonce ",p=" base64(proof).
             var final: ClientFinalMessage = .{ .buf = undefined, .len = 0 };
@@ -287,6 +319,7 @@ pub fn Scram(comptime Hmac: type, comptime Sha: type, comptime mechanism_name: [
         fn parseServerFirstFields(
             server_first: []const u8,
             client_first: *const ClientFirstMessage,
+            max_iterations: u32,
         ) Error!ServerFirstFields {
             const after_r = cutPrefix(server_first, "r=") orelse return error.InvalidServerMessage;
             const server_nonce, const after_nonce = cutScalar(after_r, ',') orelse
@@ -305,6 +338,9 @@ pub fn Scram(comptime Hmac: type, comptime Sha: type, comptime mechanism_name: [
             const iter_only = if (mem.indexOfScalar(u8, iter_str, ',')) |i| iter_str[0..i] else iter_str;
             const iterations = std.fmt.parseInt(u32, iter_only, 10) catch return error.InvalidServerMessage;
             if (iterations == 0) return error.InvalidServerMessage;
+            // Cap the iteration count to bound PBKDF2 CPU time (auth-time DoS
+            // hardening: a malicious broker could otherwise send i=4294967295).
+            if (iterations > max_iterations) return error.IterationCountTooHigh;
 
             return .{ .server_nonce = server_nonce, .salt_b64 = salt_b64, .iterations = iterations };
         }
@@ -429,7 +465,7 @@ test "RFC 7677 §5 SHA-256 known-answer vector (proof + server signature)" {
     const cf = try ScramSha256.clientFirstMessageWithNonce("user", rfc7677_client_nonce);
     try testing.expectEqualStrings("n,,n=user,r=rOprNGfwEbeRWgbNEkqO", cf.bytes());
 
-    const res = try ScramSha256.processServerFirstWithPassword(rfc7677_server_first, &cf, "pencil");
+    const res = try ScramSha256.processServerFirstWithPassword(rfc7677_server_first, &cf, "pencil", null);
     try testing.expectEqualStrings(rfc7677_client_final, res.client_final_message.bytes());
 
     try ScramSha256.verifyServerFinal(rfc7677_server_final, &res.expected_server_signature);
@@ -446,7 +482,7 @@ const sha512_server_final =
 
 test "SCRAM-SHA-512 deterministic vector (proof + server signature)" {
     const cf = try ScramSha512.clientFirstMessageWithNonce("user", rfc7677_client_nonce);
-    const res = try ScramSha512.processServerFirstWithPassword(rfc7677_server_first, &cf, "pencil");
+    const res = try ScramSha512.processServerFirstWithPassword(rfc7677_server_first, &cf, "pencil", null);
     try testing.expectEqualStrings(sha512_client_final, res.client_final_message.bytes());
     try ScramSha512.verifyServerFinal(sha512_server_final, &res.expected_server_signature);
 }
@@ -454,7 +490,7 @@ test "SCRAM-SHA-512 deterministic vector (proof + server signature)" {
 test "server nonce not starting with client nonce is rejected" {
     const cf = try ScramSha256.clientFirstMessageWithNonce("user", "clientnonce");
     const bad = "r=totallyDifferentNonce,s=c2FsdA==,i=4096";
-    try testing.expectError(error.NonceMismatch, ScramSha256.processServerFirstWithPassword(bad, &cf, "pw"));
+    try testing.expectError(error.NonceMismatch, ScramSha256.processServerFirstWithPassword(bad, &cf, "pw", null));
 }
 
 test "verifyServerFinal: wrong signature is rejected, correct is accepted" {
@@ -476,9 +512,9 @@ fn expectIncrementalMatchesBlocking(comptime S: type) !void {
     const server_first = "r=clientnonce123456789servernonce,s=c2FsdHNhbHQ=,i=4096";
     const password = "testpassword";
 
-    const blocking = try S.processServerFirstWithPassword(server_first, &cf, password);
+    const blocking = try S.processServerFirstWithPassword(server_first, &cf, password, null);
 
-    var parsed = try S.parseServerFirst(server_first, &cf, password);
+    var parsed = try S.parseServerFirst(server_first, &cf, password, null);
     while (!parsed.pbkdf2.step(256)) {}
     const salted = parsed.pbkdf2.result();
     const incremental = try S.completeServerFirst(&salted, server_first, &cf);
@@ -503,12 +539,64 @@ test "incremental path matches blocking path (SHA-512)" {
     try expectIncrementalMatchesBlocking(ScramSha512);
 }
 
+test "iteration count above cap is rejected (auth-time DoS hardening)" {
+    // A server-first with i=999_999_999 exceeds the default cap of 100_000.
+    // The blocking path must reject it without running PBKDF2.
+    const cf = try ScramSha256.clientFirstMessageWithNonce("user", "clientnonce");
+    const malicious = "r=clientnonceXYZ,s=c2FsdA==,i=999999999";
+    try testing.expectError(
+        error.IterationCountTooHigh,
+        ScramSha256.processServerFirstWithPassword(malicious, &cf, "pw", null),
+    );
+    // The incremental path must also reject it.
+    try testing.expectError(
+        error.IterationCountTooHigh,
+        ScramSha256.parseServerFirst(malicious, &cf, "pw", null),
+    );
+}
+
+test "iteration count at or below the cap succeeds" {
+    // A normal i=4096 (MSK-typical) must succeed under the default cap.
+    const cf = try ScramSha256.clientFirstMessageWithNonce("user", "clientnonce123456789");
+    const server_first = "r=clientnonce123456789servernonce,s=c2FsdHNhbHQ=,i=4096";
+    const res = try ScramSha256.processServerFirstWithPassword(server_first, &cf, "pw", null);
+    // Just verify we got a non-empty client-final message.
+    try testing.expect(res.client_final_message.bytes().len > 0);
+}
+
+test "iteration count exactly at the cap succeeds, one above fails" {
+    const cf = try ScramSha256.clientFirstMessageWithNonce("user", "clientnonce");
+    // i=100_000 (exactly the default cap) must succeed.
+    const at_cap = "r=clientnonceXYZ,s=c2FsdA==,i=100000";
+    const res = try ScramSha256.processServerFirstWithPassword(at_cap, &cf, "pw", null);
+    try testing.expect(res.client_final_message.bytes().len > 0);
+    // i=100_001 must fail.
+    const over_cap = "r=clientnonceXYZ,s=c2FsdA==,i=100001";
+    try testing.expectError(
+        error.IterationCountTooHigh,
+        ScramSha256.processServerFirstWithPassword(over_cap, &cf, "pw", null),
+    );
+}
+
+test "custom max_iterations override is respected" {
+    // A caller can set a lower cap (e.g. 8192 for a known MSK deployment).
+    const cf = try ScramSha256.clientFirstMessageWithNonce("user", "clientnonce");
+    const server_first = "r=clientnonceXYZ,s=c2FsdA==,i=20000";
+    try testing.expectError(
+        error.IterationCountTooHigh,
+        ScramSha256.processServerFirstWithPassword(server_first, &cf, "pw", 8192),
+    );
+    // The same count succeeds under the default cap.
+    const res = try ScramSha256.processServerFirstWithPassword(server_first, &cf, "pw", null);
+    try testing.expect(res.client_final_message.bytes().len > 0);
+}
+
 test "fuzz parseServerFirst: arbitrary bytes never panic" {
     try testing.fuzz({}, struct {
         fn run(_: void, input: []const u8) anyerror!void {
             const cf = ScramSha256.clientFirstMessageWithNonce("user", "clientnonce") catch return;
-            _ = ScramSha256.parseServerFirst(input, &cf, "password") catch return;
-            _ = ScramSha256.processServerFirstWithPassword(input, &cf, "password") catch return;
+            _ = ScramSha256.parseServerFirst(input, &cf, "password", null) catch return;
+            _ = ScramSha256.processServerFirstWithPassword(input, &cf, "password", null) catch return;
         }
     }.run, .{
         .corpus = &.{
