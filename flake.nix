@@ -46,6 +46,10 @@
               apacheKafka
               jdk
             ];
+
+            shellHook = ''
+              unset NIX_CFLAGS_COMPILE
+            '';
           };
         };
     };
