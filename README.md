@@ -55,22 +55,16 @@ the network thread (unavoidable under TLS + Kafka's v2 record format).
 ## Dev setup
 
 Requires Zig 0.15.2 and the Nix flake devshell (`nix develop`) for the full
-toolchain (zstd static lib, Kafka, mkcert, ziglint).
-
-**Sibling-directory requirement:** ztls is a path dependency at `../ztls`
-during development. Clone ztls alongside this repo, or `zig build` will fail
-on the missing path. Publish-time this switches to a git+hash dep.
-
-```sh
-git clone https://github.com/mattrobenolt/ztls ../ztls
-```
+toolchain (zstd static lib, Kafka, mkcert, ziglint). ztls is pulled in
+automatically as a git dependency — no sibling checkout needed.
 
 ## Build & test
 
 ```sh
 just test        # run tests
 just test-zstd   # run tests with zstd compression (needs the devshell's static libzstd)
-just e2e         # start a local Kafka broker and run the end-to-end smoke
+just e2e         # start a local Kafka broker and run the end-to-end smoke (plaintext)
+just e2e-zstd    # same, with zstd-compressed batches
 just fmt-check   # check formatting
 just lint        # run ziglint (needs the devshell)
 ```

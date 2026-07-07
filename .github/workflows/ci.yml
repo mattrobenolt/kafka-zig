@@ -15,24 +15,12 @@ permissions:
 # matrix isn't valuable for this repo and nix-darwin adds CI time without
 # signal (the devshell is the same).
 jobs:
-  # ztls is a path dep at ../ztls. actions/checkout@v4 forbids paths outside
-  # $GITHUB_WORKSPACE, so check ztls out into _ztls (inside the workspace) and
-  # symlink it to ../ztls so build.zig.zon's path dep resolves unchanged.
-  # TODO: drop this once mattrobenolt/ztls#66 lands and build.zig.zon switches
-  # to the published ztls tarball.
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-          repository: mattrobenolt/ztls
-          path: _ztls
-      - name: Symlink ztls to ../ztls
-        run: ln -s "$PWD/_ztls" "$PWD/../ztls"
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
       - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
       - run: nix develop -c zig build test --summary all
@@ -43,13 +31,6 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-          repository: mattrobenolt/ztls
-          path: _ztls
-      - name: Symlink ztls to ../ztls
-        run: ln -s "$PWD/_ztls" "$PWD/../ztls"
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
       - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
       - run: nix develop -c zig build -Dzstd=true test --summary all
@@ -74,8 +55,8 @@ jobs:
       - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
       - run: nix develop -c ziglint
 
-  # e2e (just e2e) starts a real Kafka broker — heavy and stateful. Run it
-  # manually on a dev machine via `just e2e`, not in CI.
+  # e2e (just e2e / just e2e-zstd) starts a real Kafka broker — heavy and
+  # stateful. Run it manually on a dev machine, not in CI.
   #
   # Fuzz: the repo uses std.testing.fuzz with committed corpora, which run as
   # part of `zig build test` above. A persistent --fuzz job (long-running,

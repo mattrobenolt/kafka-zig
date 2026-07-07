@@ -4,12 +4,10 @@
     .fingerprint = 0x5bbc75172c5960fb, // Changing this has security and trust implications.
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
-        // TODO: switch to the published tarball once mattrobenolt/ztls#66 is
-        // fully fixed (the d43095f fix moved fixture imports into fns, but a
-        // consumer still hits FileNotFound on 0.15.2 — reopened). CI checks
-        // ztls out into _ztls and symlinks it to ../ztls so this path dep
-        // resolves.
-        .ztls = .{ .path = "../ztls" },
+        .ztls = .{
+            .url = "https://github.com/mattrobenolt/ztls/archive/2c01682339c9cbc1a941064b37b75c9887a906f2.tar.gz",
+            .hash = "ztls-0.0.0-SHHDXoq3EACxrBDu3znLIIAALRvXjl7-1Ex71TNJhH7P",
+        },
     },
     .paths = .{
         "build.zig",
