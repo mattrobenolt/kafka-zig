@@ -77,10 +77,24 @@ Layout (big-endian unless noted):
 **Non-idempotent producer sentinels:** `producerId = -1`, `producerEpoch = -1`,
 `baseSequence = -1` (Java `RecordBatch` defaults). State these exactly.
 
-**Each record** (in the records region, before compression): length uvarint,
-then attributes i8, timestampDelta varlong, offsetDelta varint, keyLength varint
-(-1 = null), key, valueLength varint (-1 = null), value, headers
-(uvarint count, then per-header nameLength varint+name, valueLength varint+value).
+**Each record** (in the records region, before compression) — per the Kafka
+message-format spec and Java `DefaultRecord.writeTo`, ALL of these are **zigzag
+varint** (i32 via `(n<<1)^(n>>31)`), NOT unsigned_varint. This was a documented
+error in an earlier draft of this skill; do not repeat it:
+- `length`: varint (byte length of the record body AFTER this length field)
+- `attributes`: i8 (0, reserved)
+- `timestampDelta`: varlong (zigzag i64)
+- `offsetDelta`: varint (zigzag i32)
+- `keyLength`: varint (-1 = null), then key
+- `valueLength`: varint (-1 = null), then value
+- `headersCount`: varint (zigzag i32 — the spec says "the count of headers is
+  also encoded as a varint"; Java uses `writeVarint(headers.length)`)
+- per header: `headerKeyLength` varint + headerKey, `headerValueLength` varint
+  (-1 = null) + headerValue.
+
+Unsigned_varint (LEB128, no zigzag) is used ONLY for compact-type lengths
+(compact_string/compact_bytes/compact_array = N+1) and tagged-field tags/sizes —
+never for the record-level fields above.
 
 **Compression ordering is non-negotiable:**
 1. Serialize the records region.
