@@ -1,0 +1,94 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Core signal: unit + integration tests (mock broker) across the matrix.
+  # ztls is a path dep at ../ztls, so check it out as a sibling directory.
+  # ztls links libcrypto via pkg-config, so install OpenSSL on both platforms.
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      # ztls is a path dep at ../ztls. actions/checkout@v4 forbids paths
+      # outside $GITHUB_WORKSPACE, so check out into _ztls (inside the
+      # workspace) and symlink it to ../ztls so build.zig.zon's path dep
+      # resolves unchanged. Local dev still uses a real sibling ../ztls.
+      - uses: actions/checkout@v4
+        with:
+          repository: mattrobenolt/ztls
+          path: _ztls
+      - name: Symlink ztls to ../ztls
+        run: ln -s "$PWD/_ztls" "$PWD/../ztls"
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Install libcrypto (linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+      - name: Install libcrypto (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install openssl pkg-config
+          echo "PKG_CONFIG_PATH=$(brew --prefix openssl)/lib/pkgconfig" >> "$GITHUB_ENV"
+      - run: zig build test --summary all
+
+  # zstd compression path: links libzstd statically + libcrypto (via ztls).
+  test-zstd:
+    name: test-zstd (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: mattrobenolt/ztls
+          path: _ztls
+      - name: Symlink ztls to ../ztls
+        run: ln -s "$PWD/_ztls" "$PWD/../ztls"
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Install deps (linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libzstd-dev libssl-dev pkg-config
+      - name: Install deps (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install zstd openssl pkg-config
+          echo "PKG_CONFIG_PATH=$(brew --prefix openssl)/lib/pkgconfig" >> "$GITHUB_ENV"
+      - run: zig build -Dzstd=true test --summary all
+
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - run: git ls-files '*.zig' | xargs zig fmt --check
+
+  # ziglint is not published outside Matt's nix overlay (mattrobenolt/nixpkgs).
+  # There is no npm/brew/apt install path, so lint is skipped in CI — run
+  # `just lint` locally in the nix devshell.
+  #
+  # e2e (just e2e) needs Kafka + mkcert + the nix devshell. It's heavy and
+  # stateful (starts a real broker). Run it manually on a dev machine, not CI.
+  #
+  # Fuzz: the repo uses std.testing.fuzz with committed corpora, which runs as
+  # part of the regular `zig build test` step above. A persistent --fuzz job
+  # (long-running, needs a time budget) is not a pass/fail CI gate — skip it.
