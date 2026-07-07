@@ -82,14 +82,13 @@ pub const Response = struct {
     cluster_id: ?[]const u8,
     controller_id: i32,
     topics: []Topic,
-    allocator: std.mem.Allocator,
 
-    pub fn deinit(self: *Response) void {
-        for (self.brokers) |*b| b.deinit(self.allocator);
-        self.allocator.free(self.brokers);
-        if (self.cluster_id) |cid| self.allocator.free(cid);
-        for (self.topics) |*t| t.deinit(self.allocator);
-        self.allocator.free(self.topics);
+    pub fn deinit(self: *Response, allocator: std.mem.Allocator) void {
+        for (self.brokers) |*b| b.deinit(allocator);
+        allocator.free(self.brokers);
+        if (self.cluster_id) |cid| allocator.free(cid);
+        for (self.topics) |*t| t.deinit(allocator);
+        allocator.free(self.topics);
     }
 
     pub const Broker = struct {
@@ -97,7 +96,6 @@ pub const Response = struct {
         host: []const u8,
         port: i32,
         rack: ?[]const u8,
-        allocator: std.mem.Allocator,
 
         pub fn deinit(self: *Broker, allocator: std.mem.Allocator) void {
             allocator.free(self.host);
@@ -113,7 +111,6 @@ pub const Response = struct {
         replica_nodes: []i32,
         isr_nodes: []i32,
         offline_replicas: []i32,
-        allocator: std.mem.Allocator,
 
         pub fn deinit(self: *Partition, allocator: std.mem.Allocator) void {
             allocator.free(self.replica_nodes);
@@ -129,7 +126,6 @@ pub const Response = struct {
         is_internal: bool,
         partitions: []Partition,
         topic_authorized_operations: i32,
-        allocator: std.mem.Allocator,
 
         pub fn deinit(self: *Topic, allocator: std.mem.Allocator) void {
             if (self.name) |n| allocator.free(n);
@@ -185,16 +181,19 @@ pub fn encodeRequest(writer: *std.Io.Writer, req: Request) std.Io.Writer.Error!v
 pub fn decodeResponse(allocator: std.mem.Allocator, reader: *Reader) !Response {
     const throttle_time_ms = try primitives.readI32(reader);
 
-    // brokers: COMPACT_ARRAY of Broker.
+    // brokers: COMPACT_ARRAY of Broker. Track the number fully decoded so the
+    // errdefer frees only the initialized prefix — a failure mid-broker leaves
+    // the partial slot's strings unowned, so we never deinit past `brokers_len`.
     const broker_count = try primitives.readCompactArrayCount(reader);
     const n_brokers = broker_count orelse return error.Malformed;
     const brokers = try allocator.alloc(Response.Broker, n_brokers);
+    var brokers_len: usize = 0;
     errdefer {
-        for (brokers[0..0]) |*b| b.deinit(allocator);
+        for (brokers[0..brokers_len]) |*b| b.deinit(allocator);
         allocator.free(brokers);
     }
-    for (brokers) |*b| {
-        b.* = try decodeBroker(allocator, reader);
+    while (brokers_len < n_brokers) : (brokers_len += 1) {
+        brokers[brokers_len] = try decodeBroker(allocator, reader);
     }
 
     // cluster_id: COMPACT_NULLABLE_STRING.
@@ -204,16 +203,19 @@ pub fn decodeResponse(allocator: std.mem.Allocator, reader: *Reader) !Response {
 
     const controller_id = try primitives.readI32(reader);
 
-    // topics: COMPACT_ARRAY of Topic.
+    // topics: COMPACT_ARRAY of Topic. Same running-count discipline; a failure
+    // inside `decodeTopic` (including a partition-decode failure) propagates
+    // here, and the errdefer frees the topics decoded so far plus the brokers.
     const topic_count = try primitives.readCompactArrayCount(reader);
     const n_topics = topic_count orelse return error.Malformed;
     const topics = try allocator.alloc(Response.Topic, n_topics);
+    var topics_len: usize = 0;
     errdefer {
-        for (topics[0..0]) |*t| t.deinit(allocator);
+        for (topics[0..topics_len]) |*t| t.deinit(allocator);
         allocator.free(topics);
     }
-    for (topics) |*t| {
-        t.* = try decodeTopic(allocator, reader);
+    while (topics_len < n_topics) : (topics_len += 1) {
+        topics[topics_len] = try decodeTopic(allocator, reader);
     }
 
     // Trailing TAG_BUFFER.
@@ -225,7 +227,6 @@ pub fn decodeResponse(allocator: std.mem.Allocator, reader: *Reader) !Response {
         .cluster_id = cluster_id,
         .controller_id = controller_id,
         .topics = topics,
-        .allocator = allocator,
     };
 }
 
@@ -244,7 +245,6 @@ fn decodeBroker(allocator: std.mem.Allocator, reader: *Reader) !Response.Broker 
         .host = host,
         .port = port,
         .rack = rack,
-        .allocator = allocator,
     };
 }
 
@@ -261,16 +261,19 @@ fn decodeTopic(allocator: std.mem.Allocator, reader: *Reader) !Response.Topic {
     };
     const is_internal = try primitives.readBool(reader);
 
-    // partitions: COMPACT_ARRAY of Partition.
+    // partitions: COMPACT_ARRAY of Partition. Running-count errdefer frees
+    // only the initialized prefix; a failure mid-partition does not deinit
+    // the partial slot (its node arrays are either all owned or all unset).
     const partition_count = try primitives.readCompactArrayCount(reader);
     const n_partitions = partition_count orelse return error.Malformed;
     const partitions = try allocator.alloc(Response.Partition, n_partitions);
+    var partitions_len: usize = 0;
     errdefer {
-        for (partitions[0..0]) |*p| p.deinit(allocator);
+        for (partitions[0..partitions_len]) |*p| p.deinit(allocator);
         allocator.free(partitions);
     }
-    for (partitions) |*p| {
-        p.* = try decodePartition(allocator, reader);
+    while (partitions_len < n_partitions) : (partitions_len += 1) {
+        partitions[partitions_len] = try decodePartition(allocator, reader);
     }
 
     const topic_authorized_operations = try primitives.readI32(reader);
@@ -283,7 +286,6 @@ fn decodeTopic(allocator: std.mem.Allocator, reader: *Reader) !Response.Topic {
         .is_internal = is_internal,
         .partitions = partitions,
         .topic_authorized_operations = topic_authorized_operations,
-        .allocator = allocator,
     };
 }
 
@@ -310,7 +312,6 @@ fn decodePartition(allocator: std.mem.Allocator, reader: *Reader) !Response.Part
         .replica_nodes = replica_nodes,
         .isr_nodes = isr_nodes,
         .offline_replicas = offline_replicas,
-        .allocator = allocator,
     };
 }
 
@@ -570,7 +571,7 @@ test "decode response: minimal cluster (1 broker, 1 topic, 1 partition)" {
 
     var r: Reader = .init(&fixture);
     var resp = try decodeResponse(testing.allocator, &r);
-    defer resp.deinit();
+    defer resp.deinit(testing.allocator);
 
     try testing.expectEqual(@as(i32, 0), resp.throttle_time_ms);
     try testing.expectEqual(@as(usize, 1), resp.brokers.len);
@@ -630,7 +631,7 @@ test "decode response: non-null rack and cluster_id" {
 
     var r: Reader = .init(&fixture);
     var resp = try decodeResponse(testing.allocator, &r);
-    defer resp.deinit();
+    defer resp.deinit(testing.allocator);
 
     try testing.expectEqualStrings("us-east-1a", resp.brokers[0].rack.?);
     try testing.expectEqualStrings("abc", resp.cluster_id.?);
@@ -666,7 +667,7 @@ test "decode response: error_code nonzero on topic" {
 
     var r: Reader = .init(&fixture);
     var resp = try decodeResponse(testing.allocator, &r);
-    defer resp.deinit();
+    defer resp.deinit(testing.allocator);
 
     try testing.expectEqual(@as(i16, 3), resp.topics[0].error_code);
     try testing.expectEqual(@as(?[]const u8, null), resp.topics[0].name);
@@ -723,7 +724,7 @@ test "decode response: multiple partitions" {
 
     var r: Reader = .init(&fixture);
     var resp = try decodeResponse(testing.allocator, &r);
-    defer resp.deinit();
+    defer resp.deinit(testing.allocator);
 
     try testing.expectEqual(@as(usize, 2), resp.topics[0].partitions.len);
 
@@ -778,7 +779,7 @@ test "round-trip: decode then re-encode response equals fixture" {
 
     var r: Reader = .init(&fixture);
     var resp = try decodeResponse(testing.allocator, &r);
-    defer resp.deinit();
+    defer resp.deinit(testing.allocator);
 
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
@@ -807,7 +808,7 @@ test "round-trip: decode then re-encode response with rack and cluster_id" {
 
     var r: Reader = .init(&fixture);
     var resp = try decodeResponse(testing.allocator, &r);
-    defer resp.deinit();
+    defer resp.deinit(testing.allocator);
 
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
@@ -855,7 +856,7 @@ test "round-trip: decode then re-encode multi-partition response" {
 
     var r: Reader = .init(&fixture);
     var resp = try decodeResponse(testing.allocator, &r);
-    defer resp.deinit();
+    defer resp.deinit(testing.allocator);
 
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
@@ -979,7 +980,7 @@ test "decode response with full frame: length prefix + response header v1" {
     // The rest is the body — decode it.
     var body_reader: Reader = .init(hr.remaining());
     var resp = try decodeResponse(testing.allocator, &body_reader);
-    defer resp.deinit();
+    defer resp.deinit(testing.allocator);
 
     try testing.expectEqualStrings("localhost", resp.brokers[0].host);
     try testing.expectEqualStrings("test", resp.topics[0].name.?);
@@ -997,6 +998,123 @@ test "decode response: truncated input returns EndOfStream" {
 
     var r: Reader = .init(&truncated);
     try testing.expectError(error.EndOfStream, decodeResponse(testing.allocator, &r));
+}
+
+test "decode response: truncation during broker 2 host leaks nothing" {
+    // Two brokers declared. Broker 1 ("b1") decodes fully; broker 2's host
+    // string is truncated. `decodeResponse` must return an error, and
+    // `std.testing.allocator` must report zero leaks — which means the
+    // errdefer freed broker 1's duplicated `host` string and the brokers
+    // slice itself.
+    //
+    //   throttle_time_ms: 0
+    //   brokers: count=2 → 0x03
+    //     broker[0]: node_id=1, host="b1", port=9092, rack=null, tag=0x00
+    //     broker[1]: node_id=2, host=<length=3 but no bytes> ← truncated
+    const truncated = [_]u8{
+        0x00, 0x00, 0x00, 0x00, // throttle_time_ms = 0
+        0x03, // brokers: count=2
+        // broker[0] — fully decodable
+        0x00, 0x00, 0x00, 0x01, // node_id = 1
+        0x03, 0x62, 0x31, // host = "b1"
+        0x00, 0x00, 0x23, 0x84, // port = 9092
+        0x00, // rack = null
+        0x00, // broker tag buffer
+        // broker[1] — truncated mid-host-string
+        0x00, 0x00, 0x00, 0x02, // node_id = 2
+        0x04, // host length = 3, but no bytes follow
+    };
+
+    var r: Reader = .init(&truncated);
+    try testing.expectError(
+        error.EndOfStream,
+        decodeResponse(testing.allocator, &r),
+    );
+    // std.testing.allocator checks for leaks on test exit; no explicit
+    // assertion needed — a leak fails the test.
+}
+
+test "decode response: truncation during topic decode with brokers present leaks nothing" {
+    // Brokers decode fully, then a topic's name string is truncated. The
+    // errdefer must free the decoded brokers (host/rack strings + slice) in
+    // addition to the topics slice. Exercises the outer-level cleanup path.
+    //
+    //   throttle_time_ms: 0
+    //   brokers: count=1
+    //     broker[0]: node_id=1, host="b1", port=9092, rack="r1", tag=0x00
+    //   cluster_id: null
+    //   controller_id: 1
+    //   topics: count=1
+    //     topic[0]: error_code=0, name=<length=4 but no bytes> ← truncated
+    const truncated = [_]u8{
+        0x00, 0x00, 0x00, 0x00, // throttle_time_ms = 0
+        0x02, // brokers: count=1
+        0x00, 0x00, 0x00, 0x01, // node_id = 1
+        0x03, 0x62, 0x31, // host = "b1"
+        0x00, 0x00, 0x23, 0x84, // port = 9092
+        0x03, 0x72, 0x31, // rack = "r1"
+        0x00, // broker tag buffer
+        0x00, // cluster_id = null
+        0x00, 0x00, 0x00, 0x01, // controller_id = 1
+        0x02, // topics: count=1
+        0x00, 0x00, // topic[0] error_code = 0
+        0x05, // name length = 4, but no bytes follow
+    };
+
+    var r: Reader = .init(&truncated);
+    try testing.expectError(
+        error.EndOfStream,
+        decodeResponse(testing.allocator, &r),
+    );
+}
+
+test "decode response: truncation during partition decode with brokers+topic present leaks nothing" {
+    // Brokers and the topic header decode fully, then a partition's
+    // replica_nodes array is truncated. Verifies that the topic's `name`
+    // string and the topic's `partitions` slice are cleaned up, along with
+    // the outer brokers.
+    //
+    //   throttle_time_ms: 0
+    //   brokers: count=1
+    //     broker[0]: node_id=1, host="b1", port=9092, rack=null, tag=0x00
+    //   cluster_id: null
+    //   controller_id: 1
+    //   topics: count=1
+    //     topic[0]: error_code=0, name="t", topic_id=zeros, is_internal=false
+    //     partitions: count=1
+    //       partition[0]: error=0, idx=0, leader=1, epoch=0,
+    //         replica_nodes=count=2 but only 1 int follows ← truncated
+    const truncated = [_]u8{
+        0x00, 0x00, 0x00, 0x00, // throttle_time_ms = 0
+        0x02, // brokers: count=1
+        0x00, 0x00, 0x00, 0x01, // node_id = 1
+        0x03, 0x62, 0x31, // host = "b1"
+        0x00, 0x00, 0x23, 0x84, // port = 9092
+        0x00, // rack = null
+        0x00, // broker tag buffer
+        0x00, // cluster_id = null
+        0x00, 0x00, 0x00, 0x01, // controller_id = 1
+        0x02, // topics: count=1
+        0x00, 0x00, // error_code = 0
+        0x02, 0x74, // name = "t"
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // topic_id = zeros
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+        0x00, // is_internal = false
+        0x02, // partitions: count=1
+        0x00, 0x00, // partition[0] error_code = 0
+        0x00, 0x00, 0x00, 0x00, // partition_index = 0
+        0x00, 0x00, 0x00, 0x01, // leader_id = 1
+        0x00, 0x00, 0x00, 0x00, // leader_epoch = 0
+        0x03, // replica_nodes: count=2, but only 1 i32 follows
+        0x00, 0x00, 0x00, 0x01, // replica[0] = 1
+        // ← truncated here: replica[1] missing
+    };
+
+    var r: Reader = .init(&truncated);
+    try testing.expectError(
+        error.EndOfStream,
+        decodeResponse(testing.allocator, &r),
+    );
 }
 
 test "TopicRequest.byName produces zero topic_id" {
