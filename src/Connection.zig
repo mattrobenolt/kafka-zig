@@ -76,7 +76,8 @@ pub const Config = struct {
 };
 
 pub const Error = error{
-    /// The broker rejected the SASL mechanism in SaslHandshake.
+    /// The broker rejected the SASL mechanism in SaslHandshake, or advertised
+    /// a mechanism set that does not include the one we requested.
     UnsupportedSaslMechanism,
     /// The broker returned a nonzero error code during SaslAuthenticate.
     SaslAuthenticationFailed,
@@ -86,6 +87,11 @@ pub const Error = error{
     ResponseTooLarge,
     /// A malformed response frame (bad length prefix).
     MalformedResponse,
+    /// A response header carried a correlation_id that did not match the
+    /// request we sent — the stream is desynced.
+    CorrelationMismatch,
+    /// The configured client_id exceeds the connection's inline storage.
+    ClientIdTooLong,
 };
 
 /// Fixed per-connection buffer sizes. Requests and responses for the auth path
@@ -93,6 +99,10 @@ pub const Error = error{
 /// concern (the produce path writes directly into the ring, not here).
 const request_buffer_len = 64 * 1024;
 const response_buffer_len = 256 * 1024;
+
+/// Max client_id length the connection stores inline. client_id is a short
+/// identifier (Kafka truncates/limits it broker-side); 64 bytes is generous.
+const max_client_id_len = 64;
 
 /// Max plaintext per TLS record (RFC 8446 §5.1). Larger requests are chunked
 /// across records.
@@ -114,9 +124,11 @@ resp_buf: ResponseBuffer,
 /// Request framing scratch.
 req_scratch: [request_buffer_len]u8,
 correlation_id: i32,
-/// client_id captured at dial time (stored so it survives the Config's
-/// lifetime; Config stays caller-owned).
-client_id_storage: ?[]const u8 = null,
+/// client_id copied into inline storage at dial time. The Connection owns this
+/// copy, so the caller may free `config.client_id` as soon as `dial` returns.
+/// `client_id_len == null` means no client_id (encode as a null string).
+client_id_storage: [max_client_id_len]u8 = undefined,
+client_id_len: ?usize = null,
 
 /// Dial, TLS-handshake, and SASL-authenticate a broker connection.
 ///
@@ -142,8 +154,13 @@ pub fn dial(allocator: std.mem.Allocator, config: Config) !*Connection {
         .resp_buf = undefined,
         .req_scratch = undefined,
         .correlation_id = 0,
-        .client_id_storage = null,
+        .client_id_storage = undefined,
+        .client_id_len = null,
     };
+
+    // Own a copy of client_id before anything else can borrow the Config; the
+    // caller may free config.client_id the moment dial returns.
+    try self.setClientId(config.client_id);
 
     var random: ztls.Random = undefined;
     std.crypto.random.bytes(&random.data);
@@ -231,7 +248,20 @@ fn nextCorrelationId(self: *Connection) i32 {
 }
 
 fn clientId(self: *Connection) ?[]const u8 {
-    return self.client_id_storage;
+    const len = self.client_id_len orelse return null;
+    return self.client_id_storage[0..len];
+}
+
+/// Copy `client_id` into inline storage (once, at dial). `error.ClientIdTooLong`
+/// if it does not fit — a config error, surfaced deterministically at dial.
+fn setClientId(self: *Connection, client_id: ?[]const u8) !void {
+    const cid = client_id orelse {
+        self.client_id_len = null;
+        return;
+    };
+    if (cid.len > max_client_id_len) return Error.ClientIdTooLong;
+    @memcpy(self.client_id_storage[0..cid.len], cid);
+    self.client_id_len = cid.len;
 }
 
 // ---------------------------------------------------------------------------
@@ -312,7 +342,9 @@ fn read(self: *Connection, buf: []u8) !usize {
     };
 }
 
-/// `stream.writeAll`, normalizing peer-gone errors like `read`.
+/// `stream.writeAll`, normalizing peer-gone errors like `read`. Note the write
+/// error set has no `ConnectionTimedOut` (that only arises on `read`), so
+/// unlike `read` there is no timeout prong to fold in here.
 fn writeAll(self: *Connection, bytes: []const u8) !void {
     self.stream.writeAll(bytes) catch |err| switch (err) {
         error.ConnectionResetByPeer, error.BrokenPipe => return Error.ConnectionClosed,
@@ -325,8 +357,6 @@ fn writeAll(self: *Connection, bytes: []const u8) !void {
 // ---------------------------------------------------------------------------
 
 fn authenticate(self: *Connection, config: Config) !void {
-    self.client_id_storage = config.client_id;
-
     try self.apiVersionsProbe();
     try self.saslHandshake(config.scram.mechanism);
 
@@ -341,21 +371,33 @@ fn authenticate(self: *Connection, config: Config) !void {
 /// sends v0 as cheap insurance. We send it, read the response, and discard it.
 fn apiVersionsProbe(self: *Connection) !void {
     const body: request.EmptyBody = .{};
-    _ = try self.sendRequest(.api_versions, 0, body);
-    _ = try self.readResponse();
+    const corr = try self.sendRequest(.api_versions, 0, body);
+    const resp = try self.readResponse();
+    // We discard the ApiVersions payload, but still verify the header's
+    // correlation_id so a desync at connect surfaces here, not mid-SCRAM.
+    _ = try stripResponseHeaderV0(resp, corr);
 }
 
 fn saslHandshake(self: *Connection, mechanism: Mechanism) !void {
     const name = mechanismName(mechanism);
     const req_body: HandshakeBody = .{ .mechanism = name };
-    _ = try self.sendRequest(.sasl_handshake, 1, req_body);
+    const corr = try self.sendRequest(.sasl_handshake, 1, req_body);
 
     const body = try self.readResponse();
-    var payload = try stripResponseHeaderV0(body);
+    var payload = try stripResponseHeaderV0(body, corr);
     var resp = try sasl.decodeHandshakeResponse(self.allocator, &payload);
     defer resp.deinit(self.allocator);
 
     if (resp.error_code != 0) return Error.UnsupportedSaslMechanism;
+
+    // error_code is the negotiation authority; scanning the advertised list is
+    // defense-in-depth against a broker that returns success without offering
+    // the mechanism we requested (we'd otherwise walk into a SCRAM exchange the
+    // broker never agreed to).
+    for (resp.mechanisms) |m| {
+        if (std.mem.eql(u8, m, name)) return;
+    }
+    return Error.UnsupportedSaslMechanism;
 }
 
 /// Drive the SCRAM message exchange over SaslAuthenticate v1. Generic over the
@@ -400,9 +442,9 @@ fn scramExchange(self: *Connection, comptime S: type, cfg: ScramConfig) !void {
 /// response. Caller owns the returned response and must `deinit` it.
 fn saslAuthenticate(self: *Connection, token: []const u8) !sasl.AuthenticateResponse {
     const req_body: AuthBody = .{ .auth_bytes = token };
-    _ = try self.sendRequest(.sasl_authenticate, 1, req_body);
+    const corr = try self.sendRequest(.sasl_authenticate, 1, req_body);
     const body = try self.readResponse();
-    var payload = try stripResponseHeaderV0(body);
+    var payload = try stripResponseHeaderV0(body, corr);
     return sasl.decodeAuthenticateResponse(self.allocator, &payload);
 }
 
@@ -419,10 +461,17 @@ fn mechanismName(mechanism: Mechanism) []const u8 {
 
 /// Strip a response header v0 (correlation_id INT32 only) and return a reader
 /// positioned at the response body. All SASL and ApiVersions-v0 responses use
-/// header v0.
-fn stripResponseHeaderV0(body: []const u8) !Reader {
+/// header v0. Verifies the correlation_id matches the request we sent; a
+/// mismatch means we are decoding the wrong response and the stream is desynced.
+///
+/// NOTE (phase 6): the public `readResponse` returns the whole body including
+/// this header and does NOT perform this check — the phase-6 request/response
+/// dispatcher must apply the same correlation_id verification when it strips
+/// per-API response headers.
+fn stripResponseHeaderV0(body: []const u8, expected_correlation_id: i32) !Reader {
     var r: Reader = .init(body);
-    _ = primitives.readI32(&r) catch return Error.MalformedResponse;
+    const corr = primitives.readI32(&r) catch return Error.MalformedResponse;
+    if (corr != expected_correlation_id) return Error.CorrelationMismatch;
     return Reader.init(r.remaining());
 }
 
@@ -465,6 +514,65 @@ test "dial: SaslHandshake mechanism rejected → UnsupportedSaslMechanism" {
     );
 }
 
+test "dial: handshake ok but requested mechanism not advertised → UnsupportedSaslMechanism" {
+    // error_code == 0 but the advertised list is ["SCRAM-SHA-256"] while the
+    // client requested SCRAM-SHA-512. The advertised-list scan must reject it
+    // rather than walking into a SCRAM exchange the broker never agreed to.
+    try testing.expectError(
+        Error.UnsupportedSaslMechanism,
+        runAuthTest(.{ .mode = .bad_advertised_mechanism, .password = mock_password }),
+    );
+}
+
+test "dial: broker replies with wrong correlation_id → CorrelationMismatch" {
+    try testing.expectError(
+        Error.CorrelationMismatch,
+        runAuthTest(.{ .mode = .wrong_correlation, .password = mock_password }),
+    );
+}
+
+test "dial: client_id is owned — survives freeing the original config slice" {
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{ .reuse_address = true });
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+
+    var ctx: MockCtx = .{ .server = &server, .mode = .ok, .capture_client_id = true };
+    const thread = try std.Thread.spawn(.{}, mockBrokerRun, .{&ctx});
+    defer thread.join();
+
+    // Heap-allocate the client_id so we can free + poison it after dial and
+    // prove the Connection kept its own copy (not a dangling borrow).
+    const cid = try testing.allocator.dupe(u8, "ephemeral-client-id");
+    const conn = try dial(testing.allocator, .{
+        .host = "127.0.0.1",
+        .port = port,
+        .sni = mock_server_name,
+        .insecure_skip_verify = true,
+        .scram = .{
+            .mechanism = .scram_sha512,
+            .username = mock_username,
+            .password = mock_password,
+        },
+        .client_id = cid,
+    });
+    defer conn.close();
+
+    @memset(cid, 0xAA);
+    testing.allocator.free(cid);
+
+    // Post-free request: the mock broker records the client_id it received off
+    // the wire, which must still be the original value.
+    const meta_body: request.EmptyBody = .{};
+    _ = try conn.sendRequest(.metadata, 12, meta_body);
+    _ = try conn.readResponse();
+
+    try testing.expectEqualStrings(
+        "ephemeral-client-id",
+        ctx.captured_client_id[0..ctx.captured_client_id_len],
+    );
+}
+
 test "dial: wrong SCRAM password → broker rejects → SaslAuthenticationFailed" {
     try testing.expectError(
         Error.SaslAuthenticationFailed,
@@ -484,7 +592,18 @@ test "dial: broker closes mid-handshake → ConnectionClosed" {
 const mock_username = "kafka-zig-test";
 const mock_password = "correct-horse-battery-staple";
 
-const MockMode = enum { ok, bad_mechanism, reject_proof, close_after_tls };
+const MockMode = enum {
+    ok,
+    /// SaslHandshake returns error_code 33 (UNSUPPORTED_SASL_MECHANISM).
+    bad_mechanism,
+    /// SaslHandshake returns error_code 0 but advertises a list that omits the
+    /// client's requested mechanism.
+    bad_advertised_mechanism,
+    /// ApiVersions probe response carries a mismatched correlation_id.
+    wrong_correlation,
+    reject_proof,
+    close_after_tls,
+};
 
 const RunArgs = struct {
     mode: MockMode,
@@ -495,6 +614,11 @@ const MockCtx = struct {
     server: *std.net.Server,
     mode: MockMode,
     result: ?anyerror = null,
+    /// When set, the mock records the client_id from the request header of the
+    /// (post-auth) Metadata request into `captured_client_id`.
+    capture_client_id: bool = false,
+    captured_client_id: [max_client_id_len]u8 = undefined,
+    captured_client_id_len: usize = 0,
 };
 
 fn runAuthTest(args: RunArgs) !void {
@@ -628,7 +752,7 @@ fn mockBrokerServe(ctx: *MockCtx) !void {
         if (hs.isConnected() and ctx.mode == .close_after_tls) return;
         if (hs.isConnected()) {
             while (req_buf.next() catch return error.MalformedRequest) |frame| {
-                try srv.dispatch(frame, ctx.mode, &scram_state);
+                try srv.dispatch(frame, ctx, &scram_state);
             }
         }
     }
@@ -654,18 +778,23 @@ const MockServer = struct {
     hs: *ztls.ServerHandshake,
     out: *ztls.ServerHandshake.OutBuffer,
 
-    fn dispatch(self: *MockServer, frame: []const u8, mode: MockMode, st: *MockScramState) !void {
+    fn dispatch(self: *MockServer, frame: []const u8, ctx: *MockCtx, st: *MockScramState) !void {
+        const mode = ctx.mode;
         var r: Reader = .init(frame);
         const api_key_raw = try primitives.readI16(&r);
         const api_version: u16 = @intCast(try primitives.readI16(&r));
         const correlation_id = try primitives.readI32(&r);
         const api_key = try ApiKey.fromU16(@intCast(api_key_raw));
         const hv = api_keys.headerVersion(api_key, api_version);
-        // Skip request-header client_id + tag buffer.
+        // Skip (or capture) request-header client_id + tag buffer.
         switch (hv.request) {
             1 => _ = try primitives.readNullableString(&r),
             2 => {
-                _ = try primitives.readNullableCompactString(&r);
+                const cid = try primitives.readNullableCompactString(&r);
+                if (ctx.capture_client_id) if (cid) |c| {
+                    @memcpy(ctx.captured_client_id[0..c.len], c);
+                    ctx.captured_client_id_len = c.len;
+                };
                 try primitives.readTagBuffer(&r);
             },
             else => {},
@@ -673,7 +802,11 @@ const MockServer = struct {
         const req_body = r.remaining();
 
         switch (api_key) {
-            .api_versions => try self.sendApiVersionsV0(correlation_id),
+            // wrong_correlation: reply to the ApiVersions probe with a corrupted
+            // correlation_id so the client's header check must catch it.
+            .api_versions => try self.sendApiVersionsV0(
+                if (mode == .wrong_correlation) correlation_id +% 1 else correlation_id,
+            ),
             .sasl_handshake => try self.sendSaslHandshake(correlation_id, mode),
             .sasl_authenticate => try self.sendSaslAuthenticate(correlation_id, req_body, mode, st),
             .metadata => try self.sendMetadata(correlation_id),
@@ -722,17 +855,21 @@ const MockServer = struct {
     fn sendSaslHandshake(self: *MockServer, correlation_id: i32, mode: MockMode) !void {
         var body: [64]u8 = undefined;
         var w: std.Io.Writer = .fixed(&body);
-        if (mode == .bad_mechanism) {
+        switch (mode) {
             // error_code 33 (UNSUPPORTED_SASL_MECHANISM), advertise SHA-256 only.
-            try sasl.encodeHandshakeResponse(&w, .{
+            .bad_mechanism => try sasl.encodeHandshakeResponse(&w, .{
                 .error_code = 33,
                 .mechanisms = @constCast(&[_][]const u8{"SCRAM-SHA-256"}),
-            });
-        } else {
-            try sasl.encodeHandshakeResponse(&w, .{
+            }),
+            // error_code 0 but the advertised list omits the requested SHA-512.
+            .bad_advertised_mechanism => try sasl.encodeHandshakeResponse(&w, .{
+                .error_code = 0,
+                .mechanisms = @constCast(&[_][]const u8{"SCRAM-SHA-256"}),
+            }),
+            else => try sasl.encodeHandshakeResponse(&w, .{
                 .error_code = 0,
                 .mechanisms = @constCast(&[_][]const u8{"SCRAM-SHA-512"}),
-            });
+            }),
         }
         try self.respond(correlation_id, 0, w.buffered());
     }
