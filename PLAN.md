@@ -385,10 +385,10 @@ config-time tradeoffs, not runtime surprises — document them on the config.
 ```
 src/
   root.zig              — public re-exports (Client, Config, Handle, errors)
-  client.zig            — Client + network thread loop + metadata cache
+  Client.zig           — public Client API + config arena + thread spawn
   Connection.zig       — TCP + ztls + SCRAM auth → ready connection
-  producer.zig          — batching, Produce encode/ack, retry/reenqueue
-  partitioner.zig       — round-robin / key-hash
+  Producer.zig         — network thread: batching, Produce encode/ack, retry/metadata refresh
+  partitioner.zig      — round-robin / key-hash (murmur2, matches Kafka Utils.murmur2)
   Ring.zig             — MPSC payload ring (ported from AtomicRingBuffer)
   scram/
     scram.zig           — generic SCRAM client (sha256/sha512)
