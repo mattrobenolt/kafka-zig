@@ -538,9 +538,7 @@ test "encode request with real record batch" {
 
     // Encode the record batch.
     var batch_buf: [256]u8 = undefined;
-    var bw: std.Io.Writer = .fixed(&batch_buf);
-    try record_batch.encodeBatch(&bw, &records, .{});
-    const batch_bytes = bw.buffered();
+    const batch_bytes = try record_batch.encodeBatch(&batch_buf, &records, .{});
 
     // Encode the Produce request with this batch.
     const partitions = [_]PartitionData{.{

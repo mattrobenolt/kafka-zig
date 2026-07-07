@@ -216,6 +216,25 @@ pub fn writeUvarint(w: *std.Io.Writer, value: u64) std.Io.Writer.Error!void {
     try w.writeByte(@intCast(v));
 }
 
+/// Number of bytes `writeUvarint` would emit for `value`. Lets an encoder
+/// compute a length prefix without a temp buffer (zero-alloc encode path).
+pub fn uvarintSize(value: u64) usize {
+    var v = value;
+    var n: usize = 1;
+    while (v >= 0x80) : (v >>= 7) n += 1;
+    return n;
+}
+
+/// Number of bytes `writeVarint` would emit for `value` (zigzag then LEB128).
+pub fn varintSize(value: i32) usize {
+    return uvarintSize(zigzag32(value));
+}
+
+/// Number of bytes `writeVarlong` would emit for `value` (zigzag then LEB128).
+pub fn varlongSize(value: i64) usize {
+    return uvarintSize(zigzag64(value));
+}
+
 // ---------------------------------------------------------------------------
 // String types
 // ---------------------------------------------------------------------------
