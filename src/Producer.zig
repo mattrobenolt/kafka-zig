@@ -1212,9 +1212,17 @@ fn initProducerId(self: *Producer) !void {
 /// `pid_reset_pending`; on failure it stays set (the caller backs off and
 /// retries next drain) and no state is mutated — the re-init is attempted
 /// first, so a failed round-trip leaves the counters and slots untouched.
+/// BUT a persistently-failing InitProducerId must not strand in-flight slots
+/// forever (their `await()` would never resolve): each failed attempt is
+/// charged against every pending slot's retry budget via
+/// `chargeRecoveryFailure`, so recovery is bounded — the slots are eventually
+/// failed rather than spun on indefinitely.
 /// Cold path (error recovery).
 fn recoverProducerId(self: *Producer) !void {
-    try self.initProducerId();
+    self.initProducerId() catch |err| {
+        self.chargeRecoveryFailure();
+        return err;
+    };
     self.sequences.clearRetainingCapacity();
     const lo = self.ring.readHead();
     const hi = self.ring.writeHead();
@@ -1224,6 +1232,36 @@ fn recoverProducerId(self: *Producer) !void {
     }
     self.pid_reset_pending = false;
     log.debug("PID reset: fresh PID={d} epoch={d}, sequences reset", .{ self.producer_id, self.producer_epoch });
+}
+
+/// Charge a failed PID-recovery round-trip against every pending slot's retry
+/// budget. Without this a persistently-failing InitProducerId would back off
+/// forever while `pid_reset_pending` stays set, and the in-flight slots would
+/// never reach a terminal state — their `await()` would hang. Bumping each
+/// pending slot's attempt counter (generation-guarded, like a normal retry)
+/// and failing it once the budget is exhausted bounds recovery to at most
+/// `max_retries` failed attempts. When no pending slots remain after the
+/// charge, the reset flag is cleared so a later send does not inherit a stale
+/// recovery state. Wakes completions + reclaims so any failed slot's `await()`
+/// resolves immediately (the drain returns before its own wake). Cold path.
+fn chargeRecoveryFailure(self: *Producer) void {
+    const lo = self.ring.readHead();
+    const hi = self.ring.writeHead();
+    var any_pending = false;
+    var pos = lo;
+    while (pos < hi) : (pos += 1) {
+        if (!self.ring.slotIsPending(pos)) continue;
+        const generation = self.ring.slotGeneration(pos);
+        if (self.bumpAttempts(pos, generation) > self.options.max_retries) {
+            self.ring.markFailed(pos, generation, 73); // UNKNOWN_PRODUCER_ID
+            self.resetAttempts(pos);
+        } else {
+            any_pending = true;
+        }
+    }
+    if (!any_pending) self.pid_reset_pending = false;
+    self.ring.wakeCompletions();
+    _ = self.ring.reclaim();
 }
 
 /// Compute the sequence map key for a (topic, partition) pair. Uses wyhash for

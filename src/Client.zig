@@ -876,16 +876,22 @@ test "idempotency ON: OUT_OF_ORDER_SEQUENCE re-inits PID, resets sequence, retri
     try testing.expect(broker.init_producer_id_requests.load(.acquire) >= 2);
 
     // The first (failed) batch carried the startup PID; the retry batch carried
-    // the fresh PID (mock_producer_id + 1). Both start at base_sequence 0 (the
-    // fresh PID makes the broker forget the old sequence state).
+    // the fresh PID (mock_producer_id + 1). Scope the base_sequence == 0 check
+    // to the NEW-PID (recovery) batches: the fresh PID makes the broker forget
+    // all prior sequence state, so recovery batches always restart at 0. The
+    // old-PID batches may carry any base_sequence — the producer drains eagerly,
+    // so which records make the first failed batch is timing-dependent (asserting
+    // 0 on all batches was a CI flake). This is the structural guarantee.
     try testing.expect(broker.captured_batches_len >= 2);
     var saw_old_pid = false;
     var saw_new_pid = false;
     for (broker.captured_batches[0..broker.captured_batches_len]) |b| {
         try testing.expectEqual(@as(i32, 0), b.partition);
-        try testing.expectEqual(@as(i32, 0), b.base_sequence);
         if (b.producer_id == mock.mock_producer_id) saw_old_pid = true;
-        if (b.producer_id == mock.mock_producer_id + 1) saw_new_pid = true;
+        if (b.producer_id == mock.mock_producer_id + 1) {
+            saw_new_pid = true;
+            try testing.expectEqual(@as(i32, 0), b.base_sequence);
+        }
     }
     try testing.expect(saw_old_pid);
     try testing.expect(saw_new_pid);
@@ -922,11 +928,16 @@ test "idempotency ON: UNKNOWN_PRODUCER_ID re-inits PID, resets sequence, retries
     try testing.expectEqual(@as(u32, n), broker.produced.load(.acquire));
     try testing.expect(broker.init_producer_id_requests.load(.acquire) >= 2);
 
+    // Scope base_sequence == 0 to the NEW-PID (recovery) batches — the fresh PID
+    // resets all broker sequence state, so recovery batches restart at 0.
+    // Pre-recovery (old-PID) batches may carry any base_sequence (timing).
     try testing.expect(broker.captured_batches_len >= 2);
     var saw_new_pid = false;
     for (broker.captured_batches[0..broker.captured_batches_len]) |b| {
-        try testing.expectEqual(@as(i32, 0), b.base_sequence);
-        if (b.producer_id == mock.mock_producer_id + 1) saw_new_pid = true;
+        if (b.producer_id == mock.mock_producer_id + 1) {
+            saw_new_pid = true;
+            try testing.expectEqual(@as(i32, 0), b.base_sequence);
+        }
     }
     try testing.expect(saw_new_pid);
 }
