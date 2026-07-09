@@ -41,10 +41,17 @@ Committing (when the task authorizes a commit):
 
 Validation:
 - Run the narrowest relevant command first (`zig build test` for the touched module), then the broader checks (`zig build`, `zig build -Dzstd=true` when compression is in scope).
+- `zig build test` HANGS on a deadlock and prints nothing mid-hang — ALWAYS wrap it in `timeout` (e.g. `timeout 90 zig build test --summary all`). If a test hangs, do NOT grind print-instrumentation on the 90s-timeout loop; bisect instead (disable the hanging test, or run the test binary directly: `.zig-cache/o/*/test` — stderr flows there, so the live error/panic is visible). A surprising fraction of "production deadlocks" are test bugs (e.g. a dangling stack slice giving port=0) — suspect the test before the production code.
 - Report exact commands and outcomes. Do not claim success without evidence — "should work" is a guess.
 - If validation fails, diagnose the root cause before changing more code. No shotgun edits.
+- **Remove ALL debug instrumentation before reporting done.** A leftover `dbgLog`/`std.debug.print`/file-write in library code is a review blocker. Grep your own diff for `debug.print`, `dbgLog`, `/tmp/`, `createFile` before committing.
 
 Output:
 - Changed files and concise diff summary.
 - Tests/commands run with pass/fail results.
 - Residual risks, skipped checks, and any plan/phase follow-up needed.
+- **Self-report (required — this feeds the self-improvement loop, do not skip):**
+  - **What worked well** in this slice (what made it go smoothly).
+  - **Friction hit** (missing context, unclear contract, a stale skill/prompt claim, a tool gap, a Zig 0.15 surprise, a protocol gotcha the skill didn't cover). Be specific — cite the file/line/API.
+  - **What you'd need next time** to do this faster/better (a skill addition, a prompt tweak, a helper, a fixture).
+  This is not prose padding — it's the signal the director uses to tighten your prompt and the skills for the next slice. If you hit no friction, say so plainly.
