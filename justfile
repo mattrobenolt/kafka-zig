@@ -65,6 +65,18 @@ docs:
 [group("ci")]
 ci: test fmt-check test-zstd lint docs
 
+[doc("Run the produce benchmark against the mock broker (ReleaseFast)")]
+[group("bench")]
+bench:
+    zig build bench -Doptimize=ReleaseFast
+    zig-out/bin/bench
+
+[doc("Run the benchmark with custom args (ReleaseFast)")]
+[group("bench")]
+bench-args *args:
+    zig build bench -Doptimize=ReleaseFast
+    zig-out/bin/bench {{ args }}
+
 # ---------------------------------------------------------------------------
 # Phase 7 — real Kafka e2e (KRaft + SASL_SSL/SCRAM-SHA-512 over TLS)
 #

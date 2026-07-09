@@ -10,6 +10,10 @@ pub const Client = @import("Client.zig");
 pub const Stats = Client.Stats;
 pub const ErrorCounts = Client.ErrorCounts;
 
+/// In-process mock broker, exposed for the benchmark harness (issue #9).
+/// Test-only infrastructure; not intended for production use.
+pub const mock_broker = @import("testing/mock_broker.zig");
+
 test {
     std.testing.refAllDecls(@This());
 }

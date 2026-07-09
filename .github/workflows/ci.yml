@@ -83,6 +83,32 @@ jobs:
       - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
       - run: nix develop -c zizmor --persona=auditor --min-severity=medium .
 
+  # Fuzz: time-budgeted (60s) random-input search on Linux (where the Zig
+  # fuzzer works — macOS hits InvalidElfMagic). A crash/panic IS a finding
+  # that fails the job. A timeout (no crash in 60s) is NOT a failure: the
+  # `timeout` exit code 124 is mapped to 0. The fuzz corpora also run as
+  # ordinary tests in the `test` job above; this is the persistent search.
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
+      - name: Run fuzz targets for 60s
+        run: |
+          set +e
+          timeout 60 nix develop -c zig build test --fuzz
+          code=$?
+          if [ $code -eq 124 ]; then
+            echo "fuzz: 60s budget elapsed, no crashes found"
+            exit 0
+          else
+            exit $code
+          fi
+
   # e2e (just e2e / just e2e-zstd) starts a real Kafka broker — heavy and
   # stateful. Run it manually on a dev machine, not in CI.
   #

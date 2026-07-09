@@ -81,6 +81,27 @@ pub fn build(b: *Build) void {
     const e2e_step = b.step("e2e", "Build the e2e smoke binary (requires a running broker)");
     e2e_step.dependOn(b.getInstallStep());
 
+    // --- bench binary (issue #9): throughput + latency against the mock broker ---
+    // The mock broker is re-exported from root.zig (kafka.mock_broker) so the
+    // bench module can access it via the kafka import without a separate module
+    // (Zig doesn't allow the same file in two modules).
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "kafka", .module = kafka_mod },
+        },
+    });
+    const bench_exe = b.addExecutable(.{
+        .name = "bench",
+        .root_module = bench_mod,
+    });
+    b.installArtifact(bench_exe);
+
+    const bench_step = b.step("bench", "Build the benchmark binary (run with: zig build bench -Doptimize=ReleaseFast)");
+    bench_step.dependOn(b.getInstallStep());
+
     // --- test step ---
     const test_step = b.step("test", "Run tests");
 
