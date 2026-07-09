@@ -43,6 +43,19 @@ pub const Mode = enum {
     retriable_once,
     /// Return INVALID_RECORD (87) for every Produce (non-retriable).
     fatal,
+    /// Return OUT_OF_ORDER_SEQUENCE (45) on the first Produce per partition,
+    /// then ack. The idempotent producer must re-init the PID (fresh PID from
+    /// the second InitProducerId), reset sequences, and retry — the retry lands
+    /// on the ack path. The first (45) attempt is NOT counted as produced.
+    out_of_order_once,
+    /// Return UNKNOWN_PRODUCER_ID (73) on the first Produce per partition, then
+    /// ack. Same recovery as `out_of_order_once`.
+    unknown_pid_once,
+    /// Return DUPLICATE_SEQUENCE_NUMBER (37) for every Produce, and count the
+    /// records as produced exactly once (on first sight per partition): models
+    /// a lost-ack retry where the first write is already durable. The
+    /// idempotent producer must treat 37 as an ACK.
+    duplicate_seq,
 };
 
 /// A captured record-batch from a Produce request, for idempotency assertions.
@@ -79,6 +92,9 @@ pub const Broker = struct {
     max_produce_records_bytes: std.atomic.Value(u32) = .init(0),
     /// Metadata requests served (the retry test asserts a refresh happened).
     metadata_requests: std.atomic.Value(u32) = .init(0),
+    /// InitProducerId requests served. Startup acquisition is call #1; a PID
+    /// reset on OUT_OF_ORDER_SEQUENCE / UNKNOWN_PRODUCER_ID bumps this to >=2.
+    init_producer_id_requests: std.atomic.Value(u32) = .init(0),
     /// Per-partition "already injected a retriable error" flags (mock thread
     /// only; no synchronization needed).
     injected: [max_partitions]bool = @splat(false),
@@ -354,12 +370,17 @@ const Session = struct {
     fn sendInitProducerId(self: *Session, correlation_id: i32) !void {
         // InitProducerId v4 response: throttle_time_ms INT32, error_code INT16,
         // producer_id INT64, producer_epoch INT16, TAG_BUFFER. Header v1.
-        // Assign a fixed PID/epoch for test determinism.
+        // A non-transactional (transactional_id=null) InitProducerId allocates
+        // a FRESH producer id every call, so a PID reset gets a distinct PID.
+        // Model that: PID = mock_producer_id + call_index (0-based). The startup
+        // acquisition returns mock_producer_id; a recovery re-init returns
+        // mock_producer_id + 1, letting the reset tests assert a new PID.
+        const call_index = self.broker.init_producer_id_requests.fetchAdd(1, .acq_rel);
         var body: [32]u8 = undefined;
         var w: std.Io.Writer = .fixed(&body);
         try primitives.writeI32(&w, 0); // throttle_time_ms = 0
         try primitives.writeI16(&w, 0); // error_code = 0
-        try primitives.writeI64(&w, mock_producer_id); // producer_id
+        try primitives.writeI64(&w, mock_producer_id + @as(i64, call_index)); // producer_id
         try primitives.writeI16(&w, mock_producer_epoch); // producer_epoch
         try primitives.writeEmptyTagBuffer(&w);
         try self.respond(correlation_id, 1, w.buffered());
@@ -390,7 +411,18 @@ const Session = struct {
 
                 const record_count = recordsCount(records);
                 const err = self.produceError(index);
-                if (err == 0) _ = self.broker.produced.fetchAdd(record_count, .acq_rel);
+                // Count records as durable: on the ack path (err==0), or — for
+                // duplicate_seq — exactly once per partition (the first write
+                // whose ack was "lost", modelled via the injected[] flag).
+                var count_produced = err == 0;
+                if (self.broker.options.mode == .duplicate_seq) {
+                    const idx: usize = @intCast(index);
+                    if (idx < max_partitions and !self.broker.injected[idx]) {
+                        self.broker.injected[idx] = true;
+                        count_produced = true;
+                    }
+                }
+                if (count_produced) _ = self.broker.produced.fetchAdd(record_count, .acq_rel);
 
                 // Capture the batch metadata for idempotency assertions.
                 // The record-batch v2 fields are at fixed offsets (see
@@ -452,14 +484,21 @@ const Session = struct {
         return switch (self.broker.options.mode) {
             .ok => 0,
             .fatal => 87, // INVALID_RECORD
-            .retriable_once => blk: {
-                if (idx < max_partitions and !self.broker.injected[idx]) {
-                    self.broker.injected[idx] = true;
-                    break :blk 6; // NOT_LEADER_OR_FOLLOWER
-                }
-                break :blk 0;
-            },
+            .duplicate_seq => 37, // DUPLICATE_SEQUENCE_NUMBER (always)
+            .retriable_once => injectOnce(self.broker, idx, 6), // NOT_LEADER_OR_FOLLOWER
+            .out_of_order_once => injectOnce(self.broker, idx, 45), // OUT_OF_ORDER_SEQUENCE
+            .unknown_pid_once => injectOnce(self.broker, idx, 73), // UNKNOWN_PRODUCER_ID
         };
+    }
+
+    /// Return `code` the first time a partition is seen (arming the injected[]
+    /// flag), then 0 on subsequent Produces for that partition.
+    fn injectOnce(broker: *Broker, idx: usize, code: i16) i16 {
+        if (idx < max_partitions and !broker.injected[idx]) {
+            broker.injected[idx] = true;
+            return code;
+        }
+        return 0;
     }
 
     // --- SCRAM-SHA-512 server side (adapted from Connection.zig mock) ------

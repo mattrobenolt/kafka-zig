@@ -833,3 +833,189 @@ test "idempotency OFF: batches carry -1 sentinels, no PID" {
     try testing.expectEqual(@as(i16, -1), b.producer_epoch);
     try testing.expectEqual(@as(i32, -1), b.base_sequence);
 }
+
+// ---------------------------------------------------------------------------
+// 1c: idempotent re-ack error handling (OUT_OF_ORDER_SEQUENCE=45,
+// UNKNOWN_PRODUCER_ID=73, DUPLICATE_SEQUENCE_NUMBER=37). See PLAN §-idempotent
+// and issue #1. Codes verified against the Kafka error-code table
+// (https://kafka.apache.org/protocol.html#protocol_error_codes); recovery
+// semantics against KIP-360 (PID reset / sequence reset) and KIP-98 (dedup).
+// ---------------------------------------------------------------------------
+
+test "idempotency ON: OUT_OF_ORDER_SEQUENCE re-inits PID, resets sequence, retries" {
+    // Broker returns OUT_OF_ORDER_SEQUENCE (45) on the first Produce, then acks.
+    // The producer must re-init the PID (fresh PID from the 2nd InitProducerId),
+    // reset the per-partition sequence to 0, and retry — landing on the ack.
+    var broker = try mock.Broker.start(testing.allocator, .{
+        .mode = .out_of_order_once,
+        .num_partitions = 1,
+    });
+    defer broker.stop();
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var cfg = testConfig(&bootstrap);
+    cfg.enable_idempotency = true;
+    var client = try Client.init(testing.allocator, cfg);
+    defer client.deinit();
+
+    const n = 3;
+    var handles: [n]Message = undefined;
+    for (&handles, 0..) |*m, i| {
+        m.* = try client.acquire();
+        try m.setTopic("events");
+        m.setPartition(0);
+        const dst = m.value();
+        const payload = try std.fmt.bufPrint(dst, "o{d}", .{i});
+        try m.commit(@intCast(payload.len));
+    }
+    // Every message must eventually ack despite the first Produce failing 45.
+    for (&handles) |*m| try m.await();
+
+    try testing.expectEqual(@as(u32, n), broker.produced.load(.acquire));
+    // The re-init happened: startup (call 1) + recovery (call 2).
+    try testing.expect(broker.init_producer_id_requests.load(.acquire) >= 2);
+
+    // The first (failed) batch carried the startup PID; the retry batch carried
+    // the fresh PID (mock_producer_id + 1). Both start at base_sequence 0 (the
+    // fresh PID makes the broker forget the old sequence state).
+    try testing.expect(broker.captured_batches_len >= 2);
+    var saw_old_pid = false;
+    var saw_new_pid = false;
+    for (broker.captured_batches[0..broker.captured_batches_len]) |b| {
+        try testing.expectEqual(@as(i32, 0), b.partition);
+        try testing.expectEqual(@as(i32, 0), b.base_sequence);
+        if (b.producer_id == mock.mock_producer_id) saw_old_pid = true;
+        if (b.producer_id == mock.mock_producer_id + 1) saw_new_pid = true;
+    }
+    try testing.expect(saw_old_pid);
+    try testing.expect(saw_new_pid);
+}
+
+test "idempotency ON: UNKNOWN_PRODUCER_ID re-inits PID, resets sequence, retries" {
+    // KIP-360: on UNKNOWN_PRODUCER_ID (73) the broker lost producer state; the
+    // idempotent producer re-inits the PID, resets sequences, and retries. Same
+    // recovery path as OUT_OF_ORDER_SEQUENCE.
+    var broker = try mock.Broker.start(testing.allocator, .{
+        .mode = .unknown_pid_once,
+        .num_partitions = 1,
+    });
+    defer broker.stop();
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var cfg = testConfig(&bootstrap);
+    cfg.enable_idempotency = true;
+    var client = try Client.init(testing.allocator, cfg);
+    defer client.deinit();
+
+    const n = 4;
+    var handles: [n]Message = undefined;
+    for (&handles, 0..) |*m, i| {
+        m.* = try client.acquire();
+        try m.setTopic("events");
+        m.setPartition(0);
+        const dst = m.value();
+        const payload = try std.fmt.bufPrint(dst, "u{d}", .{i});
+        try m.commit(@intCast(payload.len));
+    }
+    for (&handles) |*m| try m.await();
+
+    try testing.expectEqual(@as(u32, n), broker.produced.load(.acquire));
+    try testing.expect(broker.init_producer_id_requests.load(.acquire) >= 2);
+
+    try testing.expect(broker.captured_batches_len >= 2);
+    var saw_new_pid = false;
+    for (broker.captured_batches[0..broker.captured_batches_len]) |b| {
+        try testing.expectEqual(@as(i32, 0), b.base_sequence);
+        if (b.producer_id == mock.mock_producer_id + 1) saw_new_pid = true;
+    }
+    try testing.expect(saw_new_pid);
+}
+
+test "idempotency ON: DUPLICATE_SEQUENCE_NUMBER is treated as ack, not failure" {
+    // KIP-98: the broker returns DUPLICATE_SEQUENCE_NUMBER (37) when a batch's
+    // sequence was already appended (a lost-ack retry). The data is durable, so
+    // the producer must complete the slot as ACKED (await succeeds), NOT fail
+    // it, and must NOT re-init the PID (37 is not a reset trigger).
+    var broker = try mock.Broker.start(testing.allocator, .{
+        .mode = .duplicate_seq,
+        .num_partitions = 1,
+    });
+    defer broker.stop();
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var cfg = testConfig(&bootstrap);
+    cfg.enable_idempotency = true;
+    var client = try Client.init(testing.allocator, cfg);
+    defer client.deinit();
+
+    const n = 3;
+    var handles: [n]Message = undefined;
+    for (&handles, 0..) |*m, i| {
+        m.* = try client.acquire();
+        try m.setTopic("events");
+        m.setPartition(0);
+        const dst = m.value();
+        const payload = try std.fmt.bufPrint(dst, "d{d}", .{i});
+        try m.commit(@intCast(payload.len));
+    }
+    // await() succeeding proves the slots were ACKED, not failed.
+    for (&handles) |*m| try m.await();
+
+    // The mock counts the duplicate write as durable exactly once.
+    try testing.expectEqual(@as(u32, n), broker.produced.load(.acquire));
+    // No PID reset: only the startup InitProducerId.
+    try testing.expectEqual(@as(u32, 1), broker.init_producer_id_requests.load(.acquire));
+}
+
+test "idempotency OFF: OUT_OF_ORDER_SEQUENCE fails (not silently recovered)" {
+    // Without a PID, code 45 is unexpected and non-retriable: the slot must
+    // fail with error.SendFailed carrying code 45. No InitProducerId is sent.
+    var broker = try mock.Broker.start(testing.allocator, .{
+        .mode = .out_of_order_once,
+        .num_partitions = 1,
+    });
+    defer broker.stop();
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var cfg = testConfig(&bootstrap);
+    cfg.enable_idempotency = false;
+    var client = try Client.init(testing.allocator, cfg);
+    defer client.deinit();
+
+    var m = try client.acquire();
+    try m.setTopic("events");
+    m.setPartition(0);
+    const dst = m.value();
+    @memcpy(dst[0..3], "oos");
+    try m.commit(3);
+
+    try testing.expectError(error.SendFailed, m.await());
+    try testing.expectEqual(@as(u32, 45), m.failureCode()); // OUT_OF_ORDER_SEQUENCE
+    try testing.expectEqual(@as(u32, 0), broker.init_producer_id_requests.load(.acquire));
+}
+
+test "idempotency OFF: DUPLICATE_SEQUENCE_NUMBER fails (not treated as ack)" {
+    // The 37-as-ack shortcut is idempotent-only. Without a PID, code 37 is
+    // unexpected and must fail — never silently succeed.
+    var broker = try mock.Broker.start(testing.allocator, .{
+        .mode = .duplicate_seq,
+        .num_partitions = 1,
+    });
+    defer broker.stop();
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var cfg = testConfig(&bootstrap);
+    cfg.enable_idempotency = false;
+    var client = try Client.init(testing.allocator, cfg);
+    defer client.deinit();
+
+    var m = try client.acquire();
+    try m.setTopic("events");
+    m.setPartition(0);
+    const dst = m.value();
+    @memcpy(dst[0..3], "dup");
+    try m.commit(3);
+
+    try testing.expectError(error.SendFailed, m.await());
+    try testing.expectEqual(@as(u32, 37), m.failureCode()); // DUPLICATE_SEQUENCE_NUMBER
+}

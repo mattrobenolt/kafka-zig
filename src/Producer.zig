@@ -226,8 +226,15 @@ pid_acquired: bool = false,
 /// next base sequence to assign for the NEXT first-send batch on that
 /// (topic, partition). On retry, the slot's stored `base_sequence` is reused
 /// — this counter is NOT advanced on retry (the broker dedupes by sequence).
-/// Sequence numbers wrap at i32 max; the wraparound full-reset is 1c.
+/// Sequence numbers wrap at i32 max; the wraparound full-reset is a follow-up
+/// (out of scope for the idempotent milestone, see #1).
 sequences: std.AutoHashMapUnmanaged(SeqKey, i32) = .empty,
+/// Set by `applyResponse` when a partition returns OUT_OF_ORDER_SEQUENCE (45)
+/// or UNKNOWN_PRODUCER_ID (73): the PID's sequence state is unrecoverable, so
+/// the next drain must re-init the PID (fresh epoch), reset ALL per-partition
+/// counters to 0, and clear the `base_sequence` stamp on every pending slot so
+/// each re-sends fresh from 0 under the new PID (see `recoverProducerId`).
+pid_reset_pending: bool = false,
 
 /// A (topic, partition) run in the sorted `collected` array: `[start, end)`
 /// map to one record batch / one partition_response.
@@ -357,8 +364,9 @@ pub fn deinit(self: *Producer) void {
 pub fn run(self: *Producer) void {
     // Acquire a PID/epoch before the first drain when idempotency is enabled.
     // This is a blocking call to a bootstrap broker; if it fails we log and
-    // proceed in non-idempotent mode (sentinel -1) rather than hanging — the
-    // 1c slice will add retry/error handling for PID acquisition.
+    // proceed in non-idempotent mode (sentinel -1) rather than hanging.
+    // (Startup-acquisition retry is a follow-up; mid-flight PID recovery on
+    // sequence errors is handled by `recoverProducerId`.)
     if (self.options.enable_idempotency) {
         self.initProducerId() catch |err| {
             log.warn("PID acquisition failed, proceeding non-idempotent: {s}", .{@errorName(err)});
@@ -387,6 +395,20 @@ fn drainOnce(self: *Producer) !bool {
         self.refreshMetadata() catch |err| {
             log.warn("metadata refresh failed: {s}", .{@errorName(err)});
             return false; // back off; try again next drain
+        };
+    }
+
+    // Idempotent PID recovery, deferred here from `applyResponse` so it runs
+    // once (not per partition) and BEFORE any batch is built this drain. On
+    // OUT_OF_ORDER_SEQUENCE / UNKNOWN_PRODUCER_ID the PID's broker-side
+    // sequence state is gone; re-init and reset every pending slot's sequence
+    // to 0 under the fresh PID before re-sending. If re-init fails, back off
+    // and retry next drain (the flag stays set) rather than send with a stale
+    // PID + reset counters.
+    if (self.pid_reset_pending) {
+        self.recoverProducerId() catch |err| {
+            log.warn("PID reset failed, retrying next drain: {s}", .{@errorName(err)});
+            return false;
         };
     }
 
@@ -763,14 +785,32 @@ fn applyResponse(
     slots: []const Collected,
     groups: []const Group,
 ) bool {
-    // 1c hooks for idempotent error handling (NOT implemented in this slice):
-    //   - OutOfOrderSequence (45): non-retriable for idempotent. Reset the
-    //     per-partition sequence and re-send. The slot's base_sequence should
-    //     be cleared so a new one is assigned on the next send.
-    //   - UNKNOWN_PRODUCER_ID (73): re-init PID via initProducerId(), reset ALL
-    //     sequence counters, and retry.
-    //   - DUPLICATE_SEQUENCE_NUMBER (37): the retry succeeded — treat as ack.
-    // These belong in the error_code branches below in 1c.
+    // Idempotent-specific error handling (only when a real PID is in use, i.e.
+    // producer_id != -1). These three codes are checked BEFORE the generic
+    // retriable/non-retriable classification; in non-idempotent mode they fall
+    // through and fail (a broker must not send them without a PID).
+    //
+    //   - DUPLICATE_SEQUENCE_NUMBER (37): the broker already appended this exact
+    //     (PID, epoch, sequence) — the first attempt's write is durable and only
+    //     the ack was lost. Treat as an ACK, not a failure. (Java
+    //     `ProducerStateManager.checkSequence` returns DUPLICATE for a batch
+    //     whose sequence lies within the retained cache; `Sender` completes the
+    //     batch successfully. KIP-98.)
+    //   - OUT_OF_ORDER_SEQUENCE (45) / UNKNOWN_PRODUCER_ID (73): the broker's
+    //     sequence state for this PID is unrecoverable from the client side (a
+    //     gap it can't reconcile, or the producer state was dropped — segment
+    //     deletion / retention / DeleteRecords). Re-arm the slots for retry and
+    //     flag a PID reset: the next drain re-inits the PID (fresh epoch),
+    //     resets ALL per-partition sequences to 0, and clears every pending
+    //     slot's base_sequence so it re-sends from 0 under the new PID. This is
+    //     the simplest globally-correct recovery for a non-transactional
+    //     idempotent producer that does not track last-acked sequences per
+    //     partition: a fresh PID makes the broker forget all prior sequence
+    //     state, so restarting every partition at 0 can never gap or duplicate.
+    //     (Java `TransactionManager` bumps the epoch and resets sequence numbers
+    //     for the idempotent producer on both codes — KIP-360; re-init via
+    //     InitProducerId is the network-visible equivalent here.)
+    const idem = self.producer_id != -1;
     var progressed = false;
     for (resp.responses) |tr| {
         for (tr.partition_responses) |pr| {
@@ -779,6 +819,17 @@ fn applyResponse(
             if (pr.error_code == 0) {
                 self.ackSlots(slot_run);
                 progressed = true;
+            } else if (idem and pr.error_code == 37) {
+                // DUPLICATE_SEQUENCE_NUMBER: data already durable — ack.
+                self.ackSlots(slot_run);
+                progressed = true;
+            } else if (idem and (pr.error_code == 45 or pr.error_code == 73)) {
+                // OUT_OF_ORDER_SEQUENCE / UNKNOWN_PRODUCER_ID: retry under a
+                // fresh PID. Re-arm (or fail on retry-budget exhaustion) and
+                // defer the actual re-init + full sequence reset to the next
+                // drain (see `recoverProducerId`).
+                if (self.retrySlotsWithCode(slot_run, pr.error_code)) progressed = true;
+                self.pid_reset_pending = true;
             } else if (isRetriable(pr.error_code)) {
                 if (isLeadershipError(pr.error_code)) self.metadata_stale = true;
                 if (self.retrySlotsWithCode(slot_run, pr.error_code)) progressed = true;
@@ -1122,11 +1173,10 @@ pub const InitProducerIdBody = struct {
 
 /// Acquire a producer ID/epoch via InitProducerId v4 to any bootstrap broker.
 /// On success, sets `producer_id`, `producer_epoch`, and `pid_acquired`.
-/// Cold path (once at startup). The coordinator for non-transactional
-/// idempotent init is ANY broker — FindCoordinator is NOT needed.
-///
-/// 1c hook: on UNKNOWN_PRODUCER_ID (73) from a Produce response, re-call this
-/// to get a fresh PID/epoch and reset all sequence counters.
+/// Cold path (once at startup, and again on PID recovery). The coordinator for
+/// non-transactional idempotent init is ANY broker — FindCoordinator is NOT
+/// needed. On UNKNOWN_PRODUCER_ID (73) / OUT_OF_ORDER_SEQUENCE (45) from a
+/// Produce response, `recoverProducerId` re-calls this for a fresh PID/epoch.
 fn initProducerId(self: *Producer) !void {
     const conn = try self.metadataConnection();
     const body: InitProducerIdBody = .{
@@ -1150,6 +1200,30 @@ fn initProducerId(self: *Producer) !void {
     self.producer_epoch = resp.producer_epoch;
     self.pid_acquired = true;
     log.debug("acquired PID={d} epoch={d}", .{ self.producer_id, self.producer_epoch });
+}
+
+/// Recover from OUT_OF_ORDER_SEQUENCE (45) / UNKNOWN_PRODUCER_ID (73): acquire
+/// a fresh PID/epoch, reset ALL per-partition sequence counters to 0, and clear
+/// the `base_sequence` stamp on every currently-pending slot so each re-sends
+/// fresh from sequence 0 under the new PID. Clearing every pending slot (not
+/// just the offending partition's) is required: a fresh PID resets the broker's
+/// sequence state for ALL partitions, so any pending retry still carrying an
+/// old-PID base_sequence would gap the new PID. On success, clears
+/// `pid_reset_pending`; on failure it stays set (the caller backs off and
+/// retries next drain) and no state is mutated — the re-init is attempted
+/// first, so a failed round-trip leaves the counters and slots untouched.
+/// Cold path (error recovery).
+fn recoverProducerId(self: *Producer) !void {
+    try self.initProducerId();
+    self.sequences.clearRetainingCapacity();
+    const lo = self.ring.readHead();
+    const hi = self.ring.writeHead();
+    var pos = lo;
+    while (pos < hi) : (pos += 1) {
+        if (self.ring.slotIsPending(pos)) self.ring.setSlotBaseSequence(pos, -1);
+    }
+    self.pid_reset_pending = false;
+    log.debug("PID reset: fresh PID={d} epoch={d}, sequences reset", .{ self.producer_id, self.producer_epoch });
 }
 
 /// Compute the sequence map key for a (topic, partition) pair. Uses wyhash for
