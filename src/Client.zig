@@ -305,14 +305,13 @@ pub fn tryAcquire(self: *Client) Error!Message {
 
 /// Fetch a relaxed-consistency snapshot of producer statistics (issue #7).
 /// No locks, no allocation -- returns a value struct. Torn/stale reads are
-/// acceptable. `queue_depth` and `in_flight` are read from the ring's existing
-/// atomics; the producer-thread counters (`messages_produced`, `bytes_produced`)
-/// are atomic; the network-thread counters are read with `.monotonic` loads
+/// acceptable. `queue_depth` and `in_flight` are read from `Ring.depth()`
+/// (which loads `read_head` before `write_head` to avoid underflow); the
+/// producer-thread counters (`messages_produced`, `bytes_produced`) are
+/// atomic; the network-thread counters are read with `.monotonic` loads
 /// (single-writer, relaxed cross-thread reads).
 pub fn stats(self: *const Client) Stats {
-    const wh = self.ring.writeHead();
-    const rh = self.ring.readHead();
-    const depth = wh - rh;
+    const depth = self.ring.depth();
     return .{
         .queue_depth = depth,
         .in_flight = depth,
@@ -373,6 +372,22 @@ fn testConfig(bootstrap: []const Broker) Config {
         .client_id = "kafka-zig-test",
         .enable_idempotency = true,
     };
+}
+
+/// Poll `stats().queue_depth` until it reaches zero, up to 1s. The network
+/// thread wakes completion waiters BEFORE reclaiming (`wakeCompletions` then
+/// `reclaim` in `drainOnce`), so `await()` can return before `read_head`
+/// advances. An immediate `queue_depth == 0` assertion races that window;
+/// this poll waits for the reclaim to land.
+fn expectQueueDepthZero(client: *const Client) !void {
+    const start: u64 = @intCast(@as(i64, @truncate(std.time.nanoTimestamp())));
+    const deadline_ns: u64 = start + std.time.ns_per_s;
+    while (true) {
+        if (client.stats().queue_depth == 0) return;
+        const now: u64 = @intCast(@as(i64, @truncate(std.time.nanoTimestamp())));
+        if (now >= deadline_ns) return error.Timeout;
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
 }
 
 test "produce N messages: all ack, no loss" {
@@ -1897,14 +1912,15 @@ test "#7 stats: messages_produced, bytes_produced, messages_acked after all acks
     // (relaxed consistency — the test waits for the drain to complete).
     for (&handles) |*m| try m.await();
 
+    // After all acks + reclaim, the queue should be drained. The network
+    // thread wakes completion waiters before reclaiming, so poll for the
+    // reclaim to land rather than asserting immediately.
+    try expectQueueDepthZero(client);
     const s = client.stats();
     try testing.expectEqual(@as(u64, n), s.messages_produced);
     try testing.expectEqual(total_bytes, s.bytes_produced);
     try testing.expectEqual(@as(u64, n), s.messages_acked);
     try testing.expectEqual(@as(u64, 0), s.messages_failed);
-    // After all acks + reclaim, the queue should be drained.
-    try testing.expectEqual(@as(u64, 0), s.queue_depth);
-    // At least one batch was sent.
     try testing.expect(s.batches_sent > 0);
 }
 
@@ -1977,8 +1993,10 @@ test "#7 stats: queue_depth reflects pending slots before drain" {
     broker.openGate();
     for (&handles) |*m| try m.await();
 
+    // The network thread wakes completion waiters before reclaiming, so poll
+    // for the reclaim to land rather than asserting immediately.
+    try expectQueueDepthZero(client);
     const s2 = client.stats();
-    try testing.expectEqual(@as(u64, 0), s2.queue_depth);
     try testing.expectEqual(@as(u64, n), s2.messages_acked);
 }
 

@@ -657,6 +657,17 @@ pub fn readHead(self: *const Ring) u64 {
     return self.read_head.load(.acquire);
 }
 
+/// Pending slot count: `write_head - read_head`. Loads `read_head` BEFORE
+/// `write_head` — the same ordering invariant documented in `claimSlot`:
+/// `read_head` only increases, so reading it first keeps `w >= r` (no
+/// underflow). Every caller that needs the pending depth should use this
+/// helper instead of manual subtraction so the ordering is encapsulated.
+pub fn depth(self: *const Ring) u64 {
+    const r = self.read_head.load(.acquire);
+    const w = self.write_head.load(.acquire);
+    return w - r;
+}
+
 pub fn numSlots(self: *const Ring) u32 {
     return self.num_slots;
 }
