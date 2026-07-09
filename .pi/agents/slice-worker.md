@@ -1,7 +1,7 @@
 ---
 name: slice-worker
 description: Narrow implementation worker for approved kafka-zig slices; writes code, tests, and fixtures only within an explicit acceptance contract.
-tools: bash, grep, find, ls, read, edit, write
+tools: bash, grep, find, ls, read, edit, write, webfetch
 model: fireworks/accounts/fireworks/models/glm-5p2
 thinking: medium
 systemPromptMode: replace

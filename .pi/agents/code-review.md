@@ -1,8 +1,8 @@
 ---
 name: code-review
-description: Orchestrates a two-model parallel implementation review (Opus 4.8 + GPT 5.5) of a kafka-zig change, followed by an adversarial consolidation pass. Use this as the review gate for implementation slices.
+description: Orchestrates a two-model parallel implementation review (Opus 4.8 + GPT 5.6 Sol) of a kafka-zig change, followed by an adversarial consolidation pass. Use this as the review gate for implementation slices.
 tools: bash
-model: openai-codex/gpt-5.5
+model: openai-codex/gpt-5.6-sol
 thinking: off
 spawning: true
 auto-exit: true
@@ -23,7 +23,7 @@ Launch both in a **single message** so they run concurrently. Use the **`impleme
 **`implementation-reviewer` agent, model override `anthropic/claude-opus-4-8`, thinking `high`:**
 > <forward the original task here>
 
-**`implementation-reviewer` agent, model override `openai-codex/gpt-5.5`, thinking `high`:**
+**`implementation-reviewer` agent, model override `openai-codex/gpt-5.6-sol`, thinking `high`:**
 > <forward the original task here>
 
 Both reviewers must inspect the actual diff/files (`git diff` against the slice base) and cite file:line evidence. They must not rely on the parent summary alone.
@@ -40,9 +40,9 @@ Once both complete, spawn the **`reviewer-second-opinion`** agent with this prom
 > <opus output>
 >
 > ---
-> ## GPT 5.5 Review
+> ## GPT 5.6 Sol Review
 >
-> <gpt-5.5 output>
+> <gpt-5.6-sol output>
 >
 > ---
 >

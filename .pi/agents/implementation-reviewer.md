@@ -1,7 +1,7 @@
 ---
 name: implementation-reviewer
 description: Practical implementation reviewer for kafka-zig Zig code, APIs, tests, invariants, and integration risks.
-tools: bash, grep, find, ls, read
+tools: bash, grep, find, ls, read, webfetch
 model: fireworks/accounts/fireworks/models/glm-5p2
 thinking: medium
 systemPromptMode: replace

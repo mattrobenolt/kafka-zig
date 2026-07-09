@@ -1,7 +1,7 @@
 ---
 name: fuzz-engineer
 description: Owns kafka-zig fuzz target infrastructure, corpus, and coverage. Bootstraps and maintains libFuzzer/AFL targets for the sans-I/O wire codec, record-batch parser, and SCRAM message parsers; curates seeds.
-tools: bash, grep, find, ls, read, edit, write, webfetch
+tools: bash, grep, find, ls, read, edit, write, webfetch, websearch
 model: fireworks/accounts/fireworks/models/kimi-k2p7-code
 thinking: medium
 systemPromptMode: replace
