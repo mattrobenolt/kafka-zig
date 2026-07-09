@@ -165,3 +165,18 @@ Before encoding any API, open https://kafka.apache.org/protocol.html and read
 the entry for that API key + the version you're pinning. Cross-check field
 order and types. The pinned versions above are correct for the target; the
 field layouts must come from the spec, not recall.
+
+## Error codes — verify against the table, do NOT recall
+
+Kafka error codes are a fixed table at
+https://kafka.apache.org/protocol.html#protocol_error_codes (the `Retriable`
+column matters for the producer). LLM memory for specific code numbers is
+frequently wrong (e.g. PRODUCER_FENCED is **90**, not 37 — a real fixture bug
+we shipped). When a fixture, test, or handler references an error code by
+number, look it up in the table and cite it. The retriable set the producer
+cares about (verify against the table): NOT_LEADER_OR_FOLLOWER=6,
+LEADER_NOT_AVAILABLE=5, UNKNOWN_TOPIC_OR_PARTITION=3, REQUEST_TIMED_OUT=7,
+NOT_ENOUGH_REPLICAS=19, UNKNOWN_PRODUCER_ID=73, OUT_OF_ORDER_SEQUENCE=45
+(non-retriable for idempotent — reset sequence), DUPLICATE_SEQUENCE_NUMBER=37
+(non-retriable), PRODUCER_FENCED=90 (non-retriable — fatal, the producer is
+done), COORDINATOR_NOT_AVAILABLE=14, NOT_COORDINATOR=16, REBOOTSTRAP_REQUIRED=129.
