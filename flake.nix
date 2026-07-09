@@ -48,6 +48,11 @@
               # mkcert: generate locally-trusted dev certificates (used by phase 7
               # e2e for the SASL_SSL broker — preferred over ad-hoc self-signed).
               mkcert
+              # zizmor + pinact: GitHub Actions security auditing + action-pin
+              # management. `just lint` runs zizmor on the workflows; `just
+              # pin-actions` bumps+pins actions to SHAs.
+              zizmor
+              pinact
             ];
 
             shellHook = ''

@@ -36,10 +36,19 @@ fmt:
 fmt-check:
     zig fmt --check $(git ls-files '*.zig')
 
-[doc("Run ziglint")]
+[doc("Run ziglint + zizmor (CI security audit)")]
 [group("lint")]
 lint:
     ziglint
+    # zizmor: GitHub Actions security audit. Fail on medium+ findings
+    # (informational/low like missing concurrency are reported but don't fail).
+    zizmor --persona=auditor --min-severity=medium .
+
+[doc("Pin/bump GitHub Actions to SHAs (latest tags) via pinact")]
+[group("lint")]
+pin-actions:
+    # No arg: pinact auto-discovers .github/workflows/*.yml
+    pinact run
 
 [doc("Build the library and CLI")]
 [group("build")]
