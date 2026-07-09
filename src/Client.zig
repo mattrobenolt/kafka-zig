@@ -1390,6 +1390,15 @@ test "#3 no over-linger under load: full batch drains immediately" {
     // large linger (500ms) and a max_batch_bytes that fits one batch of 15
     // small records. When all 15 are committed at once, pendingBatchFull
     // detects the batch is full and skips the linger.
+    //
+    // The assertion is: the produce completes in well under the 500ms linger.
+    // If the linger were NOT skipped, the drain would wait 500ms before
+    // sending. We measure from AFTER all commits (the first commit triggers
+    // the network thread's waitForData), so the elapsed time is only the
+    // drain+produce+ack round-trip — NOT the TLS handshake / PID acquisition
+    // / metadata fetch (which happen on the network thread before the first
+    // drain and overlap with the commit loop). This keeps the bound tight
+    // regardless of CI hardware speed.
     var broker = try mock.Broker.start(testing.allocator, .{ .mode = .ok, .num_partitions = 1 });
     defer broker.stop();
 
@@ -1401,13 +1410,21 @@ test "#3 no over-linger under load: full batch drains immediately" {
     var client = try Client.init(testing.allocator, cfg);
     defer client.deinit();
 
-    // Commit 15 records with 50-byte payloads to the same partition. The
+    // Wait for the producer to be ready (PID acquired, metadata loaded) by
+    // producing a warmup message. This ensures the TLS handshake + SCRAM +
+    // metadata are done before we start timing.
+    var warmup = try client.acquire();
+    try warmup.setTopic("events");
+    warmup.setPartition(0);
+    try warmup.writeMessage("warmup");
+    try warmup.await();
+
+    // Now commit 15 records with 50-byte payloads to the same partition. The
     // estimated pending bytes (15 * 70 = 1050) exceeds max_batch_bytes, so
     // pendingBatchFull triggers immediately and the linger is skipped. The
     // actual batch (~976B) fits within max_batch_bytes.
     const n = 15;
     var handles: [n]Message = undefined;
-    const start = std.time.milliTimestamp();
     for (&handles, 0..) |*m, i| {
         m.* = try client.acquire();
         try m.setTopic("events");
@@ -1417,14 +1434,19 @@ test "#3 no over-linger under load: full batch drains immediately" {
         try m.commit(50);
         _ = i;
     }
+    // Start timing AFTER all commits — the network thread is already
+    // connected and has metadata. The only thing between commit and ack is
+    // the drain (linger skip + encode + send + recv + ack).
+    const start = std.time.milliTimestamp();
     for (&handles) |*m| try m.await();
     const elapsed: u64 = @intCast(std.time.milliTimestamp() - start);
 
-    try testing.expectEqual(@as(u32, n), broker.produced.load(.acquire));
+    try testing.expectEqual(@as(u32, n + 1), broker.produced.load(.acquire));
     // The produce must complete in well under the 500ms linger. If the linger
-    // were NOT skipped, the drain would wait 500ms before sending. 200ms is a
-    // generous bound that accounts for TLS handshake + round-trip.
-    try testing.expect(elapsed < 2000); // generous for CI: TLS+SCRAM+PID+metadata+produce
+    // were NOT skipped, the drain would wait 500ms before sending. 300ms is a
+    // generous bound for the encode + TLS encrypt + loopback round-trip on
+    // CI hardware (the TLS handshake is already done via the warmup).
+    try testing.expect(elapsed < 300);
 }
 
 test "#3 periodic metadata refresh: increments without errors" {
