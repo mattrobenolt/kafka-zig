@@ -1619,3 +1619,187 @@ test "#4 no new acquires during drain: acquire returns Shutdown" {
     dt.join();
     try testing.expectEqual(@as(u32, 1), broker.produced.load(.acquire));
 }
+
+// --- #5 sticky partitioner tests ------------------------------------------
+
+test "#5 sticky: keyless burst coalesces to one partition with default partitioner" {
+    // With the default (sticky) partitioner + linger_ms > 0, a burst of
+    // keyless records should all land on ONE partition. The mock broker's
+    // captured_batches track which partition each batch went to.
+    var broker = try mock.Broker.start(testing.allocator, .{
+        .mode = .ok,
+        .num_partitions = 4,
+    });
+    defer broker.stop();
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var cfg = testConfig(&bootstrap);
+    cfg.linger_ms = 50;
+    cfg.enable_idempotency = false;
+    var client = try Client.init(testing.allocator, cfg);
+    defer client.deinit();
+
+    const n = 10;
+    var handles: [n]Message = undefined;
+    for (&handles, 0..) |*m, i| {
+        m.* = try client.acquire();
+        try m.setTopic("events");
+        m.setPartition(null); // let the partitioner decide → sticky
+        const dst = m.value();
+        const payload = try std.fmt.bufPrint(dst, "keyless-{d}", .{i});
+        try m.commit(@intCast(payload.len));
+    }
+    for (&handles) |*m| try m.await();
+
+    try testing.expectEqual(@as(u32, n), broker.produced.load(.acquire));
+    // All captured batches for this drain should target the same partition.
+    try testing.expect(broker.captured_batches_len > 0);
+    const first_part = broker.captured_batches[0].partition;
+    for (broker.captured_batches[0..broker.captured_batches_len]) |b| {
+        try testing.expectEqual(first_part, b.partition);
+    }
+}
+
+test "#5 sticky: round_robin spreads keyless records across partitions (regression)" {
+    // With round_robin partitioner, keyless records scatter across
+    // partitions (the pre-sticky behavior). This is a regression guard.
+    var broker = try mock.Broker.start(testing.allocator, .{
+        .mode = .ok,
+        .num_partitions = 4,
+    });
+    defer broker.stop();
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var cfg = testConfig(&bootstrap);
+    cfg.linger_ms = 50;
+    cfg.partitioner = .round_robin;
+    cfg.enable_idempotency = false;
+    var client = try Client.init(testing.allocator, cfg);
+    defer client.deinit();
+
+    const n = 8;
+    var handles: [n]Message = undefined;
+    for (&handles, 0..) |*m, i| {
+        m.* = try client.acquire();
+        try m.setTopic("events");
+        m.setPartition(null);
+        const dst = m.value();
+        const payload = try std.fmt.bufPrint(dst, "rr-{d}", .{i});
+        try m.commit(@intCast(payload.len));
+    }
+    for (&handles) |*m| try m.await();
+
+    try testing.expectEqual(@as(u32, n), broker.produced.load(.acquire));
+    // round-robin should produce batches on more than one partition.
+    var seen: [4]bool = .{ false, false, false, false };
+    for (broker.captured_batches[0..broker.captured_batches_len]) |b| {
+        const idx: usize = @intCast(b.partition);
+        if (idx < seen.len) seen[idx] = true;
+    }
+    var count: u32 = 0;
+    for (seen) |s| if (s) {
+        count += 1;
+    };
+    try testing.expect(count > 1);
+}
+
+test "#5 sticky: keyed records use key-hash with default partitioner" {
+    // With the default (sticky) partitioner, keyed records route by murmur2
+    // key-hash, not sticky. Assert the partition matches the key-hash mapping.
+    const np: u32 = 4;
+    var broker = try mock.Broker.start(testing.allocator, .{
+        .mode = .ok,
+        .num_partitions = np,
+    });
+    defer broker.stop();
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var cfg = testConfig(&bootstrap);
+    cfg.linger_ms = 50;
+    cfg.enable_idempotency = false;
+    var client = try Client.init(testing.allocator, cfg);
+    defer client.deinit();
+
+    const key = "entity-42";
+    const expected_part = partitioner.partitionForKey(key, np);
+
+    const n = 5;
+    var handles: [n]Message = undefined;
+    for (&handles, 0..) |*m, i| {
+        m.* = try client.acquire();
+        try m.setTopic("events");
+        try m.setKey(key);
+        m.setPartition(null);
+        const dst = m.value();
+        const payload = try std.fmt.bufPrint(dst, "keyed-{d}", .{i});
+        try m.commit(@intCast(payload.len));
+    }
+    for (&handles) |*m| try m.await();
+
+    try testing.expectEqual(@as(u32, n), broker.produced.load(.acquire));
+    try testing.expect(broker.captured_batches_len > 0);
+    for (broker.captured_batches[0..broker.captured_batches_len]) |b| {
+        try testing.expectEqual(@as(i32, @intCast(expected_part)), b.partition);
+    }
+}
+
+test "#5 sticky: partition rotates between successive drains" {
+    // After a drain completes (all acked), the next drain's keyless records
+    // go to a DIFFERENT partition (the sticky cursor rotates). We produce
+    // two bursts with a gap, awaiting all acks between them so each burst is
+    // a separate drain. With 4 partitions and deterministic rotation, the
+    // two drains should target different partitions.
+    var broker = try mock.Broker.start(testing.allocator, .{
+        .mode = .ok,
+        .num_partitions = 4,
+    });
+    defer broker.stop();
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var cfg = testConfig(&bootstrap);
+    cfg.linger_ms = 20;
+    cfg.retry_backoff_ms = 0;
+    cfg.enable_idempotency = false;
+    var client = try Client.init(testing.allocator, cfg);
+    defer client.deinit();
+
+    // First drain: 3 keyless records.
+    const n1 = 3;
+    var h1: [n1]Message = undefined;
+    for (&h1, 0..) |*m, i| {
+        m.* = try client.acquire();
+        try m.setTopic("events");
+        m.setPartition(null);
+        const dst = m.value();
+        const payload = try std.fmt.bufPrint(dst, "d1-{d}", .{i});
+        try m.commit(@intCast(payload.len));
+    }
+    for (&h1) |*m| try m.await();
+
+    const first_drain_len = broker.captured_batches_len;
+    try testing.expect(first_drain_len > 0);
+    const first_part = broker.captured_batches[0].partition;
+
+    // Second drain: 3 more keyless records. The sticky cursor has advanced,
+    // so these should go to a different partition.
+    const n2 = 3;
+    var h2: [n2]Message = undefined;
+    for (&h2, 0..) |*m, i| {
+        m.* = try client.acquire();
+        try m.setTopic("events");
+        m.setPartition(null);
+        const dst = m.value();
+        const payload = try std.fmt.bufPrint(dst, "d2-{d}", .{i});
+        try m.commit(@intCast(payload.len));
+    }
+    for (&h2) |*m| try m.await();
+
+    try testing.expect(broker.captured_batches_len > first_drain_len);
+    // At least one batch in the second drain should be on a different
+    // partition than the first drain.
+    var found_different = false;
+    for (broker.captured_batches[first_drain_len..broker.captured_batches_len]) |b| {
+        if (b.partition != first_part) found_different = true;
+    }
+    try testing.expect(found_different);
+}

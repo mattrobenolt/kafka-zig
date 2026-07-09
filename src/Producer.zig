@@ -325,6 +325,8 @@ force_bootstrap: bool = false,
 
 // --- round-robin counters, persistent across metadata refreshes -----------
 round_robin: std.StringHashMapUnmanaged(partitioner.RoundRobin) = .empty,
+// --- sticky partition state, per topic, persistent across metadata refreshes ---
+sticky: std.StringHashMapUnmanaged(partitioner.Sticky) = .empty,
 
 // --- preallocated drain scratch (reused every drain, never on hot path) ---
 collected: []Collected,
@@ -349,6 +351,8 @@ attempt_gen: []u32,
 read_head: u64 = 0,
 /// Shared round-robin counter used only if allocating a per-topic key fails.
 rr_fallback: partitioner.RoundRobin = .{},
+/// Shared sticky state used only if allocating a per-topic key fails.
+sticky_fallback: partitioner.Sticky = .{},
 
 // --- idempotent producer state --------------------------------------------
 /// PID and epoch assigned by the broker via InitProducerId v4. -1 = not yet
@@ -476,6 +480,10 @@ pub fn deinit(self: *Producer) void {
     var rr_it = self.round_robin.iterator();
     while (rr_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
     self.round_robin.deinit(self.allocator);
+
+    var st_it = self.sticky.iterator();
+    while (st_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+    self.sticky.deinit(self.allocator);
 
     var rb_it = self.reconnect_backoff.iterator();
     while (rb_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
@@ -654,6 +662,11 @@ fn drainOnce(self: *Producer) !bool {
     const base = self.ring.readHead();
     const head = self.ring.writeHead();
     if (base >= head) return false;
+
+    // Reset sticky partition state for this drain cycle: the first keyless
+    // record per topic picks a new sticky partition (rotating from last
+    // drain), and all subsequent keyless records in this drain reuse it.
+    self.beginStickyDrain();
 
     // --- collect pending slots, assign partitions, resolve leaders ---
     var n: usize = 0;
@@ -1157,7 +1170,8 @@ fn resetAttempts(self: *Producer, pos: u64) void {
 
 fn pickPartition(self: *Producer, topic: []const u8, key: ?[]const u8, num_partitions: u32) u32 {
     const rr = self.roundRobinFor(topic);
-    return partitioner.pick(self.options.strategy, rr, key, num_partitions);
+    const st = self.stickyFor(topic);
+    return partitioner.pick(self.options.strategy, rr, st, key, num_partitions);
 }
 
 /// The persistent round-robin counter for `topic`, created on first use with
@@ -1174,6 +1188,30 @@ fn roundRobinFor(self: *Producer, topic: []const u8) *partitioner.RoundRobin {
         return &self.rr_fallback;
     };
     return self.round_robin.getPtr(key).?;
+}
+
+/// The persistent sticky state for `topic`, created on first use with an
+/// owned key. Shares the same key lifetime as `roundRobinFor` — both use
+/// the same allocator and the keys are independent (each map owns its dupe).
+fn stickyFor(self: *Producer, topic: []const u8) *partitioner.Sticky {
+    if (self.sticky.getPtr(topic)) |st| return st;
+    const key = self.allocator.dupe(u8, topic) catch {
+        return &self.sticky_fallback;
+    };
+    self.sticky.put(self.allocator, key, .{}) catch {
+        self.allocator.free(key);
+        return &self.sticky_fallback;
+    };
+    return self.sticky.getPtr(key).?;
+}
+
+/// Reset sticky partition state for all topics at the start of a drain cycle.
+/// The first keyless record per topic picks a new sticky partition; subsequent
+/// keyless records in the same drain reuse it. Called once per `drainOnce`.
+fn beginStickyDrain(self: *Producer) void {
+    var it = self.sticky.iterator();
+    while (it.next()) |entry| entry.value_ptr.beginDrain();
+    self.sticky_fallback.beginDrain();
 }
 
 // ---------------------------------------------------------------------------
