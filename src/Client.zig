@@ -360,11 +360,22 @@ test {
 const mock = @import("testing/mock_broker.zig");
 const testing = std.testing;
 
-test "validateCompression rejects unimplemented codecs" {
-    try validateCompression(.none);
-    try validateCompression(.snappy);
-    try testing.expectError(error.CompressionNotImplemented, validateCompression(.gzip));
-    try testing.expectError(error.CompressionNotImplemented, validateCompression(.lz4));
+test "init rejects unavailable and unimplemented compression" {
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = 1 }};
+
+    var gzip = testConfig(&bootstrap);
+    gzip.compression = .gzip;
+    try testing.expectError(error.CompressionNotImplemented, init(testing.allocator, gzip));
+
+    var lz4 = testConfig(&bootstrap);
+    lz4.compression = .lz4;
+    try testing.expectError(error.CompressionNotImplemented, init(testing.allocator, lz4));
+
+    if (!build_options.zstd_enabled) {
+        var zstd = testConfig(&bootstrap);
+        zstd.compression = .zstd;
+        try testing.expectError(error.CompressionUnavailable, init(testing.allocator, zstd));
+    }
 }
 
 fn testConfig(bootstrap: []const Broker) Config {

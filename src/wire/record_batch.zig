@@ -965,8 +965,6 @@ test "encodeBatchBounded: returns zero consumed when one record cannot fit" {
 }
 
 test "encodeBatchBounded: compressed budget uses compressed size" {
-    if (!compress.zstd_enabled) return;
-
     const value = "compressible-payload-" ** 32;
     const records = [_]Record{
         .{ .offset_delta = 0, .timestamp_delta = 0, .key = "k1", .value = value, .headers = &.{} },
@@ -977,7 +975,7 @@ test "encodeBatchBounded: compressed budget uses compressed size" {
 
     var full_buf: [4096]u8 = undefined;
     var scratch: [4096]u8 = undefined;
-    const full = try encodeBatch(&full_buf, &records, .{ .compression = .zstd, .scratch = &scratch });
+    const full = try encodeBatch(&full_buf, &records, .{ .compression = .snappy, .scratch = &scratch });
 
     try testing.expect(batch_records_region_off + recordLen(records[0]) > full.len);
 
@@ -986,7 +984,7 @@ test "encodeBatchBounded: compressed budget uses compressed size" {
         &bounded_buf,
         &records,
         full.len,
-        .{ .compression = .zstd, .scratch = &scratch },
+        .{ .compression = .snappy, .scratch = &scratch },
     );
     try testing.expectEqual(@as(usize, records.len), bounded.consumed);
     try testing.expect(bounded.bytes.len <= full.len);
