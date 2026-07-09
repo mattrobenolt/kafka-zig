@@ -269,7 +269,7 @@ fn testConfig(bootstrap: []const Broker) Config {
         .tls = .{ .sni = mock.server_name, .insecure_skip_verify = true },
         .sasl = .{ .scram_sha512 = .{ .username = mock.username, .password = mock.password } },
         .acks = .all,
-        .linger_ms = 2,
+        .linger_ms = 0,
         .retry_backoff_ms = 2,
         .metadata_max_age_ms = 300_000,
         .max_message_size = 1024,

@@ -1163,6 +1163,7 @@ fn metadataAged(self: *Producer) bool {
     if (self.options.metadata_max_age_ms == 0) return false;
     if (!self.metadata_loaded) return false; // handled separately
     const now = std.time.milliTimestamp();
+    if (now <= self.last_metadata_refresh_ms) return false; // guard backward NTP step
     const age: u64 = @intCast(now - self.last_metadata_refresh_ms);
     return age >= self.options.metadata_max_age_ms;
 }
