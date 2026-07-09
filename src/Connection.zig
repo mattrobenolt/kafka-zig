@@ -78,6 +78,12 @@ pub const Config = struct {
     /// map to `error.ConnectionClosed` so the drop-and-reconnect path handles
     /// it. 0 = no timeout (block indefinitely, the pre-hardening behavior).
     io_timeout_ms: u32 = 30_000,
+    /// Size of the request-framing scratch buffer, allocated once at `dial`.
+    /// A framed Produce request is header + body including the encoded record
+    /// batch, so the caller (Producer) must size this to `max_batch_bytes` plus
+    /// framing overhead or large batches fail with `RequestBufferTooSmall`. The
+    /// 64 KiB default covers the auth/Metadata paths (bodies < 1 KiB).
+    max_request_size: usize = 64 * 1024,
 };
 
 pub const Error = error{
@@ -99,10 +105,11 @@ pub const Error = error{
     ClientIdTooLong,
 };
 
-/// Fixed per-connection buffer sizes. Requests and responses for the auth path
-/// and Metadata are comfortably within these; Produce sizing is a phase-6
-/// concern (the produce path writes directly into the ring, not here).
-const request_buffer_len = 64 * 1024;
+/// Fixed per-connection response buffer size. Requests and responses for the
+/// auth path and Metadata are comfortably within this. The request-framing
+/// scratch is sized at `dial` from `Config.max_request_size` (Produce requests
+/// can be as large as `max_batch_bytes` + framing overhead), not a fixed
+/// inline array.
 const response_buffer_len = 256 * 1024;
 
 /// Max client_id length the connection stores inline. client_id is a short
@@ -126,8 +133,11 @@ rb: ztls.RecordBuffer,
 /// Kafka response framing over decrypted application data.
 resp_storage: [response_buffer_len]u8,
 resp_buf: ResponseBuffer,
-/// Request framing scratch.
-req_scratch: [request_buffer_len]u8,
+/// Request framing scratch, heap-allocated once at `dial` and sized to
+/// `Config.max_request_size` so the largest configured Produce request fits.
+/// Freed in `deinit`. This is a cold-path (per-connection) allocation, not a
+/// per-request one — the produce hot path frames into it in place.
+req_scratch: []u8,
 correlation_id: i32,
 /// client_id copied into inline storage at dial time. The Connection owns this
 /// copy, so the caller may free `config.client_id` as soon as `dial` returns.
@@ -182,7 +192,7 @@ pub fn dial(allocator: std.mem.Allocator, config: Config) !*Connection {
         .rb = undefined,
         .resp_storage = undefined,
         .resp_buf = undefined,
-        .req_scratch = undefined,
+        .req_scratch = &.{},
         .correlation_id = 0,
         .client_id_storage = undefined,
         .client_id_len = null,
@@ -192,6 +202,11 @@ pub fn dial(allocator: std.mem.Allocator, config: Config) !*Connection {
     // Own a copy of client_id before anything else can borrow the Config; the
     // caller may free config.client_id the moment dial returns.
     try self.setClientId(config.client_id);
+
+    // Request-framing scratch, sized once to the largest configured request.
+    assert(config.max_request_size > request.length_prefix_len);
+    self.req_scratch = try allocator.alloc(u8, config.max_request_size);
+    errdefer allocator.free(self.req_scratch);
 
     var random: ztls.Random = undefined;
     std.crypto.random.bytes(&random.data);
@@ -230,6 +245,7 @@ pub fn deinit(self: *Connection) void { // ziglint-ignore: Z030 -- self is heap-
     self.hs.deinit();
     self.stream.close();
     const allocator = self.allocator;
+    allocator.free(self.req_scratch);
     allocator.destroy(self);
 }
 
@@ -249,7 +265,7 @@ pub fn sendRequest(
 ) !i32 {
     const corr = self.nextCorrelationId();
     const framed = try request.frameRequest(
-        &self.req_scratch,
+        self.req_scratch,
         api_key,
         api_version,
         corr,

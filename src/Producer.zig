@@ -1540,6 +1540,14 @@ fn connectionFor(self: *Producer, host: []const u8, port: u16) !*Connection {
         .scram = self.options.scram,
         .client_id = self.options.client_id,
         .io_timeout_ms = self.options.io_timeout_ms,
+        // A framed Produce request is header + body including the encoded
+        // record batch (bounded by `max_batch_bytes`); 8 KiB covers the
+        // Produce request header, transactional_id/acks/timeout, the
+        // topic/partition compact-array + compact-string framing, the
+        // record-length prefix, and tag buffers. Without this the framing
+        // scratch defaults to 64 KiB and large batches fail with
+        // `RequestBufferTooSmall`.
+        .max_request_size = @as(usize, self.options.max_batch_bytes) + 8192,
     });
     errdefer conn.close();
 

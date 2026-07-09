@@ -11,7 +11,9 @@
 //! growable writer, `frameRequest` writes the header+body into a caller-owned
 //! fixed buffer (`buf[4..]`), then back-patches the `i32` length into
 //! `buf[0..4]` and returns the framed slice. Overflow of the fixed buffer is
-//! `error.WriteFailed`, never a heap fallback.
+//! `error.RequestBufferTooSmall`, never a heap fallback — the caller must size
+//! `buf` to the largest request it will frame (for Produce, that is
+//! `max_batch_bytes` + framing overhead).
 //!
 //! Request header versions (spec:
 //! https://kafka.apache.org/protocol.html — "Request Header"):
@@ -43,8 +45,8 @@ pub const length_prefix_len: usize = 4;
 /// `body_ctx` is any value exposing `write(self, *std.Io.Writer) Error!void`
 /// that encodes the request body (the per-API body encoders in `api/` fit
 /// behind a one-line wrapper). Zero-alloc: everything is written into `buf`,
-/// which the caller owns and sizes. Returns `error.WriteFailed` if `buf` is
-/// too small.
+/// which the caller owns and sizes. Returns `error.RequestBufferTooSmall` if
+/// `buf` cannot hold the framed request.
 pub fn frameRequest(
     buf: []u8,
     api_key: ApiKey,
@@ -52,38 +54,64 @@ pub fn frameRequest(
     correlation_id: i32,
     client_id: ?[]const u8,
     body_ctx: anytype,
-) std.Io.Writer.Error![]const u8 {
+) error{RequestBufferTooSmall}![]const u8 {
     assert(buf.len > length_prefix_len);
     const hv = api_keys.headerVersion(api_key, api_version);
 
     var w: std.Io.Writer = .fixed(buf[length_prefix_len..]);
 
+    // A fixed writer's only failure mode is running out of room, so map every
+    // header/body write overflow to the honest `RequestBufferTooSmall`.
+    encodeHeaderAndBody(
+        &w,
+        hv.request,
+        api_key,
+        api_version,
+        correlation_id,
+        client_id,
+        body_ctx,
+    ) catch |err| switch (err) {
+        error.WriteFailed => return error.RequestBufferTooSmall,
+    };
+
+    const payload_len = w.buffered().len;
+    assert(payload_len <= std.math.maxInt(i32));
+    std.mem.writeInt(i32, buf[0..4], @intCast(payload_len), be);
+    return buf[0 .. length_prefix_len + payload_len];
+}
+
+/// Write the request header (per `header_version`) followed by the body. Split
+/// out so `frameRequest` can remap the fixed-writer overflow in one place.
+fn encodeHeaderAndBody(
+    w: *std.Io.Writer,
+    header_version: u8,
+    api_key: ApiKey,
+    api_version: u16,
+    correlation_id: i32,
+    client_id: ?[]const u8,
+    body_ctx: anytype,
+) std.Io.Writer.Error!void {
     // Request header (all versions carry these three).
-    try primitives.writeI16(&w, @intCast(api_key.toInt()));
-    try primitives.writeI16(&w, @intCast(api_version));
-    try primitives.writeI32(&w, correlation_id);
-    switch (hv.request) {
+    try primitives.writeI16(w, @intCast(api_key.toInt()));
+    try primitives.writeI16(w, @intCast(api_version));
+    try primitives.writeI32(w, correlation_id);
+    switch (header_version) {
         0 => {},
-        1 => try primitives.writeNullableString(&w, client_id),
+        1 => try primitives.writeNullableString(w, client_id),
         // Header v2 (flexible) adds a trailing tag buffer, but the client_id
         // is STILL a nullable_string (i16 length + bytes), NOT a compact_string.
         // The RequestHeader.json spec marks ClientId as flexibleVersions: "none" —
         // the old-style two-byte length prefix is retained so older brokers can
         // read the header for any ApiVersionsRequest regardless of version.
         2 => {
-            try primitives.writeNullableString(&w, client_id);
-            try primitives.writeEmptyTagBuffer(&w);
+            try primitives.writeNullableString(w, client_id);
+            try primitives.writeEmptyTagBuffer(w);
         },
         else => unreachable, // no request header version above 2 exists
     }
 
     // Body.
-    try body_ctx.write(&w);
-
-    const payload_len = w.buffered().len;
-    assert(payload_len <= std.math.maxInt(i32));
-    std.mem.writeInt(i32, buf[0..4], @intCast(payload_len), be);
-    return buf[0 .. length_prefix_len + payload_len];
+    try body_ctx.write(w);
 }
 
 /// A body context that writes nothing — for requests with an empty body
@@ -184,11 +212,11 @@ test "frameRequest: EmptyBody produces header only" {
     try testing.expectEqualSlices(u8, &expected, framed);
 }
 
-test "frameRequest: buffer too small returns WriteFailed" {
+test "frameRequest: buffer too small returns RequestBufferTooSmall" {
     var buf: [8]u8 = undefined; // 4 length + only 4 for header (need >= 8)
     const body: RawBody = .{ .bytes = "" };
     try testing.expectError(
-        error.WriteFailed,
+        error.RequestBufferTooSmall,
         frameRequest(&buf, .sasl_handshake, 1, 1, "very-long-client-id", body),
     );
 }

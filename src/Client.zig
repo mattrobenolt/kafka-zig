@@ -671,6 +671,48 @@ test "single batch exceeding max_batch_bytes fails MESSAGE_TOO_LARGE" {
     try testing.expectEqual(@as(u32, 10), m.failureCode()); // MESSAGE_TOO_LARGE
 }
 
+test "large batch > 64 KiB frames without RequestBufferTooSmall (#15)" {
+    // Regression: the Connection's request-framing scratch was a fixed 64 KiB
+    // inline array, so a single Produce request whose batch exceeded ~64 KiB
+    // overflowed `frameRequest` (error.WriteFailed, now RequestBufferTooSmall),
+    // was misread as a connection error, and the slots retried forever.
+    // With req_scratch sized to max_batch_bytes + framing overhead, a large
+    // batch frames cleanly and every message acks.
+    var broker = try mock.Broker.start(testing.allocator, .{ .mode = .ok, .num_partitions = 1 });
+    defer broker.stop();
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var cfg = testConfig(&bootstrap);
+    cfg.max_message_size = 1024;
+    cfg.max_batch_bytes = 128 * 1024; // one batch holds all 100 records
+    cfg.ring_slots = 128;
+    // Linger so all commits accumulate into a single batch before the network
+    // thread drains, making the > 64 KiB single request deterministic.
+    cfg.linger_ms = 200;
+    var client = try Client.init(testing.allocator, cfg);
+    defer client.deinit();
+
+    // 100 x ~1 KiB records to the same partition => one batch of ~100 KiB,
+    // comfortably past the old 64 KiB framing limit.
+    const n = 100;
+    var handles: [n]Message = undefined;
+    for (&handles) |*m| {
+        m.* = try client.acquire();
+        try m.setTopic("events");
+        m.setPartition(0);
+        const dst = m.value();
+        @memset(dst[0..1000], 'x');
+        try m.commit(1000);
+    }
+    for (&handles) |*m| try m.await();
+
+    try testing.expectEqual(@as(u32, n), broker.produced.load(.acquire));
+    // Prove at least one Produce request actually carried > 64 KiB of records
+    // (i.e. the batch was not silently split into sub-64 KiB requests, which
+    // would not exercise the fix).
+    try testing.expect(broker.max_produce_records_bytes.load(.acquire) > 64 * 1024);
+}
+
 // ---------------------------------------------------------------------------
 // Idempotent producer tests (1b, #13)
 // ---------------------------------------------------------------------------
