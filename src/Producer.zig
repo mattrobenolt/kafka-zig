@@ -85,10 +85,12 @@ pub const Options = struct {
     max_batch_bytes: u32,
     max_message_size: u32,
     strategy: partitioner.Strategy,
-    /// Record-batch compression applied to every batch. `.gzip` and `.lz4`
-    /// are always available (pure-Zig, no build flag). `.zstd` requires the
-    /// library to be built with `-Dzstd=true`; requesting it without that is
-    /// rejected at `Client.init` with `error.CompressionUnavailable`.
+    /// Record-batch compression applied to every batch. `.snappy` is always
+    /// available (pure-Zig, no build flag). `.zstd` requires the library to be
+    /// built with `-Dzstd=true`; requesting it without that is rejected at
+    /// `Client.init` with `error.CompressionUnavailable`. `.gzip` and `.lz4`
+    /// are wire-format constants but are rejected at `Client.init` with
+    /// `error.CompressionNotImplemented`.
     compression: record_batch.Compression = .none,
     /// Max in-place retries before a slot is failed with its last error code.
     max_retries: u8 = 8,
@@ -811,6 +813,7 @@ fn sendLeader(self: *Producer, leader: i32, slots: []const Collected) !bool {
     var group_len: usize = 0;
     var encode_off: usize = 0;
     var stopped_at_capacity = false;
+    var terminal_progress = false;
 
     var k: usize = 0;
     while (k < slots.len) {
@@ -942,6 +945,7 @@ fn sendLeader(self: *Producer, leader: i32, slots: []const Collected) !bool {
                     error.BufferTooSmall => {
                         if (pd_len == pd_start and td_len == 0 and encode_off == 0) {
                             self.failSlots(slots[p .. p + 1], 10); // MESSAGE_TOO_LARGE
+                            terminal_progress = true;
                             p += 1;
                             continue;
                         }
@@ -954,6 +958,7 @@ fn sendLeader(self: *Producer, leader: i32, slots: []const Collected) !bool {
                 if (bounded.consumed == 0) {
                     if (encode_off == 0 and pd_len == pd_start and td_len == 0) {
                         self.failSlots(slots[p .. p + 1], 10); // MESSAGE_TOO_LARGE
+                        terminal_progress = true;
                         p += 1;
                         continue;
                     }
@@ -1013,10 +1018,7 @@ fn sendLeader(self: *Producer, leader: i32, slots: []const Collected) !bool {
         // Nothing to send: either all slots were failed as MESSAGE_TOO_LARGE
         // (terminal progress), or we stopped at capacity with nothing built
         // (no progress — slots are still pending for the next drain).
-        // If any failSlots ran, group_len is 0 but those slots are terminal;
-        // track that with a simple heuristic: if we didn't stop at capacity,
-        // the only way td_len==0 is if slots were failed.
-        return !stopped_at_capacity;
+        return terminal_progress;
     }
 
     const conn = try self.leaderConnection(leader);

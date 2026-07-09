@@ -39,7 +39,8 @@ const build_options = @import("build_options");
 /// with `-Dzstd=true`; requesting it otherwise is rejected at `init` with
 /// `error.CompressionUnavailable`. `.snappy` is always available (pure-Zig,
 /// no build flag). `.gzip` and `.lz4` are wire-format constants but are not
-/// yet implemented (return `error.CompressionNotImplemented` at runtime).
+/// yet implemented and are rejected at `init` with
+/// `error.CompressionNotImplemented`.
 pub const Compression = record_batch.Compression;
 
 /// A snapshot of producer statistics (issue #7). Pull-based: the caller
@@ -162,8 +163,8 @@ pub const Config = struct {
     /// Record-batch compression. `.none` (default) sends plaintext batches;
     /// `.snappy` compresses each batch (always available, pure-Zig);
     /// `.zstd` compresses each batch (requires `-Dzstd=true` at build time).
-    /// `.gzip` and `.lz4` are wire-format constants but return
-    /// `error.CompressionNotImplemented` at runtime (not yet implemented).
+    /// `.gzip` and `.lz4` are wire-format constants but are rejected at init
+    /// with `error.CompressionNotImplemented`.
     compression: Compression = .none,
     /// When true (production default), the producer acquires a PID/epoch at
     /// startup via InitProducerId v4, tracks per-partition sequence numbers,
@@ -194,6 +195,7 @@ thread: std.Thread,
 /// as soon as this returns.
 pub fn init(allocator: Allocator, config: Config) !*Client {
     assert(config.bootstrap_brokers.len > 0);
+    try validateCompression(config.compression);
 
     const self = try allocator.create(Client);
     errdefer allocator.destroy(self);
@@ -219,14 +221,6 @@ pub fn init(allocator: Allocator, config: Config) !*Client {
         .num_slots = config.ring_slots,
     });
     errdefer self.ring.deinit(allocator);
-
-    // zstd compression requires the library to be built with -Dzstd=true.
-    // Reject at init rather than failing per-batch at runtime.
-    if (config.compression == .zstd and
-        !build_options.zstd_enabled)
-    {
-        return error.CompressionUnavailable;
-    }
 
     self.producer = try Producer.init(allocator, &self.ring, .{
         .bootstrap = bootstrap,
@@ -331,6 +325,14 @@ pub fn stats(self: *const Client) Stats {
     };
 }
 
+fn validateCompression(compression: Compression) !void {
+    switch (compression) {
+        .none, .snappy => {},
+        .zstd => if (!build_options.zstd_enabled) return error.CompressionUnavailable,
+        .gzip, .lz4 => return error.CompressionNotImplemented,
+    }
+}
+
 fn dupScram(arena: Allocator, sasl: Sasl) !Connection.ScramConfig {
     return switch (sasl) {
         .scram_sha256 => |c| .{
@@ -357,6 +359,13 @@ test {
 
 const mock = @import("testing/mock_broker.zig");
 const testing = std.testing;
+
+test "validateCompression rejects unimplemented codecs" {
+    try validateCompression(.none);
+    try validateCompression(.snappy);
+    try testing.expectError(error.CompressionNotImplemented, validateCompression(.gzip));
+    try testing.expectError(error.CompressionNotImplemented, validateCompression(.lz4));
+}
 
 fn testConfig(bootstrap: []const Broker) Config {
     return .{

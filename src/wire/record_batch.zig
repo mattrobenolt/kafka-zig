@@ -216,7 +216,12 @@ pub const EncodeOptions = struct {
     base_sequence: i32 = -1,
 };
 
-pub const EncodeError = error{ BufferTooSmall, CompressionScratchRequired, CompressionNotImplemented, CompressionFailed };
+pub const EncodeError = error{
+    BufferTooSmall,
+    CompressionScratchRequired,
+    CompressionNotImplemented,
+    CompressionFailed,
+};
 
 pub const EncodeBatchResult = struct {
     bytes: []u8,
@@ -314,7 +319,9 @@ pub fn encodeBatch(
     return written;
 }
 
-/// Encode the largest record prefix that fits `budget` bytes on the wire.
+/// Encode a record prefix that fits `budget` bytes on the wire. For
+/// uncompressed batches this is the largest prefix. For compressed batches it
+/// may return a smaller fitting prefix to avoid repeated compression attempts.
 /// Returns zero consumed records when even the first record cannot fit.
 pub fn encodeBatchBounded(
     out: []u8,
