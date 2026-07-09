@@ -111,6 +111,9 @@ all codecs):**
   against `kafka-console-consumer` (Java `GZIPInputStream` expects the gzip
   header). Always use the full gzip container for Kafka interop. (Verified
   against the Kafka Java client `GzipCompression` / `GzipOutputStream` source.)
+  **NOT YET IMPLEMENTED in kafka-zig** — the enum value exists as a wire-format
+  constant but `compress`/`decompress` return `error.NotImplemented`. Needs a
+  real encoder (link zlib/zlib-ng or do a proven DEFLATE port).
 - **lz4** (attr 3): LZ4 Frame format (v1.5.1), NOT the raw LZ4 block format and
   NOT lz4-java's "LZ4Block" format. Kafka's `Lz4Compression` wraps
   `org.apache.kafka.common.compress.Lz4BlockOutputStream`, which is "A partial
@@ -120,6 +123,9 @@ all codecs):**
   blocks (4-byte LE block_size with bit 31 = uncompressed flag + block data) +
   4-byte LE end mark (0). (Verified against the Kafka Java client
   `Lz4BlockOutputStream` / `Lz4BlockInputStream` source — trunk.)
+  **NOT YET IMPLEMENTED in kafka-zig** — the enum value exists as a wire-format
+  constant but `compress`/`decompress` return `error.NotImplemented`. Needs a
+  real encoder (link liblz4 or do a proven LZ4 port).
 
 **Non-idempotent producer sentinels:** `producerId = -1`, `producerEpoch = -1`,
 `baseSequence = -1` (Java `RecordBatch` defaults). State these exactly.

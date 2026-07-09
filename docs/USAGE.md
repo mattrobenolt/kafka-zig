@@ -213,6 +213,8 @@ interface is a single attribute in the record batch.
 | `.none` | 0 | — | Plaintext, always available. Default. |
 | `.snappy` | 2 | — | Pure-Zig, always available. No build flag needed. |
 | `.zstd` | 4 | `-Dzstd=true` | Statically links libzstd. Rejected at `init` with `error.CompressionUnavailable` if built without the flag. |
+| `.gzip` | 1 | — | **Not yet implemented.** Wire-format constant only; returns `error.CompressionNotImplemented` at runtime. |
+| `.lz4` | 3 | — | **Not yet implemented.** Wire-format constant only; returns `error.CompressionNotImplemented` at runtime. |
 
 ```zig
 .compression = .snappy,   // no build flag
@@ -223,7 +225,12 @@ Compression runs on the records region of the batch before finalizing
 CRC32C and batch length — the CRC covers attributes through end, so the
 ordering is non-negotiable.
 
-gzip/lz4 are not in v1.
+gzip and lz4 are not yet implemented. The enum values exist as wire-format
+constants (they match the Kafka attributes field compression bits), but
+using them returns `error.CompressionNotImplemented` at runtime. They need
+real implementations (link a C lib or do a proven port) rather than
+"valid but doesn't compress" placeholders. Plaintext + snappy + zstd are
+the supported codecs.
 
 ---
 

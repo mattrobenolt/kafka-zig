@@ -116,14 +116,10 @@ pub fn main() !void {
             .zstd
         else if (std.mem.eql(u8, compression, "snappy"))
             .snappy
-        else if (std.mem.eql(u8, compression, "gzip"))
-            .gzip
-        else if (std.mem.eql(u8, compression, "lz4"))
-            .lz4
         else if (std.mem.eql(u8, compression, "none"))
             .none
         else
-            fatal("--compression must be none|snappy|zstd|gzip|lz4, got: {s}", .{compression}),
+            fatal("--compression must be none|snappy|zstd, got: {s}", .{compression}),
         .linger_ms = 100,
         .max_message_size = 4 * 1024,
         .max_key_len = 64,

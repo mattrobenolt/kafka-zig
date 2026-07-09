@@ -38,7 +38,8 @@ const build_options = @import("build_options");
 /// Record-batch compression for produced batches. `.zstd` requires building
 /// with `-Dzstd=true`; requesting it otherwise is rejected at `init` with
 /// `error.CompressionUnavailable`. `.snappy` is always available (pure-Zig,
-/// no build flag).
+/// no build flag). `.gzip` and `.lz4` are wire-format constants but are not
+/// yet implemented (return `error.CompressionNotImplemented` at runtime).
 pub const Compression = record_batch.Compression;
 
 /// A snapshot of producer statistics (issue #7). Pull-based: the caller
@@ -160,9 +161,9 @@ pub const Config = struct {
     max_retries: u8 = 8,
     /// Record-batch compression. `.none` (default) sends plaintext batches;
     /// `.snappy` compresses each batch (always available, pure-Zig);
-    /// `.gzip` compresses each batch (always available, pure-Zig stored DEFLATE);
-    /// `.lz4` compresses each batch (always available, pure-Zig LZ4 Frame format);
     /// `.zstd` compresses each batch (requires `-Dzstd=true` at build time).
+    /// `.gzip` and `.lz4` are wire-format constants but return
+    /// `error.CompressionNotImplemented` at runtime (not yet implemented).
     compression: Compression = .none,
     /// When true (production default), the producer acquires a PID/epoch at
     /// startup via InitProducerId v4, tracks per-partition sequence numbers,
@@ -1165,12 +1166,12 @@ test "#2 bootstrap failover: 3 endpoints, only 2nd listening — produce succeed
     var broker = try mock.Broker.start(testing.allocator, .{ .mode = .ok, .num_partitions = 4 });
     defer broker.stop();
 
-    // Port 1 and port 2 are privileged ports that will refuse on a dev box.
-    // The TCP connect fails immediately with ConnectionRefused — no hang.
+    // Ports 9998 and 9999 are high ephemeral ports that will refuse immediately
+    // on all platforms (Linux, macOS, CI). The TCP connect fails immediately.
     const bootstrap = [_]Broker{
-        .{ .host = "127.0.0.1", .port = 1 },
+        .{ .host = "127.0.0.1", .port = 9998 },
         .{ .host = "127.0.0.1", .port = broker.port },
-        .{ .host = "127.0.0.1", .port = 2 },
+        .{ .host = "127.0.0.1", .port = 9999 },
     };
     var cfg = testConfig(&bootstrap);
     cfg.io_timeout_ms = 1000; // fail fast on dead ports
@@ -1198,8 +1199,8 @@ test "#2 all bootstrap down: init fails gracefully, no hang" {
     // should fail gracefully (not hang). We use a short io_timeout and short
     // retry budget so the failure surfaces quickly.
     const bootstrap = [_]Broker{
-        .{ .host = "127.0.0.1", .port = 1 },
-        .{ .host = "127.0.0.1", .port = 2 },
+        .{ .host = "127.0.0.1", .port = 9998 },
+        .{ .host = "127.0.0.1", .port = 9999 },
     };
     var cfg = testConfig(&bootstrap);
     cfg.io_timeout_ms = 500;
@@ -1268,7 +1269,7 @@ test "#2 reconnect backoff: dead broker is not hammered" {
     // We assert the produce fails gracefully within a bounded time (not a
     // hang), proving the backoff + retry budget is engaged.
     const bootstrap = [_]Broker{
-        .{ .host = "127.0.0.1", .port = 1 },
+        .{ .host = "127.0.0.1", .port = 9998 },
     };
     var cfg = testConfig(&bootstrap);
     cfg.io_timeout_ms = 200;
