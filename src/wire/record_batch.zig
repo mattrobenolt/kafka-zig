@@ -216,6 +216,13 @@ pub const EncodeOptions = struct {
     base_sequence: i32 = -1,
 };
 
+pub const EncodeError = error{ BufferTooSmall, CompressionScratchRequired, CompressionNotImplemented, CompressionFailed };
+
+pub const EncodeBatchResult = struct {
+    bytes: []u8,
+    consumed: usize,
+};
+
 /// Encode a complete v2 record batch into `out` and return the written slice.
 ///
 /// ZERO heap allocation: the batch is serialized directly into the
@@ -248,7 +255,7 @@ pub fn encodeBatch(
     out: []u8,
     records: []const Record,
     options: EncodeOptions,
-) error{ BufferTooSmall, CompressionNotImplemented, CompressionFailed }![]u8 {
+) EncodeError![]u8 {
     const crc_region_start = 21; // attributes field offset
     const batch_length_off = 8;
     const partition_leader_epoch_off = 12;
@@ -277,7 +284,7 @@ pub fn encodeBatch(
         const codec: compress.Codec = @enumFromInt(@intFromEnum(options.compression));
         const uncompressed = written[records_region_off..];
         // Scratch is a documented caller contract for a compressed batch.
-        const scratch = options.scratch.?;
+        const scratch = options.scratch orelse return error.CompressionScratchRequired;
         const clen = compress.compress(
             codec,
             uncompressed,
@@ -307,6 +314,45 @@ pub fn encodeBatch(
     return written;
 }
 
+/// Encode the largest record prefix that fits `budget` bytes on the wire.
+/// Returns zero consumed records when even the first record cannot fit.
+pub fn encodeBatchBounded(
+    out: []u8,
+    records: []const Record,
+    budget: usize,
+    options: EncodeOptions,
+) EncodeError!EncodeBatchResult {
+    const limit = @min(budget, out.len);
+    if (limit < batch_records_region_off) return .{ .bytes = out[0..0], .consumed = 0 };
+
+    if (options.compression == .none) {
+        const consumed = countUncompressedPrefix(records, limit);
+        if (consumed == 0) return .{ .bytes = out[0..0], .consumed = 0 };
+        const bytes = try encodeBatch(out, records[0..consumed], options);
+        assert(bytes.len <= budget);
+        return .{ .bytes = bytes, .consumed = consumed };
+    }
+
+    const codec: compress.Codec = @enumFromInt(@intFromEnum(options.compression));
+    const scratch = options.scratch orelse return error.CompressionScratchRequired;
+    var consumed = countCompressedPrefix(records, out.len, scratch.len, codec);
+    if (consumed == 0) return .{ .bytes = out[0..0], .consumed = 0 };
+
+    while (consumed > 0) {
+        const bytes = encodeBatch(out, records[0..consumed], options) catch |err| switch (err) {
+            error.BufferTooSmall => {
+                consumed = smallerCompressedPrefix(consumed);
+                continue;
+            },
+            else => return err,
+        };
+        if (bytes.len <= budget) return .{ .bytes = bytes, .consumed = consumed };
+        consumed = smallerCompressedPrefix(consumed);
+    }
+
+    return .{ .bytes = out[0..0], .consumed = 0 };
+}
+
 /// Write the full batch (header with placeholder batchLength/crc, then the
 /// CRC-covered region: attributes → recordsCount → records) into `writer`.
 /// The caller patches batchLength and crc in place afterwards.
@@ -322,7 +368,7 @@ fn writeBatch(
     try primitives.writeU32(writer, 0); // crc placeholder (patched)
 
     // --- CRC-covered region begins here (attributes) ---
-    // attributes: u16 (compression is .none — guaranteed by encodeBatch).
+    // attributes: u16 (compression bits in the low three bits).
     try primitives.writeU16(writer, @intFromEnum(options.compression));
     // lastOffsetDelta: i32 — offset delta of the last record in the batch.
     const last_delta: i32 = if (records.len == 0) 0 else records[records.len - 1].offset_delta;
@@ -345,6 +391,45 @@ fn writeBatch(
     }
 }
 
+const batch_records_region_off = 21 + 40;
+
+fn countUncompressedPrefix(records: []const Record, budget: usize) usize {
+    var len: usize = batch_records_region_off;
+    var consumed: usize = 0;
+    for (records) |rec| {
+        const rec_len = recordLen(rec);
+        if (len + rec_len > budget) break;
+        len += rec_len;
+        consumed += 1;
+    }
+    return consumed;
+}
+
+fn countCompressedPrefix(
+    records: []const Record,
+    out_len: usize,
+    scratch_len: usize,
+    codec: compress.Codec,
+) usize {
+    var records_len: usize = 0;
+    var consumed: usize = 0;
+    for (records) |rec| {
+        const rec_len = recordLen(rec);
+        const next_records_len = records_len + rec_len;
+        const bound = compress.compressBound(codec, next_records_len);
+        if (bound > scratch_len) break;
+        if (batch_records_region_off + bound > out_len) break;
+        records_len = next_records_len;
+        consumed += 1;
+    }
+    return consumed;
+}
+
+fn smallerCompressedPrefix(consumed: usize) usize {
+    if (consumed == 1) return 0;
+    return @max(@as(usize, 1), consumed / 2);
+}
+
 /// Write a single record: a zigzag-varint length prefix (byte size of the
 /// record body) followed by the body. The body length is computed
 /// arithmetically via `recordBodyLen` so no per-record temp buffer is needed.
@@ -352,6 +437,11 @@ fn writeRecord(writer: *std.Io.Writer, rec: Record) std.Io.Writer.Error!void {
     const body_len = recordBodyLen(rec);
     try primitives.writeVarint(writer, @intCast(body_len));
     try writeRecordBody(writer, rec);
+}
+
+fn recordLen(rec: Record) usize {
+    const body_len = recordBodyLen(rec);
+    return primitives.varintSize(@intCast(body_len)) + body_len;
 }
 
 /// Exact byte length of the record body that `writeRecordBody` will emit
@@ -828,6 +918,91 @@ test "encodeBatch: multiple records with timestamp/offset deltas" {
     try testing.expectEqual(@as(?[]const u8, null), batch.records[2].key);
     try testing.expectEqualStrings("v3", batch.records[2].value.?);
     try testing.expectEqual(@as(i32, 2), batch.records[2].offset_delta);
+}
+
+test "encodeBatchBounded: returns largest prefix within budget" {
+    const records = [_]Record{
+        .{ .offset_delta = 0, .timestamp_delta = 0, .key = "k1", .value = "v1", .headers = &.{} },
+        .{ .offset_delta = 1, .timestamp_delta = 0, .key = "k2", .value = "v2", .headers = &.{} },
+        .{ .offset_delta = 2, .timestamp_delta = 0, .key = "k3", .value = "v3", .headers = &.{} },
+    };
+
+    var expected_buf: [256]u8 = undefined;
+    const expected = try encodeBatch(&expected_buf, records[0..2], .{});
+
+    var buf: [256]u8 = undefined;
+    const bounded = try encodeBatchBounded(&buf, &records, expected.len, .{});
+    try testing.expectEqual(@as(usize, 2), bounded.consumed);
+    try testing.expectEqualSlices(u8, expected, bounded.bytes);
+
+    var r: Reader = .init(bounded.bytes);
+    var batch = try decodeBatch(testing.allocator, &r);
+    defer batch.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), batch.records.len);
+    try testing.expectEqual(@as(i32, 1), batch.last_offset_delta);
+}
+
+test "encodeBatchBounded: returns zero consumed when one record cannot fit" {
+    const records = [_]Record{.{
+        .offset_delta = 0,
+        .timestamp_delta = 0,
+        .key = "k1",
+        .value = "payload" ** 32,
+        .headers = &.{},
+    }};
+
+    var buf: [256]u8 = undefined;
+    const bounded = try encodeBatchBounded(&buf, &records, 60, .{});
+    try testing.expectEqual(@as(usize, 0), bounded.consumed);
+    try testing.expectEqual(@as(usize, 0), bounded.bytes.len);
+}
+
+test "encodeBatchBounded: compressed budget uses compressed size" {
+    if (!compress.zstd_enabled) return;
+
+    const value = "compressible-payload-" ** 32;
+    const records = [_]Record{
+        .{ .offset_delta = 0, .timestamp_delta = 0, .key = "k1", .value = value, .headers = &.{} },
+        .{ .offset_delta = 1, .timestamp_delta = 0, .key = "k2", .value = value, .headers = &.{} },
+        .{ .offset_delta = 2, .timestamp_delta = 0, .key = "k3", .value = value, .headers = &.{} },
+        .{ .offset_delta = 3, .timestamp_delta = 0, .key = "k4", .value = value, .headers = &.{} },
+    };
+
+    var full_buf: [4096]u8 = undefined;
+    var scratch: [4096]u8 = undefined;
+    const full = try encodeBatch(&full_buf, &records, .{ .compression = .zstd, .scratch = &scratch });
+
+    try testing.expect(batch_records_region_off + recordLen(records[0]) > full.len);
+
+    var bounded_buf: [4096]u8 = undefined;
+    const bounded = try encodeBatchBounded(
+        &bounded_buf,
+        &records,
+        full.len,
+        .{ .compression = .zstd, .scratch = &scratch },
+    );
+    try testing.expectEqual(@as(usize, records.len), bounded.consumed);
+    try testing.expect(bounded.bytes.len <= full.len);
+}
+
+test "encodeBatch: compression requires scratch" {
+    const records = [_]Record{.{
+        .offset_delta = 0,
+        .timestamp_delta = 0,
+        .key = "k1",
+        .value = "v1",
+        .headers = &.{},
+    }};
+
+    var buf: [256]u8 = undefined;
+    try testing.expectError(
+        error.CompressionScratchRequired,
+        encodeBatch(&buf, &records, .{ .compression = .zstd }),
+    );
+    try testing.expectError(
+        error.CompressionScratchRequired,
+        encodeBatchBounded(&buf, &records, buf.len, .{ .compression = .zstd }),
+    );
 }
 
 test "encodeBatch: records with headers" {
