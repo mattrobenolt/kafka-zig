@@ -83,6 +83,18 @@ jobs:
       - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
       - run: nix develop -c zizmor --persona=auditor --min-severity=medium .
 
+  # shellcheck: lint the extracted e2e shell scripts (scripts/*.sh). Matches
+  # local `just shellcheck`.
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
+      - run: nix develop -c shellcheck scripts/*.sh
+
   # Fuzz: time-budgeted (60s) random-input search on Linux (where the Zig
   # fuzzer works — macOS hits InvalidElfMagic). A crash/panic IS a finding
   # that fails the job. A timeout (no crash in 60s) is NOT a failure: the

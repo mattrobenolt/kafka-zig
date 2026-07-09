@@ -53,6 +53,8 @@
               # pin-actions` bumps+pins actions to SHAs.
               zizmor
               pinact
+              # shellcheck: lint the extracted e2e shell scripts (scripts/*.sh).
+              shellcheck
             ];
 
             shellHook = ''
