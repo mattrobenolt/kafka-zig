@@ -583,6 +583,42 @@ pub fn waitForData(self: *Ring, read_pos: u64) bool {
     }
 }
 
+/// Wait for a committed slot at or beyond `read_pos`, with a maximum wait
+/// of `timeout_ns`. Returns true if data became available, false on timeout or
+/// shutdown. Used by the producer's linger phase: after the initial
+/// `waitForData` returns (data is available), the producer calls this with the
+/// current `write_head` as `read_pos` and the remaining linger duration, to
+/// wait for MORE records to accumulate without blocking indefinitely.
+pub fn waitForDataTimed(self: *Ring, read_pos: u64, timeout_ns: u64) bool {
+    const deadline_ns = blk: {
+        const now: u64 = @intCast(std.time.nanoTimestamp());
+        break :blk now + timeout_ns;
+    };
+    while (true) {
+        if (self.shutdown.load(.acquire)) return false;
+        const head = self.write_head.load(.acquire);
+        if (read_pos < head) return true;
+
+        const now: u64 = @intCast(std.time.nanoTimestamp());
+        if (now >= deadline_ns) return false;
+
+        const remaining = deadline_ns - now;
+        const wait = @min(remaining, shutdown_poll_ns);
+
+        for (0..64) |_| {
+            atomic.spinLoopHint();
+            if (read_pos < self.write_head.load(.monotonic)) return true;
+        }
+
+        self.data_waiter.store(true, .release);
+        defer self.data_waiter.store(false, .monotonic);
+        if (self.shutdown.load(.acquire)) return false;
+        if (read_pos < self.write_head.load(.acquire)) return true;
+        // ziglint-ignore: Z026 — timeout is the intended recovery: the outer loop re-checks deadline and shutdown.
+        Futex.timedWait(writeHeadLow(self), @truncate(head), wait) catch {};
+    }
+}
+
 /// Wake the network thread after a commit (only if it is actually parked).
 pub fn notifyConsumer(self: *Ring) void {
     if (self.data_waiter.load(.acquire)) Futex.wake(writeHeadLow(self), 1);

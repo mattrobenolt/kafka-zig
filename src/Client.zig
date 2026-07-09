@@ -91,11 +91,20 @@ pub const Config = struct {
     tls: Tls,
     sasl: Sasl,
     acks: Acks = .all,
-    /// Backoff (ms) between drains that made no forward progress. (linger_ms in
-    /// PLAN §3; the current drain sends eagerly, so this is a retry backoff
-    /// rather than a batch-accumulation timer — see the follow-up note in the
-    /// slice report.)
-    linger_ms: u32 = 50,
+    /// Linger time (ms): after the first pending record arrives, the network
+    /// thread waits up to this long for more records before draining, to form
+    /// larger batches (better throughput + compression ratio). 0 = eager
+    /// (drain immediately when data is available). Default 5ms.
+    linger_ms: u32 = 5,
+    /// Backoff (ms) between drains that made no forward progress (only retries
+    /// / transient connection failures), so a persistently-unhealthy cluster
+    /// does not spin the CPU.
+    retry_backoff_ms: u32 = 5,
+    /// Metadata refresh interval (ms): refresh metadata periodically even
+    /// without errors, to catch silent leader changes / new brokers / new
+    /// partitions. 0 = only refresh on error/invalidation. Default 300000
+    /// (5 min, matching Kafka's `metadata.max.age.ms`).
+    metadata_max_age_ms: u32 = 300_000,
     max_batch_bytes: u32 = 16 * 1024,
     max_message_size: u32 = 16 * 1024,
     max_key_len: u16 = 256,
@@ -180,7 +189,9 @@ pub fn init(allocator: Allocator, config: Config) !*Client {
         .max_message_size = config.max_message_size,
         .strategy = config.partitioner,
         .max_retries = config.max_retries,
-        .retry_backoff_ns = @as(u64, config.linger_ms) * std.time.ns_per_ms,
+        .retry_backoff_ns = @as(u64, config.retry_backoff_ms) * std.time.ns_per_ms,
+        .linger_ns = @as(u64, config.linger_ms) * std.time.ns_per_ms,
+        .metadata_max_age_ms = config.metadata_max_age_ms,
         .io_timeout_ms = config.io_timeout_ms,
         .compression = config.compression,
         .enable_idempotency = config.enable_idempotency,
@@ -259,6 +270,8 @@ fn testConfig(bootstrap: []const Broker) Config {
         .sasl = .{ .scram_sha512 = .{ .username = mock.username, .password = mock.password } },
         .acks = .all,
         .linger_ms = 2,
+        .retry_backoff_ms = 2,
+        .metadata_max_age_ms = 300_000,
         .max_message_size = 1024,
         .max_key_len = 64,
         .max_topic_len = 64,
@@ -1081,7 +1094,8 @@ test "#2 all bootstrap down: init fails gracefully, no hang" {
     var cfg = testConfig(&bootstrap);
     cfg.io_timeout_ms = 500;
     cfg.max_retries = 2;
-    cfg.linger_ms = 10;
+    cfg.linger_ms = 0;
+    cfg.retry_backoff_ms = 10;
     var client = try Client.init(testing.allocator, cfg);
     defer client.deinit();
 
@@ -1113,7 +1127,8 @@ test "#2 reconnect-on-drop: broker drops first Produce, re-dial + retry succeeds
     // Use a longer retry budget and shorter backoff so the reconnect happens
     // quickly within the test.
     cfg.max_retries = 5;
-    cfg.linger_ms = 5;
+    cfg.linger_ms = 0;
+    cfg.retry_backoff_ms = 5;
     cfg.enable_idempotency = false; // simplify: no PID re-init on reconnect
     var client = try Client.init(testing.allocator, cfg);
     defer client.deinit();
@@ -1148,7 +1163,8 @@ test "#2 reconnect backoff: dead broker is not hammered" {
     var cfg = testConfig(&bootstrap);
     cfg.io_timeout_ms = 200;
     cfg.max_retries = 3;
-    cfg.linger_ms = 50; // 50ms backoff between drains
+    cfg.linger_ms = 0;
+    cfg.retry_backoff_ms = 50; // 50ms backoff between drains
     var client = try Client.init(testing.allocator, cfg);
     defer client.deinit();
 
@@ -1162,4 +1178,265 @@ test "#2 reconnect backoff: dead broker is not hammered" {
     // Should fail within the retry budget, not hang. The backoff sleep
     // between drains (50ms) prevents a tight CPU spin against the dead port.
     try testing.expectError(error.SendFailed, m.await());
+}
+
+// ---------------------------------------------------------------------------
+// #3: linger batching + periodic metadata refresh
+// ---------------------------------------------------------------------------
+
+test "#3 linger batching: small burst coalesces into one Produce request" {
+    // With linger_ms > 0, a burst of small messages committed in quick
+    // succession should coalesce into a single Produce request (one batch to
+    // one partition), not N separate requests. The mock broker tracks
+    // `produce_requests` to assert coalescing.
+    var broker = try mock.Broker.start(testing.allocator, .{ .mode = .ok, .num_partitions = 1 });
+    defer broker.stop();
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var cfg = testConfig(&bootstrap);
+    cfg.linger_ms = 50; // 50ms linger window for coalescing
+    cfg.enable_idempotency = false; // simplify: no PID overhead
+    var client = try Client.init(testing.allocator, cfg);
+    defer client.deinit();
+
+    // Commit a burst of 10 small messages to the same partition. They should
+    // all land within the linger window and form ONE batch / ONE Produce.
+    const n = 10;
+    var handles: [n]Message = undefined;
+    for (&handles, 0..) |*m, i| {
+        m.* = try client.acquire();
+        try m.setTopic("events");
+        m.setPartition(0);
+        const dst = m.value();
+        const payload = try std.fmt.bufPrint(dst, "m{d}", .{i});
+        try m.commit(@intCast(payload.len));
+    }
+    for (&handles) |*m| try m.await();
+
+    try testing.expectEqual(@as(u32, n), broker.produced.load(.acquire));
+    // All 10 records should have been coalesced into a single Produce request.
+    // Without linger (eager drain), each message could be its own Produce.
+    try testing.expectEqual(@as(u32, 1), broker.produce_requests.load(.acquire));
+}
+
+test "#3 linger=0: each message drains eagerly (regression)" {
+    // With linger_ms = 0, the drain is eager. Messages committed in quick
+    // succession may still batch if they arrive in the same waitForData wake,
+    // but the producer does NOT wait for more. We verify that with a deliberate
+    // gap between commits, each message is its own Produce request.
+    var broker = try mock.Broker.start(testing.allocator, .{ .mode = .ok, .num_partitions = 1 });
+    defer broker.stop();
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var cfg = testConfig(&bootstrap);
+    cfg.linger_ms = 0; // eager drain
+    cfg.retry_backoff_ms = 0;
+    cfg.enable_idempotency = false;
+    var client = try Client.init(testing.allocator, cfg);
+    defer client.deinit();
+
+    // Produce 3 messages one at a time, awaiting each before committing the
+    // next. With linger=0 and no overlap, each must be its own Produce.
+    for (0..3) |i| {
+        var m = try client.acquire();
+        try m.setTopic("events");
+        m.setPartition(0);
+        const dst = m.value();
+        const payload = try std.fmt.bufPrint(dst, "e{d}", .{i});
+        try m.commit(@intCast(payload.len));
+        try m.await();
+    }
+
+    try testing.expectEqual(@as(u32, 3), broker.produced.load(.acquire));
+    try testing.expectEqual(@as(u32, 3), broker.produce_requests.load(.acquire));
+}
+
+test "#3 no over-linger under load: full batch drains immediately" {
+    // With linger_ms > 0 but a full batch worth of records pending, the drain
+    // must happen immediately (no waiting for the linger timer). We set a
+    // large linger (500ms) and a max_batch_bytes that fits one batch of 15
+    // small records. When all 15 are committed at once, pendingBatchFull
+    // detects the batch is full and skips the linger.
+    var broker = try mock.Broker.start(testing.allocator, .{ .mode = .ok, .num_partitions = 1 });
+    defer broker.stop();
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var cfg = testConfig(&bootstrap);
+    cfg.linger_ms = 500; // long linger — should be skipped for a full batch
+    cfg.max_batch_bytes = 1000; // fits one batch of 15x50B records (~976B)
+    cfg.enable_idempotency = false;
+    var client = try Client.init(testing.allocator, cfg);
+    defer client.deinit();
+
+    // Commit 15 records with 50-byte payloads to the same partition. The
+    // estimated pending bytes (15 * 70 = 1050) exceeds max_batch_bytes, so
+    // pendingBatchFull triggers immediately and the linger is skipped. The
+    // actual batch (~976B) fits within max_batch_bytes.
+    const n = 15;
+    var handles: [n]Message = undefined;
+    const start = std.time.milliTimestamp();
+    for (&handles, 0..) |*m, i| {
+        m.* = try client.acquire();
+        try m.setTopic("events");
+        m.setPartition(0);
+        const dst = m.value();
+        @memset(dst[0..50], 'x');
+        try m.commit(50);
+        _ = i;
+    }
+    for (&handles) |*m| try m.await();
+    const elapsed: u64 = @intCast(std.time.milliTimestamp() - start);
+
+    try testing.expectEqual(@as(u32, n), broker.produced.load(.acquire));
+    // The produce must complete in well under the 500ms linger. If the linger
+    // were NOT skipped, the drain would wait 500ms before sending. 200ms is a
+    // generous bound that accounts for TLS handshake + round-trip.
+    try testing.expect(elapsed < 200);
+}
+
+test "#3 periodic metadata refresh: increments without errors" {
+    // With a small metadata_max_age_ms, the producer refreshes metadata
+    // proactively even without errors. The mock broker tracks
+    // `metadata_requests` — assert it increments over time beyond the initial
+    // load.
+    var broker = try mock.Broker.start(testing.allocator, .{ .mode = .ok, .num_partitions = 4 });
+    defer broker.stop();
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var cfg = testConfig(&bootstrap);
+    cfg.metadata_max_age_ms = 100; // refresh every 100ms
+    cfg.linger_ms = 0;
+    cfg.enable_idempotency = false;
+    var client = try Client.init(testing.allocator, cfg);
+    defer client.deinit();
+
+    // Produce one message to trigger the initial metadata load.
+    var m1 = try client.acquire();
+    try m1.setTopic("events");
+    m1.setPartition(0);
+    const dst = m1.value();
+    @memcpy(dst[0..4], "init");
+    try m1.commit(4);
+    try m1.await();
+
+    const initial_requests = broker.metadata_requests.load(.acquire);
+    try testing.expect(initial_requests >= 1); // at least the initial load
+
+    // Sleep long enough for at least 2 periodic refreshes to fire.
+    std.Thread.sleep(350 * std.time.ns_per_ms);
+
+    // Produce another message to trigger a drain (which checks metadata age).
+    var m2 = try client.acquire();
+    try m2.setTopic("events");
+    m2.setPartition(0);
+    const dst2 = m2.value();
+    @memcpy(dst2[0..4], "more");
+    try m2.commit(4);
+    try m2.await();
+
+    // The periodic refresh must have fired at least once beyond the initial.
+    try testing.expect(broker.metadata_requests.load(.acquire) > initial_requests);
+}
+
+test "#3 periodic metadata refresh: large max_age = no proactive refresh" {
+    // With a large metadata_max_age_ms (default 300s), no proactive refresh
+    // should happen — only the initial load and error-triggered refreshes.
+    var broker = try mock.Broker.start(testing.allocator, .{ .mode = .ok, .num_partitions = 4 });
+    defer broker.stop();
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var cfg = testConfig(&bootstrap);
+    cfg.metadata_max_age_ms = 300_000; // 5 min — no proactive refresh during test
+    cfg.linger_ms = 0;
+    cfg.enable_idempotency = false;
+    var client = try Client.init(testing.allocator, cfg);
+    defer client.deinit();
+
+    // Produce two messages with a gap between them. Only the initial metadata
+    // load should fire (no error-triggered or periodic refresh).
+    var m1 = try client.acquire();
+    try m1.setTopic("events");
+    m1.setPartition(0);
+    const dst = m1.value();
+    @memcpy(dst[0..3], "aaa");
+    try m1.commit(4);
+    try m1.await();
+
+    const requests_after_first = broker.metadata_requests.load(.acquire);
+
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+
+    var m2 = try client.acquire();
+    try m2.setTopic("events");
+    m2.setPartition(0);
+    const dst2 = m2.value();
+    @memcpy(dst2[0..3], "bbb");
+    try m2.commit(4);
+    try m2.await();
+
+    // No proactive refresh should have fired in the 100ms gap.
+    try testing.expectEqual(requests_after_first, broker.metadata_requests.load(.acquire));
+}
+
+test "#3 silent leader change: producer routes to new leader after refresh" {
+    // A single mock broker advertises two nodes (1 and 2) both at its own
+    // address (extra broker with port=0 means "same as this broker").
+    // Initially leader = 1. After a periodic metadata refresh, the leader
+    // changes to 2. The producer must pick up the new leader from the
+    // refreshed metadata and continue producing without errors. This tests
+    // the core behavior: a silent leader change (no error trigger) is
+    // recovered via the periodic refresh.
+    const extra = [_]mock.ExtraBroker{.{ .node_id = 2, .host = "127.0.0.1", .port = 0 }};
+    var broker = try mock.Broker.start(testing.allocator, .{
+        .mode = .ok,
+        .num_partitions = 1,
+        .node_id = 1,
+        .extra_brokers = &extra,
+    });
+    defer broker.stop();
+
+    // Both nodes point to the same broker (port=0 resolves to broker.port).
+    // Leader starts at node 1.
+    broker.leader_id.store(1, .release);
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var cfg = testConfig(&bootstrap);
+    cfg.metadata_max_age_ms = 100; // refresh every 100ms
+    cfg.linger_ms = 0;
+    cfg.enable_idempotency = false;
+    var client = try Client.init(testing.allocator, cfg);
+    defer client.deinit();
+
+    // Produce to node 1 (the initial leader).
+    var m1 = try client.acquire();
+    try m1.setTopic("events");
+    m1.setPartition(0);
+    const dst1 = m1.value();
+    @memcpy(dst1[0..4], "old1");
+    try m1.commit(4);
+    try m1.await();
+
+    const requests_before = broker.metadata_requests.load(.acquire);
+    try testing.expect(requests_before >= 1); // at least the initial load
+
+    // Silently change the leader to node 2. No error is triggered — the
+    // producer must pick this up via the periodic metadata refresh.
+    broker.leader_id.store(2, .release);
+
+    // Wait for a periodic metadata refresh to fire.
+    std.Thread.sleep(250 * std.time.ns_per_ms);
+
+    // Produce again — should succeed with the new leader (node 2).
+    var m2 = try client.acquire();
+    try m2.setTopic("events");
+    m2.setPartition(0);
+    const dst2 = m2.value();
+    @memcpy(dst2[0..4], "new2");
+    try m2.commit(4);
+    try m2.await();
+
+    // The periodic refresh happened: metadata_requests increased.
+    try testing.expect(broker.metadata_requests.load(.acquire) > requests_before);
+    // Both produces succeeded (produced count = 2).
+    try testing.expectEqual(@as(u32, 2), broker.produced.load(.acquire));
 }

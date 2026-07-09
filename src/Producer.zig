@@ -98,6 +98,21 @@ pub const Options = struct {
     /// transient connection failures), so a persistently-unhealthy cluster
     /// does not spin the CPU.
     retry_backoff_ns: u64 = 5 * std.time.ns_per_ms,
+    /// Linger time in ns: after the first pending record arrives, the network
+    /// thread waits up to this long for more records before draining, to form
+    /// larger batches (better throughput + compression ratio). 0 = eager
+    /// (drain immediately when data is available, the previous behavior).
+    /// The linger is a TIMER on the waitForData path, not a sleep: if a batch
+    /// fills (`max_batch_bytes` worth of pending data) before the timer
+    /// expires, the drain happens immediately — no latency regression under
+    /// load.
+    linger_ns: u64 = 0,
+    /// Max age in ms before a proactive metadata refresh. The network thread
+    /// refreshes metadata periodically even without errors, to catch silent
+    /// leader changes / new brokers / new partitions. 0 = never refresh
+    /// proactively (only on error/invalidation). Default 300000 (5 min,
+    /// matching Kafka's `metadata.max.age.ms`).
+    metadata_max_age_ms: u32 = 300_000,
     /// When true, the producer acquires a PID/epoch at startup (via
     /// InitProducerId v4 to any bootstrap broker), tracks per-partition
     /// sequence numbers, and sends real producer_id/producer_epoch/base_sequence
@@ -264,6 +279,10 @@ brokers: []BrokerInfo = &.{},
 topics: []TopicInfo = &.{},
 metadata_loaded: bool = false,
 metadata_stale: bool = false,
+/// Monotonic timestamp (ms) of the last successful metadata refresh. Used by
+/// the periodic refresh check in `drainOnce`: if `now - last_metadata_refresh_ms
+/// > metadata_max_age_ms`, refresh proactively. 0 = never refreshed.
+last_metadata_refresh_ms: i64 = 0,
 
 // --- connections keyed by "host:port" (owned keys) ------------------------
 connections: std.StringHashMapUnmanaged(*Connection) = .empty,
@@ -479,6 +498,16 @@ pub fn run(self: *Producer) void {
     self.read_head = self.ring.readHead();
     while (!self.ring.isShutdown()) {
         if (!self.ring.waitForData(self.read_head)) break; // shutdown
+        // Linger: after the first pending record arrives, wait up to
+        // `linger_ns` for more records to accumulate before draining, to form
+        // larger batches. Skipped when `linger_ns == 0` (eager drain). If a
+        // batch fills (`max_batch_bytes` worth of pending data) before the
+        // timer expires, the linger exits early — no latency regression under
+        // load. This is a TIMER on the waitForData path, not a sleep: it only
+        // runs when data is already available and we're choosing to wait for
+        // more. The retry backoff (below) is a SEPARATE concern — it sleeps
+        // when a drain made no forward progress.
+        self.linger();
         const progressed = self.drainOnce() catch |err| brk: {
             log.warn("drain failed: {s}", .{@errorName(err)});
             break :brk false;
@@ -492,10 +521,61 @@ pub fn run(self: *Producer) void {
     }
 }
 
-/// One drain pass. Returns true if any slot reached a terminal state (ack or
+/// Linger: after the first pending record arrives, wait up to `linger_ns`
+/// for more records to accumulate before draining. Exits early if a batch
+/// fills (`max_batch_bytes` worth of pending data) or on shutdown. No-op when
+/// `linger_ns == 0`.
+fn linger(self: *Producer) void {
+    const linger_ns = self.options.linger_ns;
+    if (linger_ns == 0) return;
+
+    const start: i64 = @truncate(std.time.nanoTimestamp());
+    const deadline: i64 = start + @as(i64, @intCast(linger_ns));
+
+    while (true) {
+        if (self.ring.isShutdown()) return;
+        if (self.pendingBatchFull()) return;
+
+        const now: i64 = @truncate(std.time.nanoTimestamp());
+        if (now >= deadline) return;
+
+        // Wait for more data with a bounded timeout. The futex word is
+        // write_head's low 32 bits; a producer committing advances write_head
+        // and wakes us. We re-check the deadline and batch-full condition on
+        // each wake/timeout.
+        const remaining: u64 = @intCast(deadline - now);
+        const wait_ns = @min(remaining, 50 * std.time.ns_per_ms);
+        const known_head = self.ring.writeHead();
+        _ = self.ring.waitForDataTimed(known_head, wait_ns);
+    }
+}
+
+/// Whether the pending slots contain enough data to fill a `max_batch_bytes`
+/// batch. Used by the linger to exit early under load (no over-linger).
+/// Estimates the batch size by summing each pending slot's value_len + key_len
+/// + a fixed per-record overhead. Early-exits once the sum reaches
+/// `max_batch_bytes`. O(pending slots) but breaks at the first full batch —
+/// under load this is O(batch_size), not O(ring_size).
+fn pendingBatchFull(self: *Producer) bool {
+    const max_batch = self.options.max_batch_bytes;
+    const base = self.ring.readHead();
+    const head = self.ring.writeHead();
+    var total: u32 = 0;
+    var pos = base;
+    while (pos < head) : (pos += 1) {
+        if (!self.ring.slotIsPending(pos)) continue;
+        const slot = self.ring.slotAt(pos);
+        total += slot.value_len + @as(u32, slot.key_len) + 20; // 20 ≈ per-record varint overhead
+        if (total >= max_batch) return true;
+    }
+    return false;
+}
 /// fail) this pass — i.e. forward progress was made.
 fn drainOnce(self: *Producer) !bool {
-    if (self.metadata_stale or !self.metadata_loaded) {
+    // Refresh metadata when stale (error-triggered), not yet loaded (first
+    // drain), or aged past `metadata_max_age_ms` (periodic refresh to catch
+    // silent leader changes / new brokers / new partitions without an error).
+    if (self.metadata_stale or !self.metadata_loaded or self.metadataAged()) {
         self.refreshMetadata() catch |err| {
             log.warn("metadata refresh failed: {s}", .{@errorName(err)});
             // Charge the failure against pending slots so they eventually fail
@@ -1074,6 +1154,19 @@ fn brokerAddr(self: *Producer, node_id: i32) ?BrokerInfo {
     return null;
 }
 
+/// Whether the metadata cache is older than `metadata_max_age_ms` and should
+/// be proactively refreshed. Cold-path check: one timestamp comparison per
+/// drain. Returns false when `metadata_max_age_ms == 0` (proactive refresh
+/// disabled) or when metadata has never been loaded (handled by the
+/// `!metadata_loaded` check in `drainOnce`).
+fn metadataAged(self: *Producer) bool {
+    if (self.options.metadata_max_age_ms == 0) return false;
+    if (!self.metadata_loaded) return false; // handled separately
+    const now = std.time.milliTimestamp();
+    const age: u64 = @intCast(now - self.last_metadata_refresh_ms);
+    return age >= self.options.metadata_max_age_ms;
+}
+
 /// Send a Metadata v12 request and rebuild the cache. Cold path (refresh
 /// cadence, allocations allowed, PLAN §8).
 ///
@@ -1109,6 +1202,7 @@ fn refreshMetadata(self: *Producer) !void {
     try self.rebuildMetadata(resp);
     self.metadata_loaded = true;
     self.metadata_stale = false;
+    self.last_metadata_refresh_ms = std.time.milliTimestamp();
     self.force_bootstrap = false; // success: clear the re-bootstrap flag
 }
 

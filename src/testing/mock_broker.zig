@@ -82,6 +82,21 @@ pub const Options = struct {
     /// partition, guaranteeing they are pending together with the retried
     /// slots on the next drain (exercising the base_sequence sub-run split).
     gate_first_produce: bool = false,
+    /// This broker's node ID in the metadata response. Default 1.
+    node_id: i32 = 1,
+    /// Additional brokers to advertise in the metadata response, so the
+    /// producer can be told about a second broker (for silent leader change
+    /// tests). Each entry is included in the brokers array alongside this
+    /// broker. The test changes `leader_id` to route produces to a different
+    /// node.
+    extra_brokers: []const ExtraBroker = &.{},
+};
+
+/// An additional broker endpoint advertised in the mock's metadata response.
+pub const ExtraBroker = struct {
+    node_id: i32,
+    host: []const u8,
+    port: u16,
 };
 
 pub const Broker = struct {
@@ -97,6 +112,14 @@ pub const Broker = struct {
     max_produce_records_bytes: std.atomic.Value(u32) = .init(0),
     /// Metadata requests served (the retry test asserts a refresh happened).
     metadata_requests: std.atomic.Value(u32) = .init(0),
+    /// Produce requests received (number of Produce API calls, not record
+    /// count). The linger test asserts that a burst of small messages
+    /// coalesces into fewer Produce requests.
+    produce_requests: std.atomic.Value(u32) = .init(0),
+    /// The leader node_id returned in the metadata response for all
+    /// partitions. Changeable at runtime so the silent-leader-change test can
+    /// flip the leader and assert the producer routes to the new node.
+    leader_id: std.atomic.Value(i32) = .init(1),
     /// InitProducerId requests served. Startup acquisition is call #1; a PID
     /// reset on OUT_OF_ORDER_SEQUENCE / UNKNOWN_PRODUCER_ID bumps this to >=2.
     init_producer_id_requests: std.atomic.Value(u32) = .init(0),
@@ -345,23 +368,42 @@ const Session = struct {
     fn sendMetadata(self: *Session, correlation_id: i32) !void {
         _ = self.broker.metadata_requests.fetchAdd(1, .acq_rel);
 
-        var brokers = [_]metadata.Response.Broker{.{
-            .node_id = 1,
+        const this_node = self.broker.options.node_id;
+        const current_leader = self.broker.leader_id.load(.acquire);
+
+        // Build the brokers array: this broker + any extra brokers.
+        var broker_arr: [8]metadata.Response.Broker = undefined;
+        var broker_len: usize = 0;
+        broker_arr[broker_len] = .{
+            .node_id = this_node,
             .host = "127.0.0.1",
             .port = @intCast(self.broker.port),
             .rack = null,
-        }};
+        };
+        broker_len += 1;
+        for (self.broker.options.extra_brokers) |eb| {
+            broker_arr[broker_len] = .{
+                .node_id = eb.node_id,
+                .host = eb.host,
+                // port=0 means "same as this broker" — lets the test pass a
+                // placeholder port before the broker's own port is assigned.
+                .port = if (eb.port == 0) @intCast(self.broker.port) else eb.port,
+                .rack = null,
+            };
+            broker_len += 1;
+        }
+
         var partitions: [max_partitions]metadata.Response.Partition = undefined;
-        var one = [_]i32{1};
+        var leader_arr = [_]i32{current_leader};
         const np = self.broker.options.num_partitions;
         for (0..np) |i| {
             partitions[i] = .{
                 .error_code = 0,
                 .partition_index = @intCast(i),
-                .leader_id = 1,
+                .leader_id = current_leader,
                 .leader_epoch = 0,
-                .replica_nodes = &one,
-                .isr_nodes = &one,
+                .replica_nodes = &leader_arr,
+                .isr_nodes = &leader_arr,
                 .offline_replicas = &.{},
             };
         }
@@ -378,9 +420,9 @@ const Session = struct {
         var w: std.Io.Writer = .fixed(&body);
         try metadata.encodeResponse(&w, .{
             .throttle_time_ms = 0,
-            .brokers = &brokers,
+            .brokers = broker_arr[0..broker_len],
             .cluster_id = null,
-            .controller_id = 1,
+            .controller_id = this_node,
             .topics = &topics,
         });
         try self.respond(correlation_id, 1, w.buffered());
@@ -406,6 +448,7 @@ const Session = struct {
     }
 
     fn sendProduce(self: *Session, correlation_id: i32, req_body: []const u8) !void {
+        _ = self.broker.produce_requests.fetchAdd(1, .acq_rel);
         var r: Reader = .init(req_body);
         _ = try primitives.readNullableCompactString(&r); // transactional_id
         _ = try primitives.readI16(&r); // acks
