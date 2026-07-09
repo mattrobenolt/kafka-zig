@@ -73,7 +73,7 @@ pub fn main() !void {
 
     // --- Init the Client ---
     const bootstrap = [_]kafka.Client.Broker{.{ .host = host, .port = port }};
-    var client: kafka.Client = try .init(allocator, .{
+    var client = try kafka.Client.init(allocator, .{
         .bootstrap_brokers = &bootstrap,
         .tls = .{
             .sni = host,
