@@ -1,6 +1,8 @@
 const std = @import("std");
 const Build = std.Build;
 
+const benchmark = @import("benchmark");
+
 pub fn build(b: *Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -17,8 +19,21 @@ pub fn build(b: *Build) void {
         .optimize = optimize,
     });
 
+    // --- snappy module (standalone raw-block codec, no kafka imports) ---
+    const snappy_mod = b.addModule("snappy", .{
+        .root_source_file = b.path("src/snappy/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // --- ztls dependency ---
     const ztls_dep = b.dependency("ztls", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // --- benchmark dependency ---
+    const benchmark_dep = b.dependency("benchmark", .{
         .target = target,
         .optimize = optimize,
     });
@@ -30,6 +45,7 @@ pub fn build(b: *Build) void {
         .optimize = optimize,
     });
     kafka_mod.addImport("scram", scram_mod);
+    kafka_mod.addImport("snappy", snappy_mod);
     kafka_mod.addImport("ztls", ztls_dep.module("ztls"));
     kafka_mod.addOptions("build_options", build_options);
 
@@ -113,6 +129,11 @@ pub fn build(b: *Build) void {
     const run_scram_tests = b.addRunArtifact(scram_tests);
     test_step.dependOn(&run_scram_tests.step);
 
+    // --- snappy module tests ---
+    const snappy_tests = b.addTest(.{ .root_module = snappy_mod });
+    const run_snappy_tests = b.addRunArtifact(snappy_tests);
+    test_step.dependOn(&run_snappy_tests.step);
+
     // --- docs step: Zig autodoc for the public API (issue #8) ---
     // `zig build docs` generates HTML API docs into zig-out/docs/. Uses
     // addObject (no linking) + getEmittedDocs + addInstallDirectory, the
@@ -128,4 +149,24 @@ pub fn build(b: *Build) void {
     });
     const docs_step = b.step("docs", "Generate Zig API docs (HTML) into zig-out/docs/");
     docs_step.dependOn(&docs_install.step);
+
+    // --- snappy benchmark step (ReleaseFast for meaningful numbers) ---
+    // Uses zig-benchmark's addRunTest helper, which injects @import("benchmark")
+    // into the bench root module and generates the runner executable.
+    const bench_root = b.createModule(.{
+        .root_source_file = b.path("src/snappy/bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "snappy", .module = snappy_mod },
+        },
+    });
+    const run_benchmarks = benchmark.addRunTest(b, .{
+        .dependency = benchmark_dep,
+        .root_module = bench_root,
+    });
+    if (b.args) |args| run_benchmarks.addArgs(args);
+
+    const snappy_bench_step = b.step("snappy-bench", "Run snappy benchmarks (use -Doptimize=ReleaseFast)");
+    snappy_bench_step.dependOn(&run_benchmarks.step);
 }

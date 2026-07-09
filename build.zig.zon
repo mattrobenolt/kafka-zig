@@ -8,6 +8,10 @@
             .url = "https://github.com/mattrobenolt/ztls/archive/2c01682339c9cbc1a941064b37b75c9887a906f2.tar.gz",
             .hash = "ztls-0.0.0-SHHDXoq3EACxrBDu3znLIIAALRvXjl7-1Ex71TNJhH7P",
         },
+        .benchmark = .{
+            .url = "https://github.com/mattrobenolt/zig-benchmark/archive/6e7e9ab7ed8bd8147c491ac53a1d326633a5c47a.tar.gz",
+            .hash = "benchmark-0.1.0-JS72VvXxAACo8j9BYddbkivgNHXIeD1V27013BuCtW-_",
+        },
     },
     .paths = .{
         "build.zig",
