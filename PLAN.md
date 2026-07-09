@@ -329,7 +329,7 @@ network thread's problem, not yours.
 ```zig
 const kafka = @import("kafka");
 
-var client = try kafka.Client.init(allocator, .{
+var client: kafka.Client = try .init(allocator, .{
     .bootstrap_brokers = &.{ .{ .host = "broker-1", .port = 9096 }, ... }, // 9096 = SASL/SCRAM-over-TLS on MSK
     .tls = .{ .server_ca = pem, .sni = "broker-hostname" }, // ztls-backed
     .sasl = .{ .scram_sha512 = .{ .username = "...", .password = "..." } }, // MSK default

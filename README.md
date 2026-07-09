@@ -27,7 +27,7 @@ borrowed-buffer lifetime to manage.
 ```zig
 const kafka = @import("kafka");
 
-var client = try kafka.Client.init(allocator, .{
+var client: kafka.Client = try .init(allocator, .{
     .bootstrap_brokers = &.{
         .{ .host = "broker-1", .port = 9096 },
     },
