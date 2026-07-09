@@ -77,7 +77,13 @@ Layout (big-endian unless noted):
 - crc: u32 = **CRC32C (Castagnoli)** over attributes→end
 - attributes: u16 (bits 0–2 = compression: 0 none, 1 gzip, 2 snappy, 3 lz4,
   **4 zstd**; bit 3 = timestampType; bit 4 = transactional; bit 5 = control;
-  bit 6 = idempotent)
+  bit 6 = **hasDeleteHorizonMs** (KIP-516) — NOT an idempotent flag; bits 7-15
+  unused). **There is NO idempotent attributes bit.** The broker infers
+  idempotency from `producerId != -1` (NO_PRODUCER_ID). The historical
+  `IDEMPOTENT_FLAG_MASK = 0x40` was removed when bit 6 was repurposed. Do NOT
+  set any attributes bit for idempotent mode — just send a real producerId.
+  (Verified against https://kafka.apache.org/43/implementation/message-format/
+  + the Java `RecordBatch` — `computeAttributes` sets no idempotent bit.)
 - lastOffsetDelta: i32
 - baseTimestamp: i64
 - maxTimestamp: i64
