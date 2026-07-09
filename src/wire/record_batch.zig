@@ -117,7 +117,6 @@ pub const attr_timestamp_type: u16 = 1 << 3;
 pub const attr_transactional: u16 = 1 << 4;
 pub const attr_control: u16 = 1 << 5;
 pub const attr_delete_horizon: u16 = 1 << 6;
-
 /// A decoded v2 record batch. Owned data (records, keys, values, headers) is
 /// allocated by `decodeBatch`. Call `deinit` to free.
 pub const Batch = struct {
@@ -160,6 +159,17 @@ pub const Batch = struct {
     pub fn isControl(self: Batch) bool {
         return (self.attributes & attr_control) != 0;
     }
+
+    /// Whether this batch is from an idempotent producer. The broker infers
+    /// idempotency from `producer_id != -1` (NO_PRODUCER_ID) — there is NO
+    /// separate idempotent bit in the attributes field. Bit 6 is
+    /// `hasDeleteHorizonMs` (KIP-516), NOT an idempotent flag. The historical
+    /// `IDEMPOTENT_FLAG_MASK = 0x40` was removed from the Java client when
+    /// bit 6 was repurposed; the broker now checks `producerId != -1`.
+    /// See: https://kafka.apache.org/43/implementation/message-format/
+    pub fn isIdempotent(self: Batch) bool {
+        return self.producer_id != -1;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -190,8 +200,12 @@ pub const EncodeOptions = struct {
     /// compressed bytes in a caller-owned scratch buffer preserves the
     /// zero-heap-allocation encode contract (no `std.heap.*` fallback).
     scratch: ?[]u8 = null,
-    /// Non-idempotent producer sentinels. Override only for idempotent mode
-    /// (future phase). producerId=-1, producerEpoch=-1, baseSequence=-1.
+    /// Non-idempotent producer sentinels. When all three are -1, the batch is
+    /// non-idempotent (the broker does not track sequence numbers). For
+    /// idempotent mode, the caller passes the real producer_id/producer_epoch
+    /// from InitProducerId and a per-partition base_sequence. The broker
+    /// infers idempotency from `producer_id != -1` — there is NO idempotent
+    /// bit in the attributes field (bit 6 is `hasDeleteHorizonMs`, KIP-516).
     producer_id: i64 = -1,
     producer_epoch: i16 = -1,
     base_sequence: i32 = -1,
@@ -1002,6 +1016,61 @@ test "encodeBatch: partition_leader_epoch is set" {
     defer batch.deinit(testing.allocator);
 
     try testing.expectEqual(@as(i32, 42), batch.partition_leader_epoch);
+}
+
+test "encodeBatch: idempotent producer fields (producerId/epoch/baseSequence)" {
+    // An idempotent batch carries a real producer_id (not -1), producer_epoch,
+    // and base_sequence. The broker infers idempotency from producer_id != -1
+    // — there is NO idempotent bit in the attributes field (bit 6 is
+    // hasDeleteHorizonMs, KIP-516). See:
+    // https://kafka.apache.org/43/implementation/message-format/
+    const records = [_]Record{
+        .{ .offset_delta = 0, .timestamp_delta = 0, .key = "k1", .value = "v1", .headers = &.{} },
+        .{ .offset_delta = 1, .timestamp_delta = 5, .key = "k2", .value = "v2", .headers = &.{} },
+    };
+
+    var buf: [256]u8 = undefined;
+    const bytes = try encodeBatch(&buf, &records, .{
+        .producer_id = 7000,
+        .producer_epoch = 1,
+        .base_sequence = 42,
+    });
+
+    var r: Reader = .init(bytes);
+    var batch = try decodeBatch(testing.allocator, &r);
+    defer batch.deinit(testing.allocator);
+
+    // The idempotent fields must round-trip exactly.
+    try testing.expectEqual(@as(i64, 7000), batch.producer_id);
+    try testing.expectEqual(@as(i16, 1), batch.producer_epoch);
+    try testing.expectEqual(@as(i32, 42), batch.base_sequence);
+    // isIdempotent is inferred from producer_id != -1, NOT from attributes.
+    try testing.expect(batch.isIdempotent());
+    // Attributes must NOT have any special idempotent bit set — bit 6 is
+    // hasDeleteHorizonMs, not idempotent.
+    try testing.expectEqual(@as(u16, 0), batch.attributes);
+}
+
+test "encodeBatch: non-idempotent sentinels (producerId=-1, epoch=-1, seq=-1)" {
+    const records = [_]Record{.{
+        .offset_delta = 0,
+        .timestamp_delta = 0,
+        .key = "k1",
+        .value = "v1",
+        .headers = &.{},
+    }};
+
+    var buf: [256]u8 = undefined;
+    const bytes = try encodeBatch(&buf, &records, .{});
+
+    var r: Reader = .init(bytes);
+    var batch = try decodeBatch(testing.allocator, &r);
+    defer batch.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(i64, -1), batch.producer_id);
+    try testing.expectEqual(@as(i16, -1), batch.producer_epoch);
+    try testing.expectEqual(@as(i32, -1), batch.base_sequence);
+    try testing.expect(!batch.isIdempotent());
 }
 
 test "encodeBatch: rejects gzip/snappy/lz4 (unimplemented codecs)" {

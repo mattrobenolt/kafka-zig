@@ -143,6 +143,14 @@ pub const Slot = struct {
     timestamp_ms: i64,
     key_len: u16,
     topic_len: u8,
+    /// The base sequence assigned to this slot's batch by the idempotent
+    /// producer's per-partition counter. -1 = unassigned (first send not yet
+    /// built, or idempotency is off). Set when a batch is first built for the
+    /// slot's (topic, partition); reused on in-place retry so the broker dedup
+    /// window is preserved (the whole point of idempotent sequence tracking).
+    /// Reset to -1 at acquire (`bindMessage`). Only the network thread reads
+    /// and writes this; producers never touch it.
+    base_sequence: i32 = -1,
 };
 
 /// A stable completion token, decoupled from any physical slot. Pooled; a
@@ -460,6 +468,7 @@ fn bindMessage(self: *Ring, pos: u64, handle_index: u32) Message {
     slot.key_len = 0;
     slot.value_len = 0;
     slot.err = 0;
+    slot.base_sequence = -1;
 
     return .{ .ring = self, .handle_index = handle_index, .slot_index = slot_index };
 }
@@ -611,6 +620,20 @@ pub fn slotValueCommitted(self: *Ring, index: u64) []const u8 {
 /// to `markAcked`/`markFailed`/`retry` so stale acks are rejected.
 pub fn slotGeneration(self: *Ring, index: u64) u32 {
     return self.slotAt(index).generation.load(.acquire);
+}
+
+/// The base sequence assigned to this slot's batch (-1 = unassigned / non-
+/// idempotent). The network thread reads this to decide whether a batch is a
+/// first send (assign a new sequence) or a retry (reuse the stored sequence).
+pub fn slotBaseSequence(self: *Ring, index: u64) i32 {
+    return self.slotAt(index).base_sequence;
+}
+
+/// Set the base sequence on a slot. Called by the network thread when a batch
+/// is first built for the slot's (topic, partition). On retry the slot keeps
+/// its previously-assigned value — the caller does NOT re-set it.
+pub fn setSlotBaseSequence(self: *Ring, index: u64, seq: i32) void {
+    self.slotAt(index).base_sequence = seq;
 }
 
 /// Whether the slot at `index` is currently pending (committed by a producer,

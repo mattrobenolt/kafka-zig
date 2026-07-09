@@ -95,6 +95,12 @@ pub const Options = struct {
     /// transient connection failures), so a persistently-unhealthy cluster
     /// does not spin the CPU.
     retry_backoff_ns: u64 = 5 * std.time.ns_per_ms,
+    /// When true, the producer acquires a PID/epoch at startup (via
+    /// InitProducerId v4 to any bootstrap broker), tracks per-partition
+    /// sequence numbers, and sends real producer_id/producer_epoch/base_sequence
+    /// in record batches. When false, the -1 sentinels are used (non-idempotent
+    /// mode, the v1 default behavior). Idempotency ON is the production default.
+    enable_idempotency: bool = true,
 };
 
 /// A retriable error code that reflects a (possibly) stale leader — retrying
@@ -205,6 +211,21 @@ read_head: u64 = 0,
 /// Shared round-robin counter used only if allocating a per-topic key fails.
 rr_fallback: partitioner.RoundRobin = .{},
 
+// --- idempotent producer state --------------------------------------------
+/// PID and epoch assigned by the broker via InitProducerId v4. -1 = not yet
+/// acquired (or idempotency is off). When `enable_idempotency` is true, these
+/// are populated at startup and passed to every record batch's `EncodeOptions`.
+producer_id: i64 = -1,
+producer_epoch: i16 = -1,
+pid_acquired: bool = false,
+/// Per-(topic, partition) next sequence number. Key is a packed u64:
+/// high 32 bits = topic hash, low 32 bits = partition index. The value is the
+/// next base sequence to assign for the NEXT first-send batch on that
+/// (topic, partition). On retry, the slot's stored `base_sequence` is reused
+/// — this counter is NOT advanced on retry (the broker dedupes by sequence).
+/// Sequence numbers wrap at i32 max; the wraparound full-reset is 1c.
+sequences: std.AutoHashMapUnmanaged(SeqKey, i32) = .empty,
+
 /// A (topic, partition) run in the sorted `collected` array: `[start, end)`
 /// map to one record batch / one partition_response.
 const Group = struct {
@@ -213,6 +234,15 @@ const Group = struct {
     start: usize,
     end: usize,
 };
+
+/// Key for the per-(topic, partition) sequence map. Using a u64 hash of the
+/// topic name + partition avoids owning topic string copies in the map (the
+/// metadata cache's topic names can be freed on refresh). Hash collisions
+/// are catastrophic for sequence correctness, so we use a 64-bit hash with a
+/// good mixer (wyhash) — the collision probability across a realistic topic
+/// set (~thousands) is negligible. The alternative (owned string keys) adds
+/// cold-path allocation complexity for no real safety gain at this scale.
+const SeqKey = u64;
 
 pub fn init(allocator: Allocator, ring: *Ring, options: Options) !Producer {
     const num_slots = ring.numSlots();
@@ -307,6 +337,7 @@ pub fn deinit(self: *Producer) void {
     self.allocator.free(self.compress_scratch);
     self.allocator.free(self.attempts);
     self.allocator.free(self.attempt_gen);
+    self.sequences.deinit(self.allocator);
     self.* = undefined;
 }
 
@@ -317,6 +348,15 @@ pub fn deinit(self: *Producer) void {
 /// The network-thread entry point. Blocks in `waitForData` between drains and
 /// returns when the ring is shut down.
 pub fn run(self: *Producer) void {
+    // Acquire a PID/epoch before the first drain when idempotency is enabled.
+    // This is a blocking call to a bootstrap broker; if it fails we log and
+    // proceed in non-idempotent mode (sentinel -1) rather than hanging — the
+    // 1c slice will add retry/error handling for PID acquisition.
+    if (self.options.enable_idempotency) {
+        self.initProducerId() catch |err| {
+            log.warn("PID acquisition failed, proceeding non-idempotent: {s}", .{@errorName(err)});
+        };
+    }
     self.read_head = self.ring.readHead();
     while (!self.ring.isShutdown()) {
         if (!self.ring.waitForData(self.read_head)) break; // shutdown
@@ -502,6 +542,29 @@ fn sendLeader(self: *Producer, leader: i32, slots: []const Collected) !bool {
                 };
                 rc += 1;
             }
+
+            // --- idempotent sequence assignment ---
+            // On first send (slot.base_sequence == -1), assign the next
+            // per-partition sequence and store it on every slot in the batch.
+            // On in-place retry (slot.base_sequence != -1), REUSE the stored
+            // value — the broker dedupes by sequence, so re-advancing would
+            // break exactly-once. The sequence is per-batch: records get
+            // base_sequence + offsetDelta (0..N-1) as their per-record sequence.
+            const base_seq: i32 = blk: {
+                if (!self.options.enable_idempotency or !self.pid_acquired) break :blk -1;
+                const first_slot_seq = self.ring.slotBaseSequence(slots[p].pos);
+                if (first_slot_seq != -1) break :blk first_slot_seq; // retry: reuse
+                // First send: assign and advance the per-partition counter.
+                const seq = self.nextSequence(topic, part, @intCast(rc)) catch -1;
+                if (seq != -1) {
+                    for (slots[p..p_end]) |c| self.ring.setSlotBaseSequence(c.pos, seq);
+                }
+                break :blk seq;
+            };
+
+            const pid: i64 = if (base_seq != -1) self.producer_id else -1;
+            const epoch: i16 = if (base_seq != -1) self.producer_epoch else -1;
+
             const batch = record_batch.encodeBatch(
                 self.encode_buf[encode_off..],
                 self.records_scratch[0..rc],
@@ -509,6 +572,9 @@ fn sendLeader(self: *Producer, leader: i32, slots: []const Collected) !bool {
                     .base_timestamp = now_ms,
                     .compression = self.options.compression,
                     .scratch = self.compress_scratch,
+                    .producer_id = pid,
+                    .producer_epoch = epoch,
+                    .base_sequence = base_seq,
                 },
             ) catch |err| switch (err) {
                 // The batch doesn't fit in the remaining encode buffer. If
@@ -643,6 +709,14 @@ fn applyResponse(
     slots: []const Collected,
     groups: []const Group,
 ) bool {
+    // 1c hooks for idempotent error handling (NOT implemented in this slice):
+    //   - OutOfOrderSequence (45): non-retriable for idempotent. Reset the
+    //     per-partition sequence and re-send. The slot's base_sequence should
+    //     be cleared so a new one is assigned on the next send.
+    //   - UNKNOWN_PRODUCER_ID (73): re-init PID via initProducerId(), reset ALL
+    //     sequence counters, and retry.
+    //   - DUPLICATE_SEQUENCE_NUMBER (37): the retry succeeded — treat as ack.
+    // These belong in the error_code branches below in 1c.
     var progressed = false;
     for (resp.responses) |tr| {
         for (tr.partition_responses) |pr| {
@@ -972,3 +1046,75 @@ pub const MetadataBody = struct {
         });
     }
 };
+
+/// InitProducerId v4 request body context (duck-typed by `frameRequest`).
+/// For non-transactional idempotent init: transactional_id=null,
+/// producer_id=-1, producer_epoch=-1.
+pub const InitProducerIdBody = struct {
+    transaction_timeout_ms: i32,
+    pub fn write(self: InitProducerIdBody, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try wire.init_producer_id.encodeRequest(w, .{
+            .transactional_id = null,
+            .transaction_timeout_ms = self.transaction_timeout_ms,
+            .producer_id = -1,
+            .producer_epoch = -1,
+        });
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Idempotent producer: PID acquisition + per-partition sequence tracking
+// ---------------------------------------------------------------------------
+
+/// Acquire a producer ID/epoch via InitProducerId v4 to any bootstrap broker.
+/// On success, sets `producer_id`, `producer_epoch`, and `pid_acquired`.
+/// Cold path (once at startup). The coordinator for non-transactional
+/// idempotent init is ANY broker — FindCoordinator is NOT needed.
+///
+/// 1c hook: on UNKNOWN_PRODUCER_ID (73) from a Produce response, re-call this
+/// to get a fresh PID/epoch and reset all sequence counters.
+fn initProducerId(self: *Producer) !void {
+    const conn = try self.metadataConnection();
+    const body: InitProducerIdBody = .{
+        .transaction_timeout_ms = self.options.timeout_ms,
+    };
+    const corr = conn.sendRequest(.init_producer_id, 4, body) catch |err| {
+        self.dropMetadataConnection();
+        return err;
+    };
+    const resp_body = conn.readResponse() catch |err| {
+        self.dropMetadataConnection();
+        return err;
+    };
+    var payload = try stripHeaderV1(resp_body, corr);
+    const resp = try wire.init_producer_id.decodeResponse(&payload);
+    if (resp.error_code != 0) {
+        log.warn("InitProducerId error: {d}", .{resp.error_code});
+        return error.InitProducerIdFailed;
+    }
+    self.producer_id = resp.producer_id;
+    self.producer_epoch = resp.producer_epoch;
+    self.pid_acquired = true;
+    log.debug("acquired PID={d} epoch={d}", .{ self.producer_id, self.producer_epoch });
+}
+
+/// Compute the sequence map key for a (topic, partition) pair. Uses wyhash for
+/// a good 64-bit mix — collision probability across a realistic topic set is
+/// negligible, and this avoids owning topic string copies in the map.
+fn seqKey(topic: []const u8, partition: i32) SeqKey {
+    var h: u64 = std.hash.Wyhash.hash(0, topic);
+    h = std.hash.Wyhash.hash(h, std.mem.asBytes(&partition));
+    return h;
+}
+
+/// Get or create the next sequence number for a (topic, partition). Returns the
+/// current value and advances by `count`. Called ONLY on a first-send batch
+/// (not on retry — retry reuses the slot's stored base_sequence).
+fn nextSequence(self: *Producer, topic: []const u8, partition: i32, count: i32) !i32 {
+    const key = seqKey(topic, partition);
+    const gop = try self.sequences.getOrPut(self.allocator, key);
+    if (!gop.found_existing) gop.value_ptr.* = 0;
+    const base = gop.value_ptr.*;
+    gop.value_ptr.* = base + count;
+    return base;
+}

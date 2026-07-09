@@ -114,6 +114,11 @@ pub const Config = struct {
     /// Record-batch compression. `.none` (default) sends plaintext batches;
     /// `.zstd` compresses each batch (requires `-Dzstd=true` at build time).
     compression: Compression = .none,
+    /// When true (production default), the producer acquires a PID/epoch at
+    /// startup via InitProducerId v4, tracks per-partition sequence numbers,
+    /// and sends real producer_id/producer_epoch/base_sequence in record
+    /// batches. When false, uses the -1 sentinels (non-idempotent mode).
+    enable_idempotency: bool = true,
 };
 
 allocator: Allocator,
@@ -178,6 +183,7 @@ pub fn init(allocator: Allocator, config: Config) !*Client {
         .retry_backoff_ns = @as(u64, config.linger_ms) * std.time.ns_per_ms,
         .io_timeout_ms = config.io_timeout_ms,
         .compression = config.compression,
+        .enable_idempotency = config.enable_idempotency,
     });
     errdefer self.producer.deinit();
 
@@ -259,6 +265,7 @@ fn testConfig(bootstrap: []const Broker) Config {
         .ring_slots = 64,
         .partitioner = .default,
         .client_id = "kafka-zig-test",
+        .enable_idempotency = true,
     };
 }
 
@@ -518,4 +525,203 @@ test "single batch exceeding max_batch_bytes fails MESSAGE_TOO_LARGE" {
 
     try testing.expectError(error.SendFailed, m.await());
     try testing.expectEqual(@as(u32, 10), m.failureCode()); // MESSAGE_TOO_LARGE
+}
+
+// ---------------------------------------------------------------------------
+// Idempotent producer tests (1b, #13)
+// ---------------------------------------------------------------------------
+
+test "idempotency ON: batches carry real PID, epoch, and advancing base_sequence" {
+    // Produce N messages to a single partition. The mock broker captures each
+    // batch's producer_id / producer_epoch / base_sequence. Assert:
+    //   - producer_id == mock.mock_producer_id (not -1)
+    //   - producer_epoch == mock.mock_producer_epoch
+    //   - base_sequence starts at 0 and advances by the record count per batch
+    var broker = try mock.Broker.start(testing.allocator, .{ .mode = .ok, .num_partitions = 1 });
+    defer broker.stop();
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var cfg = testConfig(&bootstrap);
+    cfg.enable_idempotency = true;
+    var client = try Client.init(testing.allocator, cfg);
+    defer client.deinit();
+
+    // Produce 5 messages, all to partition 0. They may be batched into one or
+    // more batches depending on timing; each batch's base_sequence should
+    // advance by the number of records in the preceding batch.
+    const n = 5;
+    var handles: [n]Message = undefined;
+    for (&handles, 0..) |*m, i| {
+        m.* = try client.acquire();
+        try m.setTopic("events");
+        m.setPartition(0);
+        const dst = m.value();
+        const payload = try std.fmt.bufPrint(dst, "msg-{d}", .{i});
+        try m.commit(@intCast(payload.len));
+    }
+    for (&handles) |*m| try m.await();
+
+    try testing.expectEqual(@as(u32, n), broker.produced.load(.acquire));
+
+    // Assert at least one batch was captured, and all carry the mock PID/epoch.
+    try testing.expect(broker.captured_batches_len > 0);
+    var expected_seq: i32 = 0;
+    for (broker.captured_batches[0..broker.captured_batches_len]) |b| {
+        try testing.expectEqual(mock.mock_producer_id, b.producer_id);
+        try testing.expectEqual(mock.mock_producer_epoch, b.producer_epoch);
+        // base_sequence should match expected_seq, then advance by record_count.
+        try testing.expectEqual(expected_seq, b.base_sequence);
+        try testing.expect(b.record_count > 0);
+        expected_seq += @intCast(b.record_count);
+    }
+    // The total records across all batches should equal n.
+    try testing.expectEqual(@as(i32, @intCast(n)), expected_seq);
+}
+
+test "idempotency ON: per-partition sequences are independent" {
+    // Produce messages to two different partitions in separate batches (by
+    // awaiting between groups). Each partition's base_sequence should start
+    // at 0 and advance independently.
+    var broker = try mock.Broker.start(testing.allocator, .{ .mode = .ok, .num_partitions = 2 });
+    defer broker.stop();
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var cfg = testConfig(&bootstrap);
+    cfg.enable_idempotency = true;
+    var client = try Client.init(testing.allocator, cfg);
+    defer client.deinit();
+
+    // First batch: 3 messages to partition 0.
+    var h1: [3]Message = undefined;
+    for (&h1, 0..) |*m, i| {
+        m.* = try client.acquire();
+        try m.setTopic("events");
+        m.setPartition(0);
+        const dst = m.value();
+        const payload = try std.fmt.bufPrint(dst, "a{d}", .{i});
+        try m.commit(@intCast(payload.len));
+    }
+    for (&h1) |*m| try m.await();
+
+    // Second batch: 2 messages to partition 1.
+    var h2: [2]Message = undefined;
+    for (&h2, 0..) |*m, i| {
+        m.* = try client.acquire();
+        try m.setTopic("events");
+        m.setPartition(1);
+        const dst = m.value();
+        const payload = try std.fmt.bufPrint(dst, "b{d}", .{i});
+        try m.commit(@intCast(payload.len));
+    }
+    for (&h2) |*m| try m.await();
+
+    // Third batch: 2 more messages to partition 0.
+    var h3: [2]Message = undefined;
+    for (&h3, 0..) |*m, i| {
+        m.* = try client.acquire();
+        try m.setTopic("events");
+        m.setPartition(0);
+        const dst = m.value();
+        const payload = try std.fmt.bufPrint(dst, "c{d}", .{i});
+        try m.commit(@intCast(payload.len));
+    }
+    for (&h3) |*m| try m.await();
+
+    try testing.expectEqual(@as(u32, 7), broker.produced.load(.acquire));
+
+    // Collect per-partition base_sequences.
+    var p0_seqs: [16]i32 = undefined;
+    var p0_len: usize = 0;
+    var p1_seqs: [16]i32 = undefined;
+    var p1_len: usize = 0;
+    for (broker.captured_batches[0..broker.captured_batches_len]) |b| {
+        if (b.partition == 0) {
+            p0_seqs[p0_len] = b.base_sequence;
+            p0_len += 1;
+        } else if (b.partition == 1) {
+            p1_seqs[p1_len] = b.base_sequence;
+            p1_len += 1;
+        }
+    }
+
+    // Partition 0 had two batches: first with 3 records (seq 0), second with
+    // 2 records (seq 3). Partition 1 had one batch with 2 records (seq 0).
+    try testing.expect(p0_len >= 2);
+    try testing.expectEqual(@as(i32, 0), p0_seqs[0]);
+    try testing.expectEqual(@as(i32, 3), p0_seqs[1]);
+
+    try testing.expect(p1_len >= 1);
+    try testing.expectEqual(@as(i32, 0), p1_seqs[0]);
+}
+
+test "idempotency ON: retry reuses the same base_sequence" {
+    // With retriable_once mode, the first Produce per partition fails with
+    // NOT_LEADER_OR_FOLLOWER. The retry must REUSE the same base_sequence
+    // (not re-advance), so the broker dedup window is preserved.
+    var broker = try mock.Broker.start(testing.allocator, .{
+        .mode = .retriable_once,
+        .num_partitions = 1,
+    });
+    defer broker.stop();
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var cfg = testConfig(&bootstrap);
+    cfg.enable_idempotency = true;
+    var client = try Client.init(testing.allocator, cfg);
+    defer client.deinit();
+
+    const n = 3;
+    var handles: [n]Message = undefined;
+    for (&handles, 0..) |*m, i| {
+        m.* = try client.acquire();
+        try m.setTopic("events");
+        m.setPartition(0);
+        const dst = m.value();
+        const payload = try std.fmt.bufPrint(dst, "r{d}", .{i});
+        try m.commit(@intCast(payload.len));
+    }
+    for (&handles) |*m| try m.await();
+
+    try testing.expectEqual(@as(u32, n), broker.produced.load(.acquire));
+
+    // The broker should have captured at least 2 batches for partition 0:
+    // the first (failed) and the retry (succeeded). Both must have the SAME
+    // base_sequence (0), because retry reuses the assigned sequence.
+    try testing.expect(broker.captured_batches_len >= 2);
+    const first = broker.captured_batches[0];
+    const retry = broker.captured_batches[1];
+    try testing.expectEqual(@as(i32, 0), first.partition);
+    try testing.expectEqual(@as(i32, 0), retry.partition);
+    try testing.expectEqual(first.base_sequence, retry.base_sequence);
+    try testing.expectEqual(first.record_count, retry.record_count);
+    try testing.expectEqual(mock.mock_producer_id, first.producer_id);
+    try testing.expectEqual(mock.mock_producer_id, retry.producer_id);
+}
+
+test "idempotency OFF: batches carry -1 sentinels, no PID" {
+    // Non-idempotent mode regression: producer_id=-1, producer_epoch=-1,
+    // base_sequence=-1. No InitProducerId is sent.
+    var broker = try mock.Broker.start(testing.allocator, .{ .mode = .ok, .num_partitions = 1 });
+    defer broker.stop();
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var cfg = testConfig(&bootstrap);
+    cfg.enable_idempotency = false;
+    var client = try Client.init(testing.allocator, cfg);
+    defer client.deinit();
+
+    var m = try client.acquire();
+    try m.setTopic("events");
+    m.setPartition(0);
+    const dst = m.value();
+    @memcpy(dst[0..4], "test");
+    try m.commit(4);
+    try m.await();
+
+    try testing.expectEqual(@as(u32, 1), broker.produced.load(.acquire));
+    try testing.expect(broker.captured_batches_len >= 1);
+    const b = broker.captured_batches[0];
+    try testing.expectEqual(@as(i64, -1), b.producer_id);
+    try testing.expectEqual(@as(i16, -1), b.producer_epoch);
+    try testing.expectEqual(@as(i32, -1), b.base_sequence);
 }

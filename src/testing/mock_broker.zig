@@ -32,6 +32,7 @@ pub const server_name = "ztls.server.test";
 
 const topic_name = "events";
 const max_partitions = 64;
+const max_captured_batches = 256;
 const max_tls_plaintext = 1 << 14;
 
 pub const Mode = enum {
@@ -42,6 +43,15 @@ pub const Mode = enum {
     retriable_once,
     /// Return INVALID_RECORD (87) for every Produce (non-retriable).
     fatal,
+};
+
+/// A captured record-batch from a Produce request, for idempotency assertions.
+pub const CapturedBatch = struct {
+    producer_id: i64,
+    producer_epoch: i16,
+    base_sequence: i32,
+    record_count: u32,
+    partition: i32,
 };
 
 pub const Options = struct {
@@ -65,6 +75,17 @@ pub const Broker = struct {
     /// Per-partition "already injected a retriable error" flags (mock thread
     /// only; no synchronization needed).
     injected: [max_partitions]bool = @splat(false),
+    /// Captured record batches from Produce requests, for idempotency tests.
+    /// Written by the mock thread, read by the test after `stop()` (the join
+    /// provides the memory fence). Cap at a generous bound for test use.
+    captured_batches: [max_captured_batches]CapturedBatch = @splat(.{
+        .producer_id = 0,
+        .producer_epoch = 0,
+        .base_sequence = 0,
+        .record_count = 0,
+        .partition = 0,
+    }),
+    captured_batches_len: u32 = 0,
     /// Set by `stop()` to signal the run loop to exit after the next accept.
     shutdown: std.atomic.Value(bool) = .init(false),
 
@@ -204,6 +225,7 @@ const Session = struct {
             .sasl_authenticate => try self.sendSaslAuthenticate(correlation_id, req_body, st),
             .metadata => try self.sendMetadata(correlation_id),
             .produce => try self.sendProduce(correlation_id, req_body),
+            .init_producer_id => try self.sendInitProducerId(correlation_id),
             else => return error.UnexpectedApiKey,
         }
     }
@@ -300,6 +322,20 @@ const Session = struct {
         try self.respond(correlation_id, 1, w.buffered());
     }
 
+    fn sendInitProducerId(self: *Session, correlation_id: i32) !void {
+        // InitProducerId v4 response: throttle_time_ms INT32, error_code INT16,
+        // producer_id INT64, producer_epoch INT16, TAG_BUFFER. Header v1.
+        // Assign a fixed PID/epoch for test determinism.
+        var body: [32]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&body);
+        try primitives.writeI32(&w, 0); // throttle_time_ms = 0
+        try primitives.writeI16(&w, 0); // error_code = 0
+        try primitives.writeI64(&w, mock_producer_id); // producer_id
+        try primitives.writeI16(&w, mock_producer_epoch); // producer_epoch
+        try primitives.writeEmptyTagBuffer(&w);
+        try self.respond(correlation_id, 1, w.buffered());
+    }
+
     fn sendProduce(self: *Session, correlation_id: i32, req_body: []const u8) !void {
         var r: Reader = .init(req_body);
         _ = try primitives.readNullableCompactString(&r); // transactional_id
@@ -326,6 +362,26 @@ const Session = struct {
                 const record_count = recordsCount(records);
                 const err = self.produceError(index);
                 if (err == 0) _ = self.broker.produced.fetchAdd(record_count, .acq_rel);
+
+                // Capture the batch metadata for idempotency assertions.
+                // The record-batch v2 fields are at fixed offsets (see
+                // record_batch.zig layout):
+                //   producerId: i64 at offset 43
+                //   producerEpoch: i16 at offset 51
+                //   baseSequence: i32 at offset 53
+                if (records.len >= 57 and self.broker.captured_batches_len < max_captured_batches) {
+                    const producer_id = std.mem.readInt(i64, records[43..][0..8], .big);
+                    const producer_epoch = std.mem.readInt(i16, records[51..][0..2], .big);
+                    const base_sequence = std.mem.readInt(i32, records[53..][0..4], .big);
+                    self.broker.captured_batches[self.broker.captured_batches_len] = .{
+                        .producer_id = producer_id,
+                        .producer_epoch = producer_epoch,
+                        .base_sequence = base_sequence,
+                        .record_count = record_count,
+                        .partition = index,
+                    };
+                    self.broker.captured_batches_len += 1;
+                }
 
                 pr_scratch[pr_len] = .{
                     .index = index,
@@ -478,6 +534,11 @@ const ScramState = struct {
 
 const mock_salt = "kafka-zig-salt00"; // 16 bytes, fixed for determinism
 const mock_iterations: u32 = 4096;
+
+/// Fixed PID/epoch assigned by the mock broker's InitProducerId response,
+/// for test assertions.
+pub const mock_producer_id: i64 = 7000;
+pub const mock_producer_epoch: i16 = 1;
 
 /// Read the v2 record batch `recordsCount` field (offset 57). Returns 0 for a
 /// truncated / empty batch.
