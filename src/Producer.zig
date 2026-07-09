@@ -85,10 +85,12 @@ pub const Options = struct {
     max_batch_bytes: u32,
     max_message_size: u32,
     strategy: partitioner.Strategy,
-    /// Record-batch compression applied to every batch. `.gzip` and `.lz4`
-    /// are always available (pure-Zig, no build flag). `.zstd` requires the
-    /// library to be built with `-Dzstd=true`; requesting it without that is
-    /// rejected at `Client.init` with `error.CompressionUnavailable`.
+    /// Record-batch compression applied to every batch. `.snappy` is always
+    /// available (pure-Zig, no build flag). `.zstd` requires the library to be
+    /// built with `-Dzstd=true`; requesting it without that is rejected at
+    /// `Client.init` with `error.CompressionUnavailable`. `.gzip` and `.lz4`
+    /// are wire-format constants but are rejected at `Client.init` with
+    /// `error.CompressionNotImplemented`.
     compression: record_batch.Compression = .none,
     /// Max in-place retries before a slot is failed with its last error code.
     max_retries: u8 = 8,
@@ -811,6 +813,7 @@ fn sendLeader(self: *Producer, leader: i32, slots: []const Collected) !bool {
     var group_len: usize = 0;
     var encode_off: usize = 0;
     var stopped_at_capacity = false;
+    var terminal_progress = false;
 
     var k: usize = 0;
     while (k < slots.len) {
@@ -895,70 +898,88 @@ fn sendLeader(self: *Producer, leader: i32, slots: []const Collected) !bool {
             const pid: i64 = if (base_seq != -1) self.producer_id else -1;
             const epoch: i16 = if (base_seq != -1) self.producer_epoch else -1;
 
-            const batch = record_batch.encodeBatch(
-                self.encode_buf[encode_off..],
-                self.records_scratch[0..rc],
-                .{
-                    .base_timestamp = now_ms,
-                    .compression = self.options.compression,
-                    .scratch = self.compress_scratch,
-                    .producer_id = pid,
-                    .producer_epoch = epoch,
-                    .base_sequence = base_seq,
-                },
-            ) catch |err| switch (err) {
-                // The batch doesn't fit in the remaining encode buffer. If
-                // nothing has been built yet for this leader's request, the
-                // single batch is too large — fail those slots as
-                // MESSAGE_TOO_LARGE. Otherwise, leave the rest pending. The
-                // sequence counter was only peeked (not committed), so a
-                // failed batch burns no sequence numbers.
-                error.BufferTooSmall => {
-                    if (pd_len == pd_start and td_len == 0 and encode_off == 0) {
-                        self.failSlots(slots[p..s_end], 10); // MESSAGE_TOO_LARGE
-                        p = p_end;
+            const batch_options: record_batch.EncodeOptions = .{
+                .base_timestamp = now_ms,
+                .compression = self.options.compression,
+                .scratch = self.compress_scratch,
+                .producer_id = pid,
+                .producer_epoch = epoch,
+                .base_sequence = base_seq,
+            };
+
+            var batch: []u8 = undefined;
+            var consumed_end = s_end;
+            if (enable_idem and seq_id != -1) {
+                batch = record_batch.encodeBatch(
+                    self.encode_buf[encode_off..],
+                    self.records_scratch[0..rc],
+                    batch_options,
+                ) catch |err| switch (err) {
+                    error.BufferTooSmall => {
+                        stopped_at_capacity = true;
+                        break;
+                    },
+                    else => return err,
+                };
+                if (batch.len > max_batch or encode_off + batch.len > max_batch) {
+                    stopped_at_capacity = true;
+                    break;
+                }
+            } else {
+                const batch_budget = @min(
+                    @as(usize, max_batch) - encode_off,
+                    self.encode_buf.len - encode_off,
+                );
+                const bounded = record_batch.encodeBatchBounded(
+                    self.encode_buf[encode_off..],
+                    self.records_scratch[0..rc],
+                    batch_budget,
+                    batch_options,
+                ) catch |err| switch (err) {
+                    // The batch doesn't fit in the remaining encode buffer. If
+                    // nothing has been built yet for this leader's request,
+                    // fail the first slot as MESSAGE_TOO_LARGE. Otherwise,
+                    // leave the rest pending. The sequence counter was only
+                    // peeked (not committed), so a failed batch burns no
+                    // sequence numbers.
+                    error.BufferTooSmall => {
+                        if (pd_len == pd_start and td_len == 0 and encode_off == 0) {
+                            self.failSlots(slots[p .. p + 1], 10); // MESSAGE_TOO_LARGE
+                            terminal_progress = true;
+                            p += 1;
+                            continue;
+                        }
+                        stopped_at_capacity = true;
+                        break;
+                    },
+                    else => return err,
+                };
+
+                if (bounded.consumed == 0) {
+                    if (encode_off == 0 and pd_len == pd_start and td_len == 0) {
+                        self.failSlots(slots[p .. p + 1], 10); // MESSAGE_TOO_LARGE
+                        terminal_progress = true;
+                        p += 1;
                         continue;
                     }
                     stopped_at_capacity = true;
                     break;
-                },
-                else => return err,
-            };
-
-            // Refuse to exceed max_batch_bytes. Two cases:
-            //
-            // 1. The batch alone exceeds the cap (batch.len > max_batch). If
-            //    nothing has been built for this leader's request yet, fail the
-            //    slots as MESSAGE_TOO_LARGE (10) and continue — a single
-            //    oversized message should not block the whole drain. If
-            //    something is already built, stop and leave it pending for the
-            //    next drain (which starts with a fresh encode buffer, so it'll
-            //    either fit or fail then). Again, no sequence was committed.
-            // 2. Normal overflow: this batch would push the total past the cap.
-            //    Stop adding and leave the remaining slots pending for the next
-            //    drain. No `pd_len > pd_start` guard — a later topic's first
-            //    partition must also respect the cap.
-            if (batch.len > max_batch) {
-                if (encode_off == 0 and pd_len == pd_start and td_len == 0) {
-                    self.failSlots(slots[p..s_end], 10); // MESSAGE_TOO_LARGE
-                    p = p_end;
-                    continue;
                 }
-                stopped_at_capacity = true;
-                break;
+
+                batch = bounded.bytes;
+                consumed_end = p + bounded.consumed;
+                assert(consumed_end <= s_end);
+                assert(encode_off + batch.len <= max_batch);
             }
-            if (encode_off + batch.len > max_batch) {
-                stopped_at_capacity = true;
-                break;
-            }
+            assert(findGroup(self.group_scratch[0..group_len], topic, part) == null);
 
             // --- COMMIT: every size gate passed ---
             // Only now advance the per-partition sequence and stamp the fresh
             // slots, so an in-place retry reuses this exact base_sequence and a
             // never-committed batch leaves the counter untouched (Fix 1).
             if (commit_fresh_seq) {
-                self.commitSequence(topic, part, base_seq, @intCast(rc));
-                for (slots[p..s_end]) |c| self.ring.setSlotBaseSequence(c.pos, base_seq);
+                self.commitSequence(topic, part, base_seq, @intCast(consumed_end - p));
+                for (slots[p..consumed_end]) |c| self.ring.setSlotBaseSequence(c.pos, base_seq);
             }
 
             encode_off += batch.len;
@@ -968,10 +989,15 @@ fn sendLeader(self: *Producer, leader: i32, slots: []const Collected) !bool {
                 .topic = topic,
                 .partition = part,
                 .start = p,
-                .end = s_end,
+                .end = consumed_end,
             };
             pd_len += 1;
             group_len += 1;
+            p = consumed_end;
+            if (p < s_end) {
+                stopped_at_capacity = true;
+                break;
+            }
             // Skip the rest of this partition run — remaining base_sequence
             // sub-runs (if any) are deferred to a later drain.
             p = p_end;
@@ -992,10 +1018,7 @@ fn sendLeader(self: *Producer, leader: i32, slots: []const Collected) !bool {
         // Nothing to send: either all slots were failed as MESSAGE_TOO_LARGE
         // (terminal progress), or we stopped at capacity with nothing built
         // (no progress — slots are still pending for the next drain).
-        // If any failSlots ran, group_len is 0 but those slots are terminal;
-        // track that with a simple heuristic: if we didn't stop at capacity,
-        // the only way td_len==0 is if slots were failed.
-        return !stopped_at_capacity;
+        return terminal_progress;
     }
 
     const conn = try self.leaderConnection(leader);
@@ -1721,4 +1744,128 @@ fn commitSequence(self: *Producer, topic: []const u8, partition: i32, base: i32,
     const key = seqKey(topic, partition);
     const gop = self.sequences.getOrPut(self.allocator, key) catch return;
     gop.value_ptr.* = base + count;
+}
+
+const testing = std.testing;
+const mock = @import("testing/mock_broker.zig");
+
+test "single-partition backlog above max_batch_bytes splits across drains" {
+    var broker = try mock.Broker.start(testing.allocator, .{ .mode = .ok, .num_partitions = 1 });
+    defer broker.stop();
+
+    var ring = try Ring.init(testing.allocator, .{
+        .max_message_size = 1024,
+        .max_key_len = 64,
+        .max_topic_len = 64,
+        .num_slots = 16,
+    });
+    defer ring.deinit(testing.allocator);
+
+    var msgs: [4]Ring.Message = undefined;
+    for (&msgs) |*m| {
+        m.* = try ring.acquire();
+        try m.setTopic("events");
+        m.setPartition(0);
+        @memset(m.value()[0..200], 'x');
+        try m.commit(200);
+    }
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var producer = try Producer.init(testing.allocator, &ring, .{
+        .bootstrap = &bootstrap,
+        .sni = mock.server_name,
+        .ca_bundle = null,
+        .insecure_skip_verify = true,
+        .scram = .{
+            .mechanism = .scram_sha512,
+            .username = mock.username,
+            .password = mock.password,
+        },
+        .client_id = "kafka-zig-test",
+        .acks = 1,
+        .timeout_ms = 1000,
+        .max_batch_bytes = 300,
+        .max_message_size = 1024,
+        .strategy = .default,
+    });
+    defer producer.deinit();
+
+    var failed: [msgs.len]?u32 = @splat(null);
+    var done: [msgs.len]bool = @splat(false);
+    var completed: usize = 0;
+    var drains: usize = 0;
+    while (completed < msgs.len and drains < 32) : (drains += 1) {
+        _ = try producer.drainOnce();
+        for (&msgs, 0..) |*m, i| {
+            if (done[i]) continue;
+            m.tryAwait() catch |err| switch (err) {
+                error.WouldBlock => continue,
+                error.SendFailed => {
+                    failed[i] = m.failureCode();
+                    done[i] = true;
+                    completed += 1;
+                    continue;
+                },
+                else => return err,
+            };
+            done[i] = true;
+            completed += 1;
+        }
+    }
+
+    try testing.expectEqual(@as(usize, msgs.len), completed);
+    for (failed) |code| try testing.expectEqual(@as(?u32, null), code);
+    try testing.expectEqual(@as(u32, msgs.len), broker.produced.load(.acquire));
+    try testing.expect(broker.max_produce_records_bytes.load(.acquire) <= 300);
+}
+
+test "stamped retry sub-run above max_batch_bytes is not split" {
+    var broker = try mock.Broker.start(testing.allocator, .{ .mode = .ok, .num_partitions = 1 });
+    defer broker.stop();
+
+    var ring = try Ring.init(testing.allocator, .{
+        .max_message_size = 1024,
+        .max_key_len = 64,
+        .max_topic_len = 64,
+        .num_slots = 16,
+    });
+    defer ring.deinit(testing.allocator);
+
+    var msgs: [3]Ring.Message = undefined;
+    for (&msgs) |*m| {
+        m.* = try ring.acquire();
+        try m.setTopic("events");
+        m.setPartition(0);
+        @memset(m.value()[0..200], 'x');
+        try m.commit(200);
+        ring.setSlotBaseSequence(m.slot_index, 100);
+    }
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var producer = try Producer.init(testing.allocator, &ring, .{
+        .bootstrap = &bootstrap,
+        .sni = mock.server_name,
+        .ca_bundle = null,
+        .insecure_skip_verify = true,
+        .scram = .{
+            .mechanism = .scram_sha512,
+            .username = mock.username,
+            .password = mock.password,
+        },
+        .client_id = "kafka-zig-test",
+        .acks = 1,
+        .timeout_ms = 1000,
+        .max_batch_bytes = 300,
+        .max_message_size = 1024,
+        .strategy = .default,
+    });
+    defer producer.deinit();
+    producer.producer_id = mock.mock_producer_id;
+    producer.producer_epoch = mock.mock_producer_epoch;
+    producer.pid_acquired = true;
+
+    try testing.expect(!try producer.drainOnce());
+    try testing.expectEqual(@as(u32, 0), broker.produce_requests.load(.acquire));
+    try testing.expectEqual(@as(u32, 0), broker.produced.load(.acquire));
+    for (&msgs) |*m| try testing.expectError(error.WouldBlock, m.tryAwait());
 }

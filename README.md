@@ -130,8 +130,8 @@ Optional variables:
 
 - `MSK_TOPIC` — topic name (default: `msk-e2e`)
 - `MSK_NUM` — number of messages (default: `50`)
-- `MSK_COMPRESSION` — `none`|`zstd`|`snappy`|`gzip`|`lz4` (default: `none`;
-  `zstd` requires a build with `-Dzstd=true`)
+- `MSK_COMPRESSION` — `none`|`snappy`|`zstd` (default: `none`; `zstd`
+  requires a build with `-Dzstd=true`)
 
 The recipe produces N messages through kafka-zig (TLS 1.3 + SCRAM-SHA-512),
 then consumes them back with `kafka-console-consumer.sh` and asserts the count
