@@ -1,4 +1,4 @@
-//! kafka-zig — native Zig Kafka producer. Pre-alpha.
+//! kafka-zig — native Zig Kafka producer. Early release.
 const std = @import("std");
 
 pub const version = "0.0.0";

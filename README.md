@@ -1,6 +1,7 @@
 # kafka-zig
 
-A native Zig Kafka **producer** library. Pre-alpha — the API will move.
+A native Zig Kafka **producer** library. Early release — the API is
+stabilizing but not yet frozen.
 
 Targets modern Kafka 3.x / AWS MSK. TLS 1.3 via
 [ztls](https://github.com/mattrobenolt/ztls). SASL SCRAM-SHA-512 over TLS
@@ -10,15 +11,25 @@ protocol, no heap allocation on the encode/decode hot path.
 
 ## Status
 
+**Early release.** The producer is feature-complete for its target use
+case (modern Kafka 3.x / AWS MSK, TLS 1.3, SCRAM-SHA-512, idempotent
+delivery, snappy/zstd compression, HA across multiple bootstrap endpoints,
+batch splitting, graceful shutdown, pull-based metrics). It has been
+two-model consensus-reviewed at every phase and passes end-to-end against
+a real Kafka broker. However, it has not yet seen production traffic —
+treat the API as stabilizing, not frozen, and test against your own cluster
+before relying on it.
+
 What works: producing against modern Kafka / MSK with sticky (default) /
 key-hash / round-robin partitioning, TLS 1.3, SCRAM-SHA-512, plaintext,
 snappy, and zstd record batches, bounded in-flight backpressure, in-place
-retry on retriable errors, idempotent producer (PID/epoch/sequence), and
+retry on retriable errors, idempotent producer (PID/epoch/sequence),
+batch splitting under `max_batch_bytes`, graceful shutdown drain, and
 pull-based metrics.
 
-Not in scope: consumer, consumer groups, Fetch, transactions,
-gzip/lz4, Schema Registry, async I/O. See
-[`PLAN.md`](PLAN.md) for the full design and roadmap.
+Not in scope (yet): consumer, consumer groups, Fetch, transactions,
+gzip/lz4 (will link C libs, not hand-roll), Schema Registry, async I/O.
+See [`PLAN.md`](PLAN.md) for the full design and roadmap.
 
 ## Documentation
 
