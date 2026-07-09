@@ -331,3 +331,59 @@ e2e-zstd: kafka-up
 
     echo "e2e-zstd: PASS — produced {{ e2e_msgs }} zstd, consumed $COUNT"
     just kafka-down
+
+# Real-Kafka e2e with snappy-compressed batches. Snappy is always available
+# (pure-Zig, no build flag), so this builds the default e2e binary and
+# produces with --compression snappy. Exercises the full snappy compression
+# path against a real broker (the unit/mock tests cover the codec; this
+# proves it interops with kafka-console-consumer's snappy decode).
+[doc("Run the snappy-compression e2e against a real Kafka broker")]
+[group("e2e")]
+e2e-snappy: kafka-up
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "$(git rev-parse --show-toplevel)"
+
+    echo "e2e-snappy: building..."
+    zig build e2e
+
+    # Create the snappy topic before producing.
+    printf '%s\n' \
+        'security.protocol=SASL_SSL' \
+        'sasl.mechanism=SCRAM-SHA-512' \
+        'sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="{{ scram_user }}" password="{{ scram_pass }}";' \
+        'ssl.truststore.type=PEM' \
+        'ssl.truststore.location={{ e2e_dir }}/rootCA.pem' \
+        'ssl.endpoint.identification.algorithm=' \
+        > {{ e2e_dir }}/consumer.properties
+    kafka-topics.sh --bootstrap-server localhost:{{ sasl_ssl_port }} \
+        --create --if-not-exists --topic {{ e2e_topic }}-snappy \
+        --partitions 4 --replication-factor 1 \
+        --command-config {{ e2e_dir }}/consumer.properties
+
+    echo "e2e-snappy: producing {{ e2e_msgs }} snappy-compressed messages via kafka-zig..."
+    zig-out/bin/e2e --broker localhost:{{ sasl_ssl_port }} \
+        --ca {{ e2e_dir }}/rootCA.pem \
+        --user {{ scram_user }} --pass {{ scram_pass }} \
+        --topic {{ e2e_topic }}-snappy --num {{ e2e_msgs }} --compression snappy
+
+    echo "e2e-snappy: consuming {{ e2e_msgs }} messages via kafka-console-consumer..."
+    OUTPUT="$(kafka-console-consumer.sh \
+        --bootstrap-server localhost:{{ sasl_ssl_port }} \
+        --topic {{ e2e_topic }}-snappy \
+        --from-beginning \
+        --max-messages {{ e2e_msgs }} \
+        --command-config {{ e2e_dir }}/consumer.properties \
+        --timeout-ms 10000 2>&1)"
+    COUNT="$(echo "$OUTPUT" | grep -c '^msg-' || true)"
+    echo "$OUTPUT" | tail -5
+    echo "e2e-snappy: consumed $COUNT messages"
+
+    if [ "$COUNT" -ne "{{ e2e_msgs }}" ]; then
+        echo "e2e-snappy: FAIL — expected {{ e2e_msgs }}, got $COUNT"
+        just kafka-down
+        exit 1
+    fi
+
+    echo "e2e-snappy: PASS — produced {{ e2e_msgs }} snappy, consumed $COUNT"
+    just kafka-down

@@ -37,7 +37,8 @@ const build_options = @import("build_options");
 
 /// Record-batch compression for produced batches. `.zstd` requires building
 /// with `-Dzstd=true`; requesting it otherwise is rejected at `init` with
-/// `error.CompressionUnavailable`.
+/// `error.CompressionUnavailable`. `.snappy` is always available (pure-Zig,
+/// no build flag).
 pub const Compression = record_batch.Compression;
 
 const Client = @This();
@@ -121,6 +122,7 @@ pub const Config = struct {
     io_timeout_ms: u32 = 30_000,
     max_retries: u8 = 8,
     /// Record-batch compression. `.none` (default) sends plaintext batches;
+    /// `.snappy` compresses each batch (always available, pure-Zig);
     /// `.zstd` compresses each batch (requires `-Dzstd=true` at build time).
     compression: Compression = .none,
     /// When true (production default), the producer acquires a PID/epoch at

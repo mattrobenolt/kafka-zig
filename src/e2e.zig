@@ -86,10 +86,12 @@ pub fn main() !void {
         .acks = .all,
         .compression = if (std.mem.eql(u8, compression, "zstd"))
             .zstd
+        else if (std.mem.eql(u8, compression, "snappy"))
+            .snappy
         else if (std.mem.eql(u8, compression, "none"))
             .none
         else
-            fatal("--compression must be none|zstd, got: {s}", .{compression}),
+            fatal("--compression must be none|snappy|zstd, got: {s}", .{compression}),
         .linger_ms = 100,
         .max_message_size = 4 * 1024,
         .max_key_len = 64,
