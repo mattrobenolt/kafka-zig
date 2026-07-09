@@ -698,6 +698,114 @@ test "idempotency ON: retry reuses the same base_sequence" {
     try testing.expectEqual(mock.mock_producer_id, retry.producer_id);
 }
 
+test "idempotency ON: retry does not merge fresh records into the retried batch" {
+    // Fix 2 regression: a retriable batch (slots 0..2, base_sequence=0) fails;
+    // BEFORE the retry, fresh slots 3..4 are committed to the SAME partition.
+    // The retry must NOT absorb the fresh records — the retried batch stays
+    // (base_sequence=0, 3 records) and the fresh records get their own batch
+    // (base_sequence=3, 2 records). A merge would break broker dedup (the
+    // broker would see a different batch with an already-used base_sequence).
+    //
+    // `gate_first_produce` makes this deterministic: the broker blocks before
+    // responding to the first Produce, so the test can commit the fresh
+    // records while the producer is stuck awaiting the (failing) response,
+    // guaranteeing the retried and fresh slots are pending together on the
+    // next drain.
+    var broker = try mock.Broker.start(testing.allocator, .{
+        .mode = .retriable_once,
+        .num_partitions = 1,
+        .gate_first_produce = true,
+    });
+    defer broker.stop();
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var cfg = testConfig(&bootstrap);
+    cfg.enable_idempotency = true;
+    var client = try Client.init(testing.allocator, cfg);
+    defer client.deinit();
+
+    // Three records to partition 0 — do NOT await yet.
+    var h1: [3]Message = undefined;
+    for (&h1, 0..) |*m, i| {
+        m.* = try client.acquire();
+        try m.setTopic("events");
+        m.setPartition(0);
+        const dst = m.value();
+        const payload = try std.fmt.bufPrint(dst, "x{d}", .{i});
+        try m.commit(@intCast(payload.len));
+    }
+
+    // Wait until the producer has sent the first Produce (now blocked in the
+    // gate), then commit two MORE records to the same partition. They land in
+    // the ring while the producer is awaiting the failing response, so the
+    // next drain sees the retried h1 slots and the fresh h2 slots together.
+    broker.waitFirstProduce();
+    var h2: [2]Message = undefined;
+    for (&h2, 0..) |*m, i| {
+        m.* = try client.acquire();
+        try m.setTopic("events");
+        m.setPartition(0);
+        const dst = m.value();
+        const payload = try std.fmt.bufPrint(dst, "y{d}", .{i});
+        try m.commit(@intCast(payload.len));
+    }
+    // Release the gate: the first Produce fails (NOT_LEADER_OR_FOLLOWER), the
+    // h1 slots retry, and the h2 slots are fresh in the same drain.
+    broker.openGate();
+
+    for (&h1) |*m| try m.await();
+    for (&h2) |*m| try m.await();
+
+    try testing.expectEqual(@as(u32, 5), broker.produced.load(.acquire));
+
+    // Group captured batches by base_sequence. A retry re-sends a byte-
+    // identical batch, so every batch sharing a base_sequence MUST have the
+    // same record count — the merge bug produced a base_sequence=0 retry with
+    // a LARGER count than its first send. The distinct base_sequences must
+    // also tile [0, 5) exactly, proving the fresh records got their own
+    // sequence rather than being folded into the retried batch. (Assertions
+    // are robust to the producer batching h1 as one batch or, under a rare
+    // drain-timing split, several: the invariant holds either way.)
+    try testing.expect(broker.captured_batches_len >= 2);
+    var seqs: [8]i32 = undefined;
+    var counts: [8]u32 = undefined;
+    var distinct: usize = 0;
+    for (broker.captured_batches[0..broker.captured_batches_len]) |b| {
+        try testing.expectEqual(@as(i32, 0), b.partition);
+        try testing.expectEqual(mock.mock_producer_id, b.producer_id);
+        var found = false;
+        for (seqs[0..distinct], counts[0..distinct]) |s, c| {
+            if (s == b.base_sequence) {
+                try testing.expectEqual(c, b.record_count); // identical retry
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            seqs[distinct] = b.base_sequence;
+            counts[distinct] = b.record_count;
+            distinct += 1;
+        }
+    }
+    // At least two distinct sequences: the retried set and the fresh set. A
+    // single distinct sequence would mean everything merged into base_seq 0.
+    try testing.expect(distinct >= 2);
+    // Insertion-sort the distinct sequences ascending, then verify tiling.
+    for (1..distinct) |i| {
+        var j = i;
+        while (j > 0 and seqs[j - 1] > seqs[j]) : (j -= 1) {
+            std.mem.swap(i32, &seqs[j - 1], &seqs[j]);
+            std.mem.swap(u32, &counts[j - 1], &counts[j]);
+        }
+    }
+    var expected: i32 = 0;
+    for (seqs[0..distinct], counts[0..distinct]) |s, c| {
+        try testing.expectEqual(expected, s);
+        expected += @intCast(c);
+    }
+    try testing.expectEqual(@as(i32, 5), expected);
+}
+
 test "idempotency OFF: batches carry -1 sentinels, no PID" {
     // Non-idempotent mode regression: producer_id=-1, producer_epoch=-1,
     // base_sequence=-1. No InitProducerId is sent.

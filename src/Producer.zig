@@ -20,10 +20,13 @@
 //!   2. Ensure metadata is fresh (refresh if empty/invalidated).
 //!   3. Scan `[read_head, write_head)`, collect pending slots, assign a
 //!      partition to any left unassigned, resolve each slot's leader.
-//!   4. Sort collected slots by (leader, topic, partition); each contiguous
-//!      (topic, partition) run becomes exactly one v2 record batch (the broker
-//!      requires one batch per partition_data entry). Group batches per leader
-//!      into one Produce request.
+//!   4. Sort collected slots by (leader, topic, partition, ring position);
+//!      each contiguous (topic, partition) run becomes at most one v2 record
+//!      batch per drain (the broker requires one batch per partition_data
+//!      entry). A partition run is split by base_sequence identity so a retry
+//!      batch never merges in fresh records; only the first sub-run is sent
+//!      this drain, the rest stay pending. Group batches per leader into one
+//!      Produce request.
 //!   5. Send each leader's request, read the response, and per partition:
 //!      ack (error 0), retry-in-place (retriable), or fail (non-retriable).
 //!      Leadership errors additionally invalidate the metadata cache.
@@ -237,11 +240,15 @@ const Group = struct {
 
 /// Key for the per-(topic, partition) sequence map. Using a u64 hash of the
 /// topic name + partition avoids owning topic string copies in the map (the
-/// metadata cache's topic names can be freed on refresh). Hash collisions
-/// are catastrophic for sequence correctness, so we use a 64-bit hash with a
-/// good mixer (wyhash) — the collision probability across a realistic topic
-/// set (~thousands) is negligible. The alternative (owned string keys) adds
-/// cold-path allocation complexity for no real safety gain at this scale.
+/// metadata cache's topic names can be freed on refresh). A hash collision
+/// would be CATASTROPHIC for sequence correctness — two partitions sharing a
+/// counter would emit overlapping/gapped sequences and wedge both. We accept
+/// that risk only because it is genuinely negligible: with a good 64-bit
+/// mixer (wyhash) the birthday-bound collision probability across a realistic
+/// topic set (~10^4 (topic, partition) pairs) is ~10^-13. Owned string keys
+/// would remove the risk entirely at the cost of cold-path allocation; the
+/// probability is low enough that the hash is the pragmatic choice, but the
+/// tradeoff is a real (if remote) correctness gamble, not a free lunch.
 const SeqKey = u64;
 
 pub fn init(allocator: Allocator, ring: *Ring, options: Options) !Producer {
@@ -482,7 +489,15 @@ fn lessThan(_: void, a: Collected, b: Collected) bool {
     if (a.leader != b.leader) return a.leader < b.leader;
     const ord = std.mem.order(u8, a.topic, b.topic);
     if (ord != .eq) return ord == .lt;
-    return a.partition < b.partition;
+    if (a.partition != b.partition) return a.partition < b.partition;
+    // Tie-breaker: ring position. `std.sort.pdq` is NOT stable, so without
+    // this equal (leader, topic, partition) slots could be reordered
+    // arbitrarily between drains. Per-record offset deltas (and thus
+    // per-record sequence numbers) are assigned by slot order, so a
+    // non-deterministic order would make idempotent sequence assignment
+    // non-deterministic. Ordering by `pos` preserves commit order and makes
+    // the base_sequence sub-run split (see `sendLeader`) well-defined.
+    return a.pos < b.pos;
 }
 
 // ---------------------------------------------------------------------------
@@ -521,6 +536,29 @@ fn sendLeader(self: *Producer, leader: i32, slots: []const Collected) !bool {
             var p_end = p;
             while (p_end < t_end and slots[p_end].partition == part) p_end += 1;
 
+            // At most ONE record batch per (topic, partition) per request:
+            // Kafka requires exactly one batch per partition_data entry, and
+            // the response carries one partition_response per partition, so we
+            // never emit two partition_data entries for the same index.
+            //
+            // Within the partition run, split by base_sequence identity and
+            // take only the FIRST sub-run (Fix 2). Slots are ordered by ring
+            // position (see `lessThan`), so an already-sent batch's slots
+            // (base_sequence != -1, committed earlier → lower pos) form a
+            // contiguous leading sub-run and fresh slots (base_sequence == -1,
+            // committed later) form the trailing sub-run. Emitting only the
+            // first sub-run means:
+            //   - a retry batch stays byte-identical to its original send (it
+            //     never absorbs fresh records committed after it was sent), so
+            //     broker dedup by (PID, epoch, sequence) still works, and
+            //   - idempotent ordering holds (base_sequence N is acked before
+            //     N+k is ever sent).
+            // Remaining sub-runs stay pending and are sent on a later drain
+            // (re-collected from the ring each drain).
+            const seq_id = self.ring.slotBaseSequence(slots[p].pos);
+            var s_end = p;
+            while (s_end < p_end and self.ring.slotBaseSequence(slots[s_end].pos) == seq_id) s_end += 1;
+
             // If we've already hit the max_batch_bytes cap, stop adding batches
             // to this leader's request. Remaining slots stay pending and are
             // sent in the next drain.
@@ -529,9 +567,9 @@ fn sendLeader(self: *Producer, leader: i32, slots: []const Collected) !bool {
                 break;
             }
 
-            // One record batch for this (topic, partition) run.
+            // One record batch for this base_sequence sub-run [p, s_end).
             var rc: usize = 0;
-            for (slots[p..p_end], 0..) |c, idx| {
+            for (slots[p..s_end], 0..) |c, idx| {
                 const key = self.ring.slotKey(c.pos);
                 self.records_scratch[rc] = .{
                     .offset_delta = @intCast(idx),
@@ -543,24 +581,27 @@ fn sendLeader(self: *Producer, leader: i32, slots: []const Collected) !bool {
                 rc += 1;
             }
 
-            // --- idempotent sequence assignment ---
-            // On first send (slot.base_sequence == -1), assign the next
-            // per-partition sequence and store it on every slot in the batch.
-            // On in-place retry (slot.base_sequence != -1), REUSE the stored
-            // value — the broker dedupes by sequence, so re-advancing would
-            // break exactly-once. The sequence is per-batch: records get
-            // base_sequence + offsetDelta (0..N-1) as their per-record sequence.
-            const base_seq: i32 = blk: {
-                if (!self.options.enable_idempotency or !self.pid_acquired) break :blk -1;
-                const first_slot_seq = self.ring.slotBaseSequence(slots[p].pos);
-                if (first_slot_seq != -1) break :blk first_slot_seq; // retry: reuse
-                // First send: assign and advance the per-partition counter.
-                const seq = self.nextSequence(topic, part, @intCast(rc)) catch -1;
-                if (seq != -1) {
-                    for (slots[p..p_end]) |c| self.ring.setSlotBaseSequence(c.pos, seq);
+            // --- idempotent sequence: PEEK, do not advance yet (Fix 1) ---
+            // Fresh sub-run (seq_id == -1): peek the per-partition counter to
+            // obtain base_seq for encoding, but DON'T advance the counter or
+            // stamp the slots until the batch clears every size gate below.
+            // Otherwise a locally-failed oversized batch would burn sequence
+            // numbers and wedge the partition. Retry sub-run (seq_id != -1):
+            // reuse the stored base_sequence; the counter is never advanced on
+            // retry (the broker dedupes by sequence).
+            const enable_idem = self.options.enable_idempotency and self.pid_acquired;
+            var base_seq: i32 = -1;
+            var commit_fresh_seq = false;
+            if (enable_idem) {
+                if (seq_id != -1) {
+                    base_seq = seq_id; // retry: reuse the assigned sequence
+                } else if (self.peekSequence(topic, part)) |seq| {
+                    base_seq = seq; // fresh: peek now, advance only at commit
+                    commit_fresh_seq = true;
+                } else |_| {
+                    base_seq = -1; // sequence map OOM → non-idempotent fallback
                 }
-                break :blk seq;
-            };
+            }
 
             const pid: i64 = if (base_seq != -1) self.producer_id else -1;
             const epoch: i16 = if (base_seq != -1) self.producer_epoch else -1;
@@ -578,12 +619,14 @@ fn sendLeader(self: *Producer, leader: i32, slots: []const Collected) !bool {
                 },
             ) catch |err| switch (err) {
                 // The batch doesn't fit in the remaining encode buffer. If
-                // nothing has been built yet for this (topic, partition) run,
-                // the single batch is too large — fail those slots as
-                // MESSAGE_TOO_LARGE. Otherwise, leave the rest pending.
+                // nothing has been built yet for this leader's request, the
+                // single batch is too large — fail those slots as
+                // MESSAGE_TOO_LARGE. Otherwise, leave the rest pending. The
+                // sequence counter was only peeked (not committed), so a
+                // failed batch burns no sequence numbers.
                 error.BufferTooSmall => {
                     if (pd_len == pd_start and td_len == 0 and encode_off == 0) {
-                        self.failSlots(slots[p..p_end], 10); // MESSAGE_TOO_LARGE
+                        self.failSlots(slots[p..s_end], 10); // MESSAGE_TOO_LARGE
                         p = p_end;
                         continue;
                     }
@@ -601,14 +644,14 @@ fn sendLeader(self: *Producer, leader: i32, slots: []const Collected) !bool {
             //    oversized message should not block the whole drain. If
             //    something is already built, stop and leave it pending for the
             //    next drain (which starts with a fresh encode buffer, so it'll
-            //    either fit or fail then).
+            //    either fit or fail then). Again, no sequence was committed.
             // 2. Normal overflow: this batch would push the total past the cap.
             //    Stop adding and leave the remaining slots pending for the next
             //    drain. No `pd_len > pd_start` guard — a later topic's first
             //    partition must also respect the cap.
             if (batch.len > max_batch) {
                 if (encode_off == 0 and pd_len == pd_start and td_len == 0) {
-                    self.failSlots(slots[p..p_end], 10); // MESSAGE_TOO_LARGE
+                    self.failSlots(slots[p..s_end], 10); // MESSAGE_TOO_LARGE
                     p = p_end;
                     continue;
                 }
@@ -620,6 +663,15 @@ fn sendLeader(self: *Producer, leader: i32, slots: []const Collected) !bool {
                 break;
             }
 
+            // --- COMMIT: every size gate passed ---
+            // Only now advance the per-partition sequence and stamp the fresh
+            // slots, so an in-place retry reuses this exact base_sequence and a
+            // never-committed batch leaves the counter untouched (Fix 1).
+            if (commit_fresh_seq) {
+                self.commitSequence(topic, part, base_seq, @intCast(rc));
+                for (slots[p..s_end]) |c| self.ring.setSlotBaseSequence(c.pos, base_seq);
+            }
+
             encode_off += batch.len;
 
             self.partition_data_scratch[pd_len] = .{ .index = part, .records = batch };
@@ -627,10 +679,12 @@ fn sendLeader(self: *Producer, leader: i32, slots: []const Collected) !bool {
                 .topic = topic,
                 .partition = part,
                 .start = p,
-                .end = p_end,
+                .end = s_end,
             };
             pd_len += 1;
             group_len += 1;
+            // Skip the rest of this partition run — remaining base_sequence
+            // sub-runs (if any) are deferred to a later drain.
             p = p_end;
         }
 
@@ -1107,14 +1161,29 @@ fn seqKey(topic: []const u8, partition: i32) SeqKey {
     return h;
 }
 
-/// Get or create the next sequence number for a (topic, partition). Returns the
-/// current value and advances by `count`. Called ONLY on a first-send batch
-/// (not on retry — retry reuses the slot's stored base_sequence).
-fn nextSequence(self: *Producer, topic: []const u8, partition: i32, count: i32) !i32 {
+/// PEEK the next sequence number for a (topic, partition) WITHOUT advancing.
+/// Creates the entry (value 0) on first use. Called on a fresh (never-sent)
+/// batch to obtain the `base_sequence` for encoding; the counter is advanced
+/// separately by `commitSequence` at the batch commit point, AFTER every size
+/// gate has passed. Splitting peek from commit is what prevents a locally
+/// failed batch (BufferTooSmall / oversized → MESSAGE_TOO_LARGE) from burning
+/// sequence numbers: a burned sequence leaves the broker's expected sequence
+/// ahead of ours and wedges the partition with OUT_OF_ORDER_SEQUENCE for the
+/// life of the PID.
+fn peekSequence(self: *Producer, topic: []const u8, partition: i32) !i32 {
     const key = seqKey(topic, partition);
     const gop = try self.sequences.getOrPut(self.allocator, key);
     if (!gop.found_existing) gop.value_ptr.* = 0;
-    const base = gop.value_ptr.*;
+    return gop.value_ptr.*;
+}
+
+/// COMMIT: advance the per-(topic, partition) counter by `count` at the batch
+/// commit point. `base` must be the value just returned by `peekSequence` for
+/// the same (topic, partition) this drain. The entry always exists here
+/// (peekSequence created it and nothing removes entries), so the `getOrPut`
+/// cannot allocate — the `catch` is defensive and unreachable in practice.
+fn commitSequence(self: *Producer, topic: []const u8, partition: i32, base: i32, count: i32) void {
+    const key = seqKey(topic, partition);
+    const gop = self.sequences.getOrPut(self.allocator, key) catch return;
     gop.value_ptr.* = base + count;
-    return base;
 }

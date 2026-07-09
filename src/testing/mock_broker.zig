@@ -57,6 +57,13 @@ pub const CapturedBatch = struct {
 pub const Options = struct {
     mode: Mode = .ok,
     num_partitions: u32 = 4,
+    /// When true, the broker blocks before responding to the FIRST Produce it
+    /// receives, until `openGate()` is called. This is a deterministic hook
+    /// for the retry+fresh-merge test: while the producer is blocked awaiting
+    /// the first (failing) response, the test commits more records to the same
+    /// partition, guaranteeing they are pending together with the retried
+    /// slots on the next drain (exercising the base_sequence sub-run split).
+    gate_first_produce: bool = false,
 };
 
 pub const Broker = struct {
@@ -76,8 +83,14 @@ pub const Broker = struct {
     /// only; no synchronization needed).
     injected: [max_partitions]bool = @splat(false),
     /// Captured record batches from Produce requests, for idempotency tests.
-    /// Written by the mock thread, read by the test after `stop()` (the join
-    /// provides the memory fence). Cap at a generous bound for test use.
+    /// Written by the mock thread, read by the test on the main thread. The
+    /// reads are safe without an explicit fence: every assertion follows a
+    /// `Message.await()`, and await synchronizes-with the producer thread's
+    /// release of the ack (acquire load), which in turn happens-after the
+    /// producer read the broker's TLS response — so the captured writes on the
+    /// broker thread are visible by the time await returns. (The earlier
+    /// "reads happen after stop()" justification was wrong: assertions run
+    /// before `defer broker.stop()`.) Cap at a generous bound for test use.
     captured_batches: [max_captured_batches]CapturedBatch = @splat(.{
         .producer_id = 0,
         .producer_epoch = 0,
@@ -88,6 +101,11 @@ pub const Broker = struct {
     captured_batches_len: u32 = 0,
     /// Set by `stop()` to signal the run loop to exit after the next accept.
     shutdown: std.atomic.Value(bool) = .init(false),
+    /// Gate coordination for `gate_first_produce` (see Options). The broker
+    /// arms `first_produce_seen` on the first Produce and blocks until the
+    /// test calls `openGate()`.
+    first_produce_seen: std.atomic.Value(bool) = .init(false),
+    gate_open: std.atomic.Value(bool) = .init(false),
 
     pub fn start(allocator: Allocator, options: Options) !*Broker {
         std.debug.assert(options.num_partitions <= max_partitions);
@@ -118,6 +136,17 @@ pub const Broker = struct {
         self.thread.join();
         self.server.deinit();
         self.allocator.destroy(self);
+    }
+
+    /// Block until the broker has received (and gated on) the first Produce.
+    /// Only meaningful with `gate_first_produce = true`.
+    pub fn waitFirstProduce(self: *Broker) void {
+        while (!self.first_produce_seen.load(.acquire)) std.Thread.sleep(std.time.ns_per_ms);
+    }
+
+    /// Release the first-Produce gate so the broker can send its response.
+    pub fn openGate(self: *Broker) void {
+        self.gate_open.store(true, .release);
     }
 
     fn run(self: *Broker) void {
@@ -402,6 +431,14 @@ const Session = struct {
         // Track the max total records bytes in any single Produce request so
         // the max_batch_bytes test can assert no over-cap request arrived.
         _ = self.broker.max_produce_records_bytes.fetchMax(total_records_bytes, .acq_rel);
+
+        // Deterministic gate: block before responding to the FIRST Produce so
+        // the test can commit more records while the producer is stuck here.
+        if (self.broker.options.gate_first_produce and
+            self.broker.first_produce_seen.cmpxchgStrong(false, true, .acq_rel, .acquire) == null)
+        {
+            while (!self.broker.gate_open.load(.acquire)) std.Thread.sleep(std.time.ns_per_ms);
+        }
 
         var body: [16 * 1024]u8 = undefined;
         var w: std.Io.Writer = .fixed(&body);
