@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .ztls = .{
-            .url = "https://github.com/mattrobenolt/ztls/archive/2c01682339c9cbc1a941064b37b75c9887a906f2.tar.gz",
-            .hash = "ztls-0.0.0-SHHDXoq3EACxrBDu3znLIIAALRvXjl7-1Ex71TNJhH7P",
+            .url = "https://github.com/mattrobenolt/ztls/archive/049762b55ff9928f6c402e73c19c0f7a8542bbc0.tar.gz",
+            .hash = "ztls-0.0.0-SHHDXku_EQBjYICd6afwnQwg5zQVTK7Ed8PdAh76L_O5",
         },
         .benchmark = .{
             .url = "https://github.com/mattrobenolt/zig-benchmark/archive/6e7e9ab7ed8bd8147c491ac53a1d326633a5c47a.tar.gz",
