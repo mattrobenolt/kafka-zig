@@ -91,4 +91,20 @@ pub fn build(b: *Build) void {
     const scram_tests = b.addTest(.{ .root_module = scram_mod });
     const run_scram_tests = b.addRunArtifact(scram_tests);
     test_step.dependOn(&run_scram_tests.step);
+
+    // --- docs step: Zig autodoc for the public API (issue #8) ---
+    // `zig build docs` generates HTML API docs into zig-out/docs/. Uses
+    // addObject (no linking) + getEmittedDocs + addInstallDirectory, the
+    // standard 0.15 autodoc recipe (same pattern ztls uses).
+    const docs_obj = b.addObject(.{
+        .name = "kafka-docs",
+        .root_module = kafka_mod,
+    });
+    const docs_install = b.addInstallDirectory(.{
+        .source_dir = docs_obj.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    });
+    const docs_step = b.step("docs", "Generate Zig API docs (HTML) into zig-out/docs/");
+    docs_step.dependOn(&docs_install.step);
 }

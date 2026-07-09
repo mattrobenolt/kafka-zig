@@ -55,9 +55,15 @@ pin-actions:
 build:
     zig build
 
+[doc("Generate Zig API docs (HTML) into zig-out/docs/")]
+[group("build")]
+docs:
+    zig build docs
+    @echo "docs: generated into zig-out/docs/ (open zig-out/docs/index.html)"
+
 [doc("Run all CI gates")]
 [group("ci")]
-ci: test fmt-check test-zstd lint
+ci: test fmt-check test-zstd lint docs
 
 # ---------------------------------------------------------------------------
 # Phase 7 — real Kafka e2e (KRaft + SASL_SSL/SCRAM-SHA-512 over TLS)

@@ -10,13 +10,25 @@ protocol, no heap allocation on the encode/decode hot path.
 
 ## Status
 
-What works: producing against modern Kafka / MSK with round-robin and
-key-hash partitioning, TLS 1.3, SCRAM-SHA-512, plaintext and zstd record
-batches, bounded in-flight backpressure, in-place retry on retriable errors.
+What works: producing against modern Kafka / MSK with sticky (default) /
+key-hash / round-robin partitioning, TLS 1.3, SCRAM-SHA-512, plaintext,
+snappy, and zstd record batches, bounded in-flight backpressure, in-place
+retry on retriable errors, idempotent producer (PID/epoch/sequence), and
+pull-based metrics.
 
-Not in scope: consumer, consumer groups, Fetch, transactions, idempotent
-producer (PID/epoch), gzip/snappy/lz4, Schema Registry, async I/O. See
+Not in scope: consumer, consumer groups, Fetch, transactions,
+gzip/lz4, Schema Registry, async I/O. See
 [`PLAN.md`](PLAN.md) for the full design and roadmap.
+
+## Documentation
+
+- **[USAGE guide](docs/USAGE.md)** — the full public API, config reference,
+  error semantics, backpressure/lifetime contract, idempotent producer,
+  metrics, and graceful shutdown. Read this to start producing.
+- **API reference (autodoc)** — run `just docs` to generate HTML API docs
+  into `zig-out/docs/`; open `zig-out/docs/index.html`.
+- **[PLAN.md](PLAN.md)** — design document, phased acceptance ladder, and
+  open questions.
 
 ## Usage
 
@@ -70,6 +82,8 @@ just test        # run tests
 just test-zstd   # run tests with zstd compression (needs the devshell's static libzstd)
 just e2e         # start a local Kafka broker and run the end-to-end smoke (plaintext)
 just e2e-zstd    # same, with zstd-compressed batches
+just e2e-snappy  # same, with snappy-compressed batches
+just docs        # generate Zig API docs into zig-out/docs/
 just fmt-check   # check formatting
 just lint        # run ziglint (needs the devshell)
 ```
