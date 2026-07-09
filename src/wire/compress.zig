@@ -15,14 +15,13 @@
 //! Verified against kafka-python's snappy_encode(xerial_compatible=True) and
 //! xerial/snappy-java SnappyOutputStream.
 //!
-//! The underlying raw-block encoder is literal-only (no match-finding): it
-//! produces valid snappy blocks that any consumer can decompress, but the ratio
-//! is ~1:1. The raw-block decoder is full: it handles all tag types (literal +
-//! copy 1/2/4-byte offset), so it can decompress blocks produced by any snappy
-//! compressor (including the reference C++ snappy with full match-finding).
-//! `snappyDecompress` accepts both Xerial-framed input (detected via the magic
-//! header) and bare raw blocks (backward compat). Snappy is always available
-//! (no build flag, no C dep).
+//! The underlying raw-block codec lives in `src/snappy/` (its own module): a
+//! hash-table match-finder encoder (real back-references, not literal-only)
+//! and a SIMD-accelerated decoder that handles all tag types. The decoder
+//! accepts blocks produced by any snappy compressor, including the reference
+//! C++ snappy. `snappyDecompress` accepts both Xerial-framed input (detected
+//! via the magic header) and bare raw blocks (backward compat). Snappy is
+//! always available (no build flag, no C dep).
 //! Spec: https://github.com/google/snappy/blob/main/format_description.txt
 //!
 //! gzip (codec 1) uses the full gzip container format (RFC 1952) — NOT raw
@@ -75,6 +74,8 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const testing = std.testing;
+
+const snappy = @import("snappy");
 
 const build_options = @import("build_options");
 pub const zstd_enabled = build_options.zstd_enabled;
@@ -744,7 +745,7 @@ fn lz4BlockDecompress(input: []const u8, out: []u8) DecompressError!usize {
 }
 
 // ---------------------------------------------------------------------------
-// Snappy — Xerial-framed on the wire, pure-Zig raw-block codec underneath
+// Snappy — Xerial-framed on the wire, raw-block codec delegated to `snappy`
 //
 // Kafka's snappy codec (attribute 2) is Xerial-framed: a 16-byte header plus
 // blocks of (BE int32 compressed_size + a raw snappy block of a <=32KB chunk).
@@ -752,28 +753,11 @@ fn lz4BlockDecompress(input: []const u8, out: []u8) DecompressError!usize {
 // framed/streaming format with the "\xff\x06" magic — it is the org.xerial
 // SnappyOutputStream format the Kafka Java client speaks.
 //
-// The framing layer (snappyCompress / snappyDecompress / snappyCompressBound /
-// snappyDecompressedLen) wraps the raw-block primitives (snappyBlock*). The
-// raw-block format is a varint-encoded uncompressed length followed by a
-// sequence of tags, per the snappy spec.
-//
-// Spec: https://github.com/google/snappy/blob/main/format_description.txt
-//
-// The encoder is literal-only (no match-finding / back-references). It produces
-// valid snappy blocks that any snappy decoder (including the reference C++
-// snappy and Java's kafka-console-consumer) can decompress. The compression
-// ratio is ~1:1 (slightly worse due to tag overhead) — acceptable for v1
-// interop. A full compressor with match-finding can be added later without
-// changing the decoder or the wire format.
-//
-// The decoder is full: it handles all four tag types (literal + copy with
-// 1/2/4-byte offset), so it can decompress blocks produced by any snappy
-// compressor. This matters for the mock-broker round-trip and for future
-// consumer work where the broker may send snappy-compressed batches produced by
-// a full compressor.
-//
-// Zero heap allocation: both compress and decompress read `input` and write into
-// caller-provided `out` buffers, returning the byte count. No allocator.
+// This file holds only the framing layer (snappyCompress / snappyDecompress /
+// snappyCompressBound / snappyDecompressedLen). The raw-block codec — a
+// hash-table match-finder encoder and a SIMD-accelerated decoder — lives in
+// `src/snappy/` (imported as `snappy`), so it is reusable and testable in
+// isolation. Zero heap allocation throughout.
 // ---------------------------------------------------------------------------
 
 /// Xerial frame magic: `[0x82,'S','N','A','P','P','Y',0]` (0x82 == -126 as a
@@ -802,7 +786,7 @@ fn snappyCompressBound(input_len: usize) usize {
     var remaining = input_len;
     while (remaining > 0) {
         const chunk = @min(remaining, xerial_block_size);
-        bound += 4 + snappyBlockCompressBound(chunk);
+        bound += 4 + snappy.maxCompressedLength(chunk);
         remaining -= chunk;
     }
     return bound;
@@ -826,7 +810,7 @@ fn snappyCompress(input: []const u8, out: []u8) CompressError!usize {
         // then backfill the prefix with the block's compressed size.
         if (out_pos + 4 > out.len) return error.BufferTooSmall;
         const block_out = out[out_pos + 4 ..];
-        const block_len = try snappyBlockCompress(input[in_pos..][0..chunk], block_out);
+        const block_len = try snappy.compressBlock(input[in_pos..][0..chunk], block_out);
         assert(block_len <= 0xFFFFFFFF);
         std.mem.writeInt(u32, out[out_pos..][0..4], @intCast(block_len), .big);
         out_pos += 4 + block_len;
@@ -840,7 +824,7 @@ fn snappyCompress(input: []const u8, out: []u8) CompressError!usize {
 /// block). Bare raw block: the leading varint. `error.DecompressionFailed` on
 /// truncation/corruption. Cold path (broker responses).
 fn snappyDecompressedLen(input: []const u8) DecompressError!usize {
-    if (!isXerial(input)) return snappyBlockDecompressedLen(input);
+    if (!isXerial(input)) return snappy.decompressedBlockLen(input);
     var pos: usize = xerial_header.len;
     var total: usize = 0;
     while (pos < input.len) {
@@ -848,7 +832,7 @@ fn snappyDecompressedLen(input: []const u8) DecompressError!usize {
         const block_size = std.mem.readInt(u32, input[pos..][0..4], .big);
         pos += 4;
         if (pos + block_size > input.len) return error.DecompressionFailed;
-        total += try snappyBlockDecompressedLen(input[pos..][0..block_size]);
+        total += try snappy.decompressedBlockLen(input[pos..][0..block_size]);
         pos += block_size;
     }
     return total;
@@ -861,7 +845,7 @@ fn snappyDecompressedLen(input: []const u8) DecompressError!usize {
 /// `snappyDecompressedLen`); `error.DecompressionFailed` on corrupt input. Zero
 /// heap allocation.
 fn snappyDecompress(input: []const u8, out: []u8) DecompressError!usize {
-    if (!isXerial(input)) return snappyBlockDecompress(input, out);
+    if (!isXerial(input)) return snappy.decompressBlock(input, out);
     var in_pos: usize = xerial_header.len;
     var out_pos: usize = 0;
     while (in_pos < input.len) {
@@ -869,242 +853,9 @@ fn snappyDecompress(input: []const u8, out: []u8) DecompressError!usize {
         const block_size = std.mem.readInt(u32, input[in_pos..][0..4], .big);
         in_pos += 4;
         if (in_pos + block_size > input.len) return error.DecompressionFailed;
-        out_pos += try snappyBlockDecompress(input[in_pos..][0..block_size], out[out_pos..]);
+        out_pos += try snappy.decompressBlock(input[in_pos..][0..block_size], out[out_pos..]);
         in_pos += block_size;
     }
-    return out_pos;
-}
-
-/// Number of bytes to encode `value` as an unsigned LEB128 varint.
-fn uvarintSize(value: usize) usize {
-    if (value == 0) return 1;
-    var size: usize = 0;
-    var v = value;
-    while (v != 0) : (v >>= 7) size += 1;
-    return size;
-}
-
-/// Write `value` as an unsigned LEB128 varint into `out`, returning bytes
-/// written. `error.BufferTooSmall` when `out` is too small.
-fn writeUvarint(out: []u8, value: usize) CompressError!usize {
-    var v = value;
-    var pos: usize = 0;
-    while (v >= 0x80) {
-        if (pos >= out.len) return error.BufferTooSmall;
-        out[pos] = @as(u8, @truncate(v)) | 0x80;
-        pos += 1;
-        v >>= 7;
-    }
-    if (pos >= out.len) return error.BufferTooSmall;
-    out[pos] = @as(u8, @truncate(v));
-    return pos + 1;
-}
-
-/// Read an unsigned LEB128 varint from `input` at `pos`, advancing `pos`.
-/// Snappy stores the uncompressed length as a varint (max 5 bytes for u32).
-/// `error.DecompressionFailed` on truncation or overflow.
-fn readUvarint(input: []const u8, pos: *usize) DecompressError!usize {
-    var result: usize = 0;
-    var i: usize = 0;
-    while (i < 5) : (i += 1) {
-        if (pos.* >= input.len) return error.DecompressionFailed;
-        const byte = input[pos.*];
-        pos.* += 1;
-        result |= (@as(usize, byte & 0x7F)) << @intCast(i * 7);
-        if (byte & 0x80 == 0) return result;
-    }
-    return error.DecompressionFailed; // varint too long (> 5 bytes)
-}
-
-/// Worst-case compressed size for a literal-only snappy encoding of
-/// `input_len` bytes. The encoder uses the largest literal chunk that fits,
-/// but the worst case (max tag overhead) is one tag byte per 60-byte chunk
-/// (the smallest literal encoding). Plus the varint-encoded uncompressed
-/// length.
-fn snappyBlockCompressBound(input_len: usize) usize {
-    return uvarintSize(input_len) + input_len + (input_len + 59) / 60;
-}
-
-/// Compress `input` into `out` using the snappy block format (literal-only
-/// encoder). Returns bytes written. `error.BufferTooSmall` when `out` is too
-/// small — size it via `snappyBlockCompressBound`. Zero heap allocation.
-///
-/// Tag format for literals (type 00):
-///   length 1–60:   tag = (length - 1) << 2         (1 byte tag)
-///   length 61–256: tag = 0xF0, then (length - 1) as 1 byte  (2 bytes)
-///   length 257–65536: tag = 0xF4, then (length - 1) as 2 bytes LE  (3 bytes)
-///   length 65537–16M: tag = 0xF8, then (length - 1) as 3 bytes LE  (4 bytes)
-///   length > 16M:  tag = 0xFC, then (length - 1) as 4 bytes LE  (5 bytes)
-fn snappyBlockCompress(input: []const u8, out: []u8) CompressError!usize {
-    var out_pos: usize = 0;
-    out_pos += try writeUvarint(out[out_pos..], input.len);
-
-    var in_pos: usize = 0;
-    while (in_pos < input.len) {
-        const remaining = input.len - in_pos;
-
-        // Choose the largest literal chunk that fits in `remaining`, and write
-        // the tag header. The chunk sizes correspond to the tag encodings
-        // above (60 = 6-bit, 256 = 1-byte ext, 65536 = 2-byte ext, etc).
-        if (remaining <= 60) {
-            if (out_pos + 1 + remaining > out.len) return error.BufferTooSmall;
-            out[out_pos] = @as(u8, @intCast(remaining - 1)) << 2;
-            out_pos += 1;
-        } else if (remaining <= 256) {
-            if (out_pos + 2 + remaining > out.len) return error.BufferTooSmall;
-            out[out_pos] = 0xF0;
-            out[out_pos + 1] = @intCast(remaining - 1);
-            out_pos += 2;
-        } else if (remaining <= 65536) {
-            if (out_pos + 3 + remaining > out.len) return error.BufferTooSmall;
-            out[out_pos] = 0xF4;
-            const v: u16 = @intCast(remaining - 1);
-            out[out_pos + 1] = @truncate(v);
-            out[out_pos + 2] = @truncate(v >> 8);
-            out_pos += 3;
-        } else if (remaining <= 16777216) {
-            if (out_pos + 4 + remaining > out.len) return error.BufferTooSmall;
-            out[out_pos] = 0xF8;
-            const v: u32 = @intCast(remaining - 1);
-            out[out_pos + 1] = @truncate(v);
-            out[out_pos + 2] = @truncate(v >> 8);
-            out[out_pos + 3] = @truncate(v >> 16);
-            out_pos += 4;
-        } else {
-            // 4-byte extended literal, chunked at 2^32 - 1.
-            const chunk: usize = @min(remaining, 0xFFFFFFFF);
-            if (out_pos + 5 + chunk > out.len) return error.BufferTooSmall;
-            out[out_pos] = 0xFC;
-            const v: u32 = @intCast(chunk - 1);
-            out[out_pos + 1] = @truncate(v);
-            out[out_pos + 2] = @truncate(v >> 8);
-            out[out_pos + 3] = @truncate(v >> 16);
-            out[out_pos + 4] = @truncate(v >> 24);
-            out_pos += 5;
-            @memcpy(out[out_pos..][0..chunk], input[in_pos..][0..chunk]);
-            out_pos += chunk;
-            in_pos += chunk;
-            continue;
-        }
-
-        @memcpy(out[out_pos..][0..remaining], input[in_pos..][0..remaining]);
-        out_pos += remaining;
-        in_pos += remaining;
-    }
-
-    return out_pos;
-}
-
-/// Decompressed byte length of a snappy block (the varint at the start of
-/// `input`). `error.DecompressionFailed` if the varint is corrupt/truncated.
-fn snappyBlockDecompressedLen(input: []const u8) DecompressError!usize {
-    var pos: usize = 0;
-    return readUvarint(input, &pos);
-}
-
-/// Copy `length` bytes from `out[pos - offset .. pos - offset + length]` to
-/// `out[pos .. pos + length]`, handling overlap (like memmove). The byte-by-byte
-/// loop is correct for all overlap cases; the decoder is cold-path (mock
-/// broker / tests), so the simplicity is worth the non-vectorized copy.
-fn snappyCopy(out: []u8, pos: usize, offset: usize, length: usize) void {
-    assert(offset > 0);
-    assert(offset <= pos);
-    assert(pos + length <= out.len);
-    var i: usize = 0;
-    while (i < length) : (i += 1) {
-        out[pos + i] = out[pos - offset + i];
-    }
-}
-
-/// Decompress a snappy block from `input` into `out`, returning bytes written.
-/// `error.BufferTooSmall` when `out` is too small (size via
-/// `snappyBlockDecompressedLen`). `error.DecompressionFailed` on corrupt input.
-/// Zero heap allocation.
-///
-/// Handles all four tag types:
-///   00: literal (copy raw bytes from input to output)
-///   01: copy with 1-byte offset (3-bit length, 11-bit offset)
-///   10: copy with 2-byte offset (6-bit length, 16-bit offset LE)
-///   11: copy with 4-byte offset (6-bit length, 32-bit offset LE)
-fn snappyBlockDecompress(input: []const u8, out: []u8) DecompressError!usize {
-    var in_pos: usize = 0;
-    const uncomp_len = try readUvarint(input, &in_pos);
-    if (uncomp_len > out.len) return error.BufferTooSmall;
-
-    var out_pos: usize = 0;
-    while (in_pos < input.len) {
-        const tag = input[in_pos];
-        in_pos += 1;
-
-        switch (tag & 3) {
-            0 => {
-                // Literal: the 6-bit field (tag >> 2) encodes the length.
-                // Values 0–59 mean length = field + 1. Values 60–63 mean the
-                // length is in the next 1–4 bytes (LE), plus 1.
-                const code6: u8 = tag >> 2;
-                var length: usize = undefined;
-                if (code6 < 60) {
-                    length = @as(usize, code6) + 1;
-                } else {
-                    const extra: usize = @as(usize, code6) - 59; // 60→1, 61→2, 62→3, 63→4
-                    if (in_pos + extra > input.len) return error.DecompressionFailed;
-                    length = 1;
-                    var i: usize = 0;
-                    while (i < extra) : (i += 1) {
-                        length += @as(usize, input[in_pos + i]) << @intCast(i * 8);
-                    }
-                    in_pos += extra;
-                }
-                if (in_pos + length > input.len) return error.DecompressionFailed;
-                if (out_pos + length > uncomp_len) return error.DecompressionFailed;
-                @memcpy(out[out_pos..][0..length], input[in_pos..][0..length]);
-                in_pos += length;
-                out_pos += length;
-            },
-            1 => {
-                // Copy with 1-byte offset: bits 2–4 = length - 4, bits 5–7 =
-                // upper 3 bits of offset, next byte = lower 8 bits.
-                const length: usize = @as(usize, (tag >> 2) & 0x07) + 4;
-                if (in_pos >= input.len) return error.DecompressionFailed;
-                const offset: usize = (@as(usize, tag >> 5) << 8) | @as(usize, input[in_pos]);
-                in_pos += 1;
-                if (offset == 0 or offset > out_pos) return error.DecompressionFailed;
-                if (out_pos + length > uncomp_len) return error.DecompressionFailed;
-                snappyCopy(out, out_pos, offset, length);
-                out_pos += length;
-            },
-            2 => {
-                // Copy with 2-byte offset: bits 2–7 = length - 1, next 2 bytes
-                // LE = offset.
-                const length: usize = @as(usize, tag >> 2) + 1;
-                if (in_pos + 1 >= input.len) return error.DecompressionFailed;
-                const offset: usize = @as(usize, input[in_pos]) | (@as(usize, input[in_pos + 1]) << 8);
-                in_pos += 2;
-                if (offset == 0 or offset > out_pos) return error.DecompressionFailed;
-                if (out_pos + length > uncomp_len) return error.DecompressionFailed;
-                snappyCopy(out, out_pos, offset, length);
-                out_pos += length;
-            },
-            3 => {
-                // Copy with 4-byte offset: bits 2–7 = length - 1, next 4 bytes
-                // LE = offset.
-                const length: usize = @as(usize, tag >> 2) + 1;
-                if (in_pos + 3 >= input.len) return error.DecompressionFailed;
-                const offset: usize = @as(usize, input[in_pos]) |
-                    (@as(usize, input[in_pos + 1]) << 8) |
-                    (@as(usize, input[in_pos + 2]) << 16) |
-                    (@as(usize, input[in_pos + 3]) << 24);
-                in_pos += 4;
-                if (offset == 0 or offset > out_pos) return error.DecompressionFailed;
-                if (out_pos + length > uncomp_len) return error.DecompressionFailed;
-                snappyCopy(out, out_pos, offset, length);
-                out_pos += length;
-            },
-            else => unreachable,
-        }
-    }
-
-    if (out_pos != uncomp_len) return error.DecompressionFailed;
     return out_pos;
 }
 
@@ -1546,6 +1297,25 @@ test "snappy: small input round-trips" {
 
     var back: [64]u8 = undefined;
     const blen = try decompress(.snappy, comp[0..clen], &back);
+    try testing.expectEqualSlices(u8, input, back[0..blen]);
+}
+
+test "snappy: compressible input shrinks via match-finding" {
+    // Repetitive input >= min_non_literal_block_size exercises the match
+    // finder (the small-input tests above all bail to a single literal).
+    const input = "the quick brown fox" ** 400; // 7600 bytes, crosses one 32KB? no, one block
+    const bound = compressBound(.snappy, input.len);
+    const comp = try testing.allocator.alloc(u8, bound);
+    defer testing.allocator.free(comp);
+    const clen = try compress(.snappy, input, comp, 0);
+    try testing.expect(clen < input.len / 2);
+    try testing.expectEqualSlices(u8, &xerial_magic, comp[0..8]);
+
+    const dlen = try decompressedLen(.snappy, comp[0..clen]);
+    try testing.expectEqual(input.len, dlen);
+    const back = try testing.allocator.alloc(u8, dlen);
+    defer testing.allocator.free(back);
+    const blen = try decompress(.snappy, comp[0..clen], back);
     try testing.expectEqualSlices(u8, input, back[0..blen]);
 }
 
