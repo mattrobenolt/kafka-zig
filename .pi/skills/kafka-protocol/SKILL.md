@@ -93,6 +93,20 @@ Layout (big-endian unless noted):
 - records count: i32
 - records: array of records (or compressed blob if compression attr set)
 
+**Compression format per codec (VERIFY — Kafka does NOT use raw blocks for
+all codecs):**
+- **zstd** (attr 4): raw zstd frame (what `ZSTD_compress` produces).
+- **snappy** (attr 2): **Xerial-framed** (NOT raw Snappy block). Kafka Java
+  uses `SnappyOutputStream`/`SnappyInputStream` (xerial/snappy-java). Format:
+  16-byte header `[0x82, 'S','N','A','P','P','Y', 0, version=1 BE i32,
+  compatible=1 BE i32]` + blocks of `(BE i32 compressed_size + raw Snappy
+  block of a ≤32KB chunk)`. A raw-block encoder will round-trip with your own
+  decoder but FAIL against `kafka-console-consumer` (Java/Xerial). Always
+  Xerial-frame snappy for Kafka interop. (Verified against kafka-python
+  `snappy_encode(xerial_compatible=True)` + snappy-java `SnappyOutputStream`.)
+- **gzip** (attr 1): standard DEFLATE.
+- **lz4** (attr 3): lz4 block format (verify — Kafka may use framed, not raw).
+
 **Non-idempotent producer sentinels:** `producerId = -1`, `producerEpoch = -1`,
 `baseSequence = -1` (Java `RecordBatch` defaults). State these exactly.
 
