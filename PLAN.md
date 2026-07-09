@@ -13,7 +13,7 @@ scope for v1.
 ## 1. Scope
 
 **In (v1):**
-- Produce to a topic, round-robin and key-hash partitioning.
+- Produce to a topic, sticky (default) / key-hash / round-robin partitioning.
 - TLS 1.3 transport (ztls over a blocking `std.net.Stream`).
 - SASL SCRAM-SHA-256 (and SHA-512) authentication.
 - Bootstrap → metadata discovery → per-partition-leader connections.
@@ -340,7 +340,7 @@ var client: kafka.Client = try .init(allocator, .{
     .max_key_len = 256,
     .max_topic_len = 128,
     .ring_slots = 8192,           // reserved ≈ 8192 × 16KB ≈ 128MB
-    .partitioner = .default,      // round-robin; .key_hash for keyed
+    .partitioner = .default,      // sticky for null key; key-hash for keyed (KIP-794)
 });
 defer client.deinit(); // joins network thread
 
@@ -388,7 +388,7 @@ src/
   Client.zig           — public Client API + config arena + thread spawn
   Connection.zig       — TCP + ztls + SCRAM auth → ready connection
   Producer.zig         — network thread: batching, Produce encode/ack, retry/metadata refresh
-  partitioner.zig      — round-robin / key-hash (murmur2, matches Kafka Utils.murmur2)
+  partitioner.zig      — sticky (default) / key-hash / round-robin (murmur2, matches Kafka Utils.murmur2)
   Ring.zig             — MPSC payload ring (ported from AtomicRingBuffer)
   scram/
     scram.zig           — generic SCRAM client (sha256/sha512)
