@@ -266,6 +266,10 @@ pub const Message = struct {
     }
 };
 
+// --- Producer-thread stats counters (incremented in commit, read by stats) ---
+messages_produced: atomic.Value(u64) align(cache_line),
+bytes_produced: atomic.Value(u64) align(cache_line),
+
 // --- Read-only after init -------------------------------------------------
 slots: []align(page_size) Slot,
 handles: []Handle,
@@ -360,6 +364,8 @@ pub fn init(gpa: Allocator, config: Config) !Ring {
         .max_key_len = config.max_key_len,
         .max_message_size = config.max_message_size,
         .bytes_per_slot = bytes_per_slot,
+        .messages_produced = .init(0),
+        .bytes_produced = .init(0),
         .write_head = .init(0),
         .data_waiter = .init(false),
         .read_head = .init(0),
@@ -516,6 +522,10 @@ fn commit(self: *Ring, slot_index: u32, value_len: u32) Error!void {
     // Release: publishes handle_index + all metadata + payload to the network
     // thread's acquire-load of status.
     slot.status.store(status_pending, .release);
+    // Stats: producer-thread counters (issue #7). Monotonic — the slot's
+    // release-store above is the real publication; these are just counters.
+    _ = self.messages_produced.fetchAdd(1, .monotonic);
+    _ = self.bytes_produced.fetchAdd(value_len, .monotonic);
     self.notifyConsumer();
 }
 

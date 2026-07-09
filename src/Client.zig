@@ -41,6 +41,43 @@ const build_options = @import("build_options");
 /// no build flag).
 pub const Compression = record_batch.Compression;
 
+/// A snapshot of producer statistics (issue #7). Pull-based: the caller
+/// fetches it via `Client.stats()`. All values are a relaxed-consistency
+/// snapshot -- torn or stale reads are acceptable (it's metrics, not
+/// accounting). No locks, no allocation.
+pub const Stats = struct {
+    /// Pending slots in the ring: `write_head - read_head`. Slots that have
+    /// been committed but not yet reclaimed (acked/failed + physically
+    /// recycled by the network thread).
+    queue_depth: u64,
+    /// Messages currently in flight. In v1 this equals `queue_depth` -- every
+    /// committed-but-not-reclaimed slot is "in flight." A finer split
+    /// (sent-but-not-acked vs. waiting-to-send) is a follow-up.
+    in_flight: u64,
+    /// Total messages committed by producer threads (atomic, multi-threaded).
+    messages_produced: u64,
+    /// Total bytes committed by producer threads (atomic, multi-threaded).
+    bytes_produced: u64,
+    /// Total Produce requests sent to brokers (network thread).
+    batches_sent: u64,
+    /// Total messages acked by the broker (network thread).
+    messages_acked: u64,
+    /// Total messages permanently failed (network thread).
+    messages_failed: u64,
+    /// Error counts by class (network thread).
+    errors: ErrorCounts,
+};
+
+/// Error counts by class, for the `Stats` snapshot.
+pub const ErrorCounts = struct {
+    /// Retriable errors encountered (per slot per retry attempt).
+    retriable: u64,
+    /// Permanent (non-retriable) failures, including retry-budget exhaustion.
+    fatal: u64,
+    /// Connection drops during Produce sends.
+    connection_drops: u64,
+};
+
 const Client = @This();
 
 /// A producer message handle: the ring's `Message`, re-exported.
@@ -264,6 +301,32 @@ pub fn acquire(self: *Client) Error!Message {
 /// Non-blocking `acquire`: `error.WouldBlock` when the ring is full.
 pub fn tryAcquire(self: *Client) Error!Message {
     return self.ring.tryAcquire();
+}
+
+/// Fetch a relaxed-consistency snapshot of producer statistics (issue #7).
+/// No locks, no allocation -- returns a value struct. Torn/stale reads are
+/// acceptable. `queue_depth` and `in_flight` are read from the ring's existing
+/// atomics; the producer-thread counters (`messages_produced`, `bytes_produced`)
+/// are atomic; the network-thread counters are read with `.monotonic` loads
+/// (single-writer, relaxed cross-thread reads).
+pub fn stats(self: *const Client) Stats {
+    const wh = self.ring.writeHead();
+    const rh = self.ring.readHead();
+    const depth = wh - rh;
+    return .{
+        .queue_depth = depth,
+        .in_flight = depth,
+        .messages_produced = self.ring.messages_produced.load(.monotonic),
+        .bytes_produced = self.ring.bytes_produced.load(.monotonic),
+        .batches_sent = self.producer.batches_sent.load(.monotonic),
+        .messages_acked = self.producer.messages_acked.load(.monotonic),
+        .messages_failed = self.producer.messages_failed.load(.monotonic),
+        .errors = .{
+            .retriable = self.producer.errors_retriable.load(.monotonic),
+            .fatal = self.producer.errors_fatal.load(.monotonic),
+            .connection_drops = self.producer.errors_connection_drops.load(.monotonic),
+        },
+    };
 }
 
 fn dupScram(arena: Allocator, sasl: Sasl) !Connection.ScramConfig {
@@ -1804,4 +1867,155 @@ test "#5 sticky: partition rotates between successive drains" {
         if (b.partition != first_part) found_different = true;
     }
     try testing.expect(found_different);
+}
+
+// ---------------------------------------------------------------------------
+// #7: pull-based metrics/stats
+// ---------------------------------------------------------------------------
+
+test "#7 stats: messages_produced, bytes_produced, messages_acked after all acks" {
+    var broker = try mock.Broker.start(testing.allocator, .{ .mode = .ok, .num_partitions = 4 });
+    defer broker.stop();
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var client = try Client.init(testing.allocator, testConfig(&bootstrap));
+    defer client.deinit();
+
+    const n: u32 = 20;
+    var handles: [n]Message = undefined;
+    var total_bytes: u64 = 0;
+    for (&handles, 0..) |*m, i| {
+        m.* = try client.acquire();
+        try m.setTopic("events");
+        m.setPartition(null);
+        const dst = m.value();
+        const payload = try std.fmt.bufPrint(dst, "stats-msg-{d}", .{i});
+        try m.commit(@intCast(payload.len));
+        total_bytes += payload.len;
+    }
+    // Wait for all acks before reading stats so the values are stable
+    // (relaxed consistency — the test waits for the drain to complete).
+    for (&handles) |*m| try m.await();
+
+    const s = client.stats();
+    try testing.expectEqual(@as(u64, n), s.messages_produced);
+    try testing.expectEqual(total_bytes, s.bytes_produced);
+    try testing.expectEqual(@as(u64, n), s.messages_acked);
+    try testing.expectEqual(@as(u64, 0), s.messages_failed);
+    // After all acks + reclaim, the queue should be drained.
+    try testing.expectEqual(@as(u64, 0), s.queue_depth);
+    // At least one batch was sent.
+    try testing.expect(s.batches_sent > 0);
+}
+
+test "#7 stats: fatal errors counted on non-retriable failure" {
+    var broker = try mock.Broker.start(testing.allocator, .{
+        .mode = .fatal,
+        .num_partitions = 1,
+    });
+    defer broker.stop();
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var client = try Client.init(testing.allocator, testConfig(&bootstrap));
+    defer client.deinit();
+
+    var m = try client.acquire();
+    try m.setTopic("events");
+    m.setPartition(0);
+    const dst = m.value();
+    @memcpy(dst[0..3], "bad");
+    try m.commit(3);
+
+    try testing.expectError(error.SendFailed, m.await());
+
+    const s = client.stats();
+    try testing.expectEqual(@as(u64, 1), s.messages_produced);
+    try testing.expectEqual(@as(u64, 0), s.messages_acked);
+    try testing.expectEqual(@as(u64, 1), s.messages_failed);
+    try testing.expect(s.errors.fatal > 0);
+}
+
+test "#7 stats: queue_depth reflects pending slots before drain" {
+    // Produce N messages to a gated broker without awaiting. The broker
+    // blocks before responding to the first Produce, so the network thread
+    // is stuck and the ring still has pending slots. Assert queue_depth == N.
+    var broker = try mock.Broker.start(testing.allocator, .{
+        .mode = .ok,
+        .num_partitions = 1,
+        .gate_first_produce = true,
+    });
+    defer broker.stop();
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var cfg = testConfig(&bootstrap);
+    cfg.linger_ms = 0;
+    cfg.enable_idempotency = false;
+    var client = try Client.init(testing.allocator, cfg);
+    defer client.deinit();
+
+    const n: u32 = 5;
+    var handles: [n]Message = undefined;
+    for (&handles, 0..) |*m, i| {
+        m.* = try client.acquire();
+        try m.setTopic("events");
+        m.setPartition(0);
+        const dst = m.value();
+        const payload = try std.fmt.bufPrint(dst, "q{d}", .{i});
+        try m.commit(@intCast(payload.len));
+    }
+
+    // Wait until the producer has sent the first Produce (now blocked in the
+    // gate). The remaining slots are still pending in the ring.
+    broker.waitFirstProduce();
+
+    const s = client.stats();
+    try testing.expectEqual(@as(u64, n), s.messages_produced);
+    try testing.expect(s.queue_depth > 0);
+    try testing.expect(s.queue_depth <= @as(u64, n));
+
+    // Release the gate and await all so the ring drains cleanly.
+    broker.openGate();
+    for (&handles) |*m| try m.await();
+
+    const s2 = client.stats();
+    try testing.expectEqual(@as(u64, 0), s2.queue_depth);
+    try testing.expectEqual(@as(u64, n), s2.messages_acked);
+}
+
+test "#7 stats: retriable errors and connection_drops counted" {
+    // close_after_first_produce mode: the broker drops the first Produce
+    // (connection drop), then the producer reconnects and retries. Assert
+    // connection_drops > 0 and errors.retriable > 0.
+    var broker = try mock.Broker.start(testing.allocator, .{
+        .mode = .close_after_first_produce,
+        .num_partitions = 1,
+    });
+    defer broker.stop();
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var cfg = testConfig(&bootstrap);
+    cfg.max_retries = 5;
+    cfg.linger_ms = 0;
+    cfg.retry_backoff_ms = 5;
+    cfg.enable_idempotency = false;
+    var client = try Client.init(testing.allocator, cfg);
+    defer client.deinit();
+
+    const n: u32 = 3;
+    var handles: [n]Message = undefined;
+    for (&handles, 0..) |*m, i| {
+        m.* = try client.acquire();
+        try m.setTopic("events");
+        m.setPartition(0);
+        const dst = m.value();
+        const payload = try std.fmt.bufPrint(dst, "cd{d}", .{i});
+        try m.commit(@intCast(payload.len));
+    }
+    for (&handles) |*m| try m.await();
+
+    const s = client.stats();
+    try testing.expectEqual(@as(u64, n), s.messages_acked);
+    try testing.expect(s.errors.connection_drops > 0);
+    try testing.expect(s.errors.retriable > 0);
+    try testing.expectEqual(@as(u64, 0), s.errors.fatal);
 }

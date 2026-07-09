@@ -7,6 +7,8 @@ pub const wire = @import("wire/root.zig");
 pub const Ring = @import("Ring.zig");
 pub const Connection = @import("Connection.zig");
 pub const Client = @import("Client.zig");
+pub const Stats = Client.Stats;
+pub const ErrorCounts = Client.ErrorCounts;
 
 test {
     std.testing.refAllDecls(@This());

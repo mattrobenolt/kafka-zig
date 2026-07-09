@@ -328,6 +328,17 @@ round_robin: std.StringHashMapUnmanaged(partitioner.RoundRobin) = .empty,
 // --- sticky partition state, per topic, persistent across metadata refreshes ---
 sticky: std.StringHashMapUnmanaged(partitioner.Sticky) = .empty,
 
+// --- network-thread stats counters (issue #7, read by stats() from another thread) ---
+// Single-writer (network thread) / multi-reader (stats). Monotonic stores
+// from the network thread, monotonic loads from stats() -- relaxed consistency,
+// torn/stale reads are acceptable (it's metrics, not accounting).
+batches_sent: std.atomic.Value(u64) = .init(0),
+messages_acked: std.atomic.Value(u64) = .init(0),
+messages_failed: std.atomic.Value(u64) = .init(0),
+errors_retriable: std.atomic.Value(u64) = .init(0),
+errors_fatal: std.atomic.Value(u64) = .init(0),
+errors_connection_drops: std.atomic.Value(u64) = .init(0),
+
 // --- preallocated drain scratch (reused every drain, never on hot path) ---
 collected: []Collected,
 records_scratch: []record_batch.Record,
@@ -690,6 +701,7 @@ fn drainOnce(self: *Producer) !bool {
             self.metadata_stale = true;
             if (self.bumpAttempts(pos, generation) > self.options.max_retries) {
                 self.ring.markFailed(pos, generation, 3); // UNKNOWN_TOPIC_OR_PARTITION
+                self.recordFailure();
             }
             continue;
         }
@@ -712,6 +724,7 @@ fn drainOnce(self: *Producer) !bool {
             self.metadata_stale = true;
             if (self.bumpAttempts(pos, generation) > self.options.max_retries) {
                 self.ring.markFailed(pos, generation, 5); // LEADER_NOT_AVAILABLE
+                self.recordFailure();
             }
             continue;
         }
@@ -749,6 +762,7 @@ fn drainOnce(self: *Producer) !bool {
             // Connection error: drop the connection and retry these slots.
             self.dropLeaderConnection(leader);
             self.metadata_stale = true;
+            _ = self.errors_connection_drops.fetchAdd(1, .monotonic);
             self.retrySlots(self.collected[i..j]);
         }
         i = j;
@@ -990,6 +1004,7 @@ fn sendLeader(self: *Producer, leader: i32, slots: []const Collected) !bool {
         .topic_data = self.topic_data_scratch[0..td_len],
     };
     const corr = try conn.sendRequest(.produce, 9, body);
+    _ = self.batches_sent.fetchAdd(1, .monotonic);
 
     if (self.options.acks == 0) {
         // No response is sent for acks=0; treat every collected slot as acked.
@@ -1101,11 +1116,28 @@ fn findGroup(groups: []const Group, topic: []const u8, partition: i32) ?Group {
     return null;
 }
 
+// ---------------------------------------------------------------------------
+// Stats helpers (issue #7): record terminal failures in the counters.
+// ---------------------------------------------------------------------------
+
+/// Record a single permanent slot failure in the stats counters.
+fn recordFailure(self: *Producer) void {
+    _ = self.messages_failed.fetchAdd(1, .monotonic);
+    _ = self.errors_fatal.fetchAdd(1, .monotonic);
+}
+
+/// Record `count` permanent slot failures in the stats counters (bulk).
+fn recordFailures(self: *Producer, count: usize) void {
+    _ = self.messages_failed.fetchAdd(count, .monotonic);
+    _ = self.errors_fatal.fetchAdd(count, .monotonic);
+}
+
 fn ackSlots(self: *Producer, slot_run: []const Collected) void {
     for (slot_run) |c| {
         self.ring.markAcked(c.pos, c.generation);
         self.resetAttempts(c.pos);
     }
+    _ = self.messages_acked.fetchAdd(slot_run.len, .monotonic);
 }
 
 fn failSlots(self: *Producer, slot_run: []const Collected, code: i16) void {
@@ -1113,6 +1145,7 @@ fn failSlots(self: *Producer, slot_run: []const Collected, code: i16) void {
         self.ring.markFailed(c.pos, c.generation, @intCast(@as(u16, @bitCast(code))));
         self.resetAttempts(c.pos);
     }
+    self.recordFailures(slot_run.len);
 }
 
 /// Retry a run after a retriable partition error: bump the attempt counter and
@@ -1125,9 +1158,11 @@ fn retrySlotsWithCode(self: *Producer, slot_run: []const Collected, code: i16) b
         if (self.bumpAttempts(c.pos, c.generation) > self.options.max_retries) {
             self.ring.markFailed(c.pos, c.generation, @intCast(@as(u16, @bitCast(code))));
             self.resetAttempts(c.pos);
+            self.recordFailure();
             any_failed = true;
         } else {
             _ = self.ring.retry(c.pos, c.generation) catch {}; // ziglint-ignore: Z026 -- late ack, drop
+            _ = self.errors_retriable.fetchAdd(1, .monotonic);
         }
     }
     return any_failed;
@@ -1139,8 +1174,10 @@ fn retrySlots(self: *Producer, slot_run: []const Collected) void {
         if (self.bumpAttempts(c.pos, c.generation) > self.options.max_retries) {
             self.ring.markFailed(c.pos, c.generation, 13); // NETWORK_EXCEPTION
             self.resetAttempts(c.pos);
+            self.recordFailure();
         } else {
             _ = self.ring.retry(c.pos, c.generation) catch {}; // ziglint-ignore: Z026 -- late ack, drop
+            _ = self.errors_retriable.fetchAdd(1, .monotonic);
         }
     }
 }
@@ -1621,6 +1658,7 @@ fn chargeMetadataFailure(self: *Producer) void {
         if (self.bumpAttempts(pos, generation) > self.options.max_retries) {
             self.ring.markFailed(pos, generation, 13); // NETWORK_EXCEPTION
             self.resetAttempts(pos);
+            self.recordFailure();
         }
     }
     self.ring.wakeCompletions();
@@ -1638,6 +1676,7 @@ fn chargeRecoveryFailure(self: *Producer) void {
         if (self.bumpAttempts(pos, generation) > self.options.max_retries) {
             self.ring.markFailed(pos, generation, 73); // UNKNOWN_PRODUCER_ID
             self.resetAttempts(pos);
+            self.recordFailure();
         } else {
             any_pending = true;
         }
