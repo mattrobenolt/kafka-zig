@@ -16,6 +16,7 @@ pub const metadata = @import("api/metadata.zig");
 pub const api_versions = @import("api/api_versions.zig");
 pub const sasl = @import("api/sasl.zig");
 pub const produce = @import("api/produce.zig");
+pub const init_producer_id = @import("api/init_producer_id.zig");
 
 test {
     std.testing.refAllDecls(@This());

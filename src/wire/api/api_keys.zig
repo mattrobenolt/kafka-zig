@@ -27,6 +27,7 @@ pub const ApiKey = enum(u16) {
     metadata = 3,
     sasl_handshake = 17,
     api_versions = 18,
+    init_producer_id = 22,
     sasl_authenticate = 36,
     _,
 
@@ -40,6 +41,7 @@ pub const ApiKey = enum(u16) {
             3 => .metadata,
             17 => .sasl_handshake,
             18 => .api_versions,
+            22 => .init_producer_id,
             36 => .sasl_authenticate,
             else => error.UnknownApiKey,
         };
@@ -59,6 +61,7 @@ pub const pinned_version: std.EnumMap(ApiKey, u16) = .init(.{
     .metadata = 12,
     .sasl_handshake = 1,
     .api_versions = 3,
+    .init_producer_id = 4,
     .sasl_authenticate = 1,
 });
 
@@ -71,6 +74,7 @@ pub fn isFlexible(api: ApiKey, version: u16) bool {
         .produce => version >= 9,
         .metadata => version >= 12,
         .api_versions => version >= 3,
+        .init_producer_id => version >= 2,
         .sasl_handshake => false,
         .sasl_authenticate => false,
         _ => false,
@@ -114,6 +118,10 @@ pub fn headerVersion(api: ApiKey, version: u16) HeaderVersion {
             else => .{ .request = 1, .response = 0 },
         },
         .sasl_handshake => .{ .request = 1, .response = 0 },
+        .init_producer_id => switch (version) {
+            0...1 => .{ .request = 1, .response = 0 },
+            else => .{ .request = 2, .response = 1 },
+        },
         .sasl_authenticate => .{ .request = 1, .response = 0 },
         _ => .{ .request = 1, .response = 0 },
     };
@@ -129,6 +137,7 @@ test "ApiKey.toInt and fromU16 round-trip" {
     try testing.expectEqual(ApiKey.metadata, try ApiKey.fromU16(3));
     try testing.expectEqual(ApiKey.sasl_handshake, try ApiKey.fromU16(17));
     try testing.expectEqual(ApiKey.api_versions, try ApiKey.fromU16(18));
+    try testing.expectEqual(ApiKey.init_producer_id, try ApiKey.fromU16(22));
     try testing.expectEqual(ApiKey.sasl_authenticate, try ApiKey.fromU16(36));
 }
 
@@ -147,6 +156,7 @@ test "pinned versions" {
     try testing.expectEqual(@as(u16, 12), pinned_version.get(.metadata).?);
     try testing.expectEqual(@as(u16, 1), pinned_version.get(.sasl_handshake).?);
     try testing.expectEqual(@as(u16, 3), pinned_version.get(.api_versions).?);
+    try testing.expectEqual(@as(u16, 4), pinned_version.get(.init_producer_id).?);
     try testing.expectEqual(@as(u16, 1), pinned_version.get(.sasl_authenticate).?);
 }
 
@@ -154,6 +164,9 @@ test "isFlexible" {
     try testing.expect(isFlexible(.produce, 9));
     try testing.expect(isFlexible(.metadata, 12));
     try testing.expect(isFlexible(.api_versions, 3));
+    try testing.expect(isFlexible(.init_producer_id, 2));
+    try testing.expect(isFlexible(.init_producer_id, 4));
+    try testing.expect(!isFlexible(.init_producer_id, 1));
     try testing.expect(!isFlexible(.sasl_handshake, 1));
     try testing.expect(!isFlexible(.sasl_authenticate, 1));
 }
@@ -201,4 +214,20 @@ test "headerVersion: produce v9 → {2, 1}" {
     const hv = headerVersion(.produce, 9);
     try testing.expectEqual(@as(u8, 2), hv.request);
     try testing.expectEqual(@as(u8, 1), hv.response);
+}
+
+test "headerVersion: init_producer_id v4 → {2, 1}" {
+    // Spec: https://kafka.apache.org/43/design/protocol#the_messages_init_producer_id
+    // — v2+ uses request header v2 (compact types, flexible). Response header
+    // v1 (flexible response with tagged fields).
+    const hv = headerVersion(.init_producer_id, 4);
+    try testing.expectEqual(@as(u8, 2), hv.request);
+    try testing.expectEqual(@as(u8, 1), hv.response);
+}
+
+test "headerVersion: init_producer_id v0 → {1, 0}" {
+    // v0/v1 are non-flexible: request header v1, response header v0.
+    const hv = headerVersion(.init_producer_id, 0);
+    try testing.expectEqual(@as(u8, 1), hv.request);
+    try testing.expectEqual(@as(u8, 0), hv.response);
 }
