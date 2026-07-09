@@ -186,3 +186,19 @@ NOT_ENOUGH_REPLICAS=19, UNKNOWN_PRODUCER_ID=73, OUT_OF_ORDER_SEQUENCE=45
 (non-retriable for idempotent — reset sequence), DUPLICATE_SEQUENCE_NUMBER=37
 (non-retriable), PRODUCER_FENCED=90 (non-retriable — fatal, the producer is
 done), COORDINATOR_NOT_AVAILABLE=14, NOT_COORDINATOR=16, REBOOTSTRAP_REQUIRED=129.
+
+## Idempotent producer: PID/sequence state is GLOBAL to the PID
+
+A non-transactional idempotent producer's PID + epoch + per-partition sequence
+state is **global to the PID**, not per-partition. A re-init (new PID/epoch) or
+an epoch bump **invalidates every partition's sequences at once** — the broker
+forgets all sequence state for the old PID. So on `OUT_OF_ORDER_SEQUENCE` (45)
+or `UNKNOWN_PRODUCER_ID` (73), the reset must clear `base_sequence` on **every**
+pending slot, not just the offending partition's. Do the reset at the top of
+the next drain (iterate all pending slots), NOT inline in the response loop —
+a per-partition inline reset would leave other partitions' in-flight retries
+carrying stale old-PID sequences that gap the new PID and wedge.
+
+`DUPLICATE_SEQUENCE_NUMBER` (37) is NOT an error — the broker already appended
+this `(PID, epoch, sequence)`, meaning the first write landed and only the ack
+was lost. Treat it as an ACK (the data is durable).
