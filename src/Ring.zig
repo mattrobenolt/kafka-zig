@@ -305,6 +305,14 @@ handle_freed: atomic.Value(u32),
 pool_waiters: atomic.Value(u32),
 
 shutdown: atomic.Value(bool) align(cache_line),
+/// Set by `requestDrain` (phase 1 of graceful shutdown). Blocks new
+/// `acquire`/`tryAcquire` (returns `error.Shutdown`) but lets the network
+/// thread keep draining pending slots. The network thread's `run` loop
+/// detects this, finishes in-flight Produce round-trips up to a configurable
+/// drain timeout, then exits. `requestShutdown` (phase 2) is called after the
+/// drain completes or times out, waking any remaining `await` waiters with
+/// `error.Shutdown`.
+draining: atomic.Value(bool) align(cache_line),
 
 comptime {
     // Little-endian assumption: we futex on the low 32 bits of the 64-bit
@@ -362,6 +370,7 @@ pub fn init(gpa: Allocator, config: Config) !Ring {
         .handle_freed = .init(0),
         .pool_waiters = .init(0),
         .shutdown = .init(false),
+        .draining = .init(false),
     };
 }
 
@@ -409,6 +418,7 @@ const ClaimMode = enum { block, no_block };
 fn claimSlot(self: *Ring, mode: ClaimMode) Error!u64 {
     while (true) {
         if (self.shutdown.load(.acquire)) return error.Shutdown;
+        if (self.draining.load(.acquire)) return error.Shutdown;
 
         // Load read_head BEFORE write_head. read_head only increases, so a
         // read_head read first is <= its value when write_head is read, which
@@ -561,11 +571,15 @@ fn finishAwait(self: *Ring, handle_index: u32, result: u32, err_out: *u32) Error
 /// Mirrors the original's event loop: bounded spin, then futex on write_head.
 pub fn waitForData(self: *Ring, read_pos: u64) bool {
     // Intentionally unbounded: this is the single-consumer event loop. It
-    // terminates on shutdown or on data becoming available.
+    // terminates on shutdown, drain completion (draining + no pending data),
+    // or on data becoming available.
     while (true) {
         if (self.shutdown.load(.acquire)) return false;
         const head = self.write_head.load(.acquire);
         if (read_pos < head) return true;
+        // Draining with no pending data: the drain is complete (all in-flight
+        // slots have been resolved). Return false so the network thread exits.
+        if (self.draining.load(.acquire)) return false;
 
         for (0..64) |_| {
             atomic.spinLoopHint();
@@ -598,6 +612,7 @@ pub fn waitForDataTimed(self: *Ring, read_pos: u64, timeout_ns: u64) bool {
         if (self.shutdown.load(.acquire)) return false;
         const head = self.write_head.load(.acquire);
         if (read_pos < head) return true;
+        if (self.draining.load(.acquire)) return false;
 
         const now: u64 = @intCast(std.time.nanoTimestamp());
         if (now >= deadline_ns) return false;
@@ -787,6 +802,26 @@ pub fn retry(self: *Ring, index: u64, generation: u32) Error!u64 {
     return index;
 }
 
+/// Phase 1 of graceful shutdown: stop accepting new messages (acquire returns
+/// `error.Shutdown`) but let the network thread keep draining pending slots.
+/// The network thread's `run` loop detects `isDraining()` and finishes
+/// in-flight Produce round-trips up to the drain timeout, then exits.
+/// `Client.deinit` calls this first, joins the thread, then calls
+/// `requestShutdown` (phase 2) to wake any remaining awaiters.
+pub fn requestDrain(self: *Ring) void {
+    self.draining.store(true, .release);
+    // Wake every kind of waiter so nobody is stuck waiting for data/slots
+    // that will never come (no new acquires during drain).
+    if (self.data_waiter.load(.acquire)) Futex.wake(writeHeadLow(self), 1);
+    Futex.wake(readHeadLow(self), math.maxInt(u32));
+    Futex.wake(&self.completions, math.maxInt(u32));
+    Futex.wake(&self.handle_freed, math.maxInt(u32));
+}
+
+pub fn isDraining(self: *const Ring) bool {
+    return self.draining.load(.acquire);
+}
+
 pub fn requestShutdown(self: *Ring) void {
     self.shutdown.store(true, .release);
     // Bump the two dedicated counter words BEFORE waking them. A waiter that
@@ -817,6 +852,7 @@ fn poolAlloc(self: *Ring, mode: ClaimMode) Error!u32 {
         const index: u32 = @truncate(head);
         if (index == handle_nil) {
             if (self.shutdown.load(.acquire)) return error.Shutdown;
+            if (self.draining.load(.acquire)) return error.Shutdown;
             switch (mode) {
                 .no_block => return error.WouldBlock,
                 .block => {
@@ -1639,6 +1675,76 @@ test "init rounds slot count up to a power of two" {
     defer ring.deinit(testing.allocator);
     try testing.expectEqual(@as(u32, 8), ring.numSlots());
     try testing.expectEqual(@as(u64, 7), ring.mask);
+}
+
+test "requestDrain blocks new acquires but lets pending slots drain" {
+    // requestDrain (phase 1 of graceful shutdown) must block new acquire /
+    // tryAcquire while letting the network thread keep draining pending slots.
+    var ring = try Ring.init(testing.allocator, tinyConfig(4));
+    defer ring.deinit(testing.allocator);
+
+    // Commit a message (pending) — it stays drainable.
+    var m = try ring.acquire();
+    try m.setTopic("t");
+    try m.commit(1);
+    try testing.expect(ring.slotIsPending(0));
+
+    // Enter drain mode.
+    ring.requestDrain();
+    try testing.expect(ring.isDraining());
+    try testing.expect(!ring.isShutdown());
+
+    // New acquires are blocked with error.Shutdown.
+    try testing.expectError(error.Shutdown, ring.tryAcquire());
+
+    // The pending slot is still drainable: the consumer can still ack it.
+    try testing.expect(ackOne(&ring, 0));
+    ring.wakeCompletions();
+    try m.await();
+    try testing.expectEqual(@as(u64, 1), ring.reclaim()); // advance read_head
+
+    // waitForData returns false when draining and no data remains.
+    try testing.expect(!ring.waitForData(ring.readHead()));
+
+    // Full shutdown still works after drain.
+    ring.requestShutdown();
+    try testing.expect(ring.isShutdown());
+}
+
+test "requestDrain unblocks an in-flight acquire" {
+    // Like the shutdown unblock test, but for drain: a producer blocked in
+    // acquire (ring full) must unblock with error.Shutdown when requestDrain
+    // is called, not hang.
+    const Waiter = struct {
+        fn run(r: *Ring, result: *atomic.Value(u32)) void {
+            if (r.acquire()) |_| {
+                result.store(1, .release);
+            } else |err| switch (err) {
+                error.Shutdown => result.store(2, .release),
+                else => result.store(3, .release),
+            }
+        }
+    };
+
+    var ring = try Ring.init(testing.allocator, tinyConfig(2));
+    defer ring.deinit(testing.allocator);
+
+    // Fill the ring so acquire must block.
+    var msgs: [2]Message = undefined;
+    for (&msgs) |*m| {
+        m.* = try ring.acquire();
+        try m.setTopic("t");
+        try m.commit(1);
+    }
+
+    var result: atomic.Value(u32) = .init(0);
+    const t = try Thread.spawn(.{}, Waiter.run, .{ &ring, &result });
+    ring.requestDrain();
+    expectUnblocksBy(&result, 2, 2 * std.time.ns_per_s) catch |e| {
+        t.join();
+        return e;
+    };
+    t.join();
 }
 
 test {

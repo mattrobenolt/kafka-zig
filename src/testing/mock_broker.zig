@@ -61,6 +61,11 @@ pub const Mode = enum {
     /// re-dial, and retry — the second Produce succeeds. Tests reconnect-on-drop
     /// on the produce hot path (#2).
     close_after_first_produce,
+    /// Close the TLS connection after EVERY Produce request (no response sent).
+    /// The producer never gets an ack — it reconnects and retries indefinitely.
+    /// Used by the drain-timeout test: the drain timeout bounds the total wait,
+    /// and remaining slots surface `error.Shutdown`.
+    never_ack,
 };
 
 /// A captured record-batch from a Produce request, for idempotency assertions.
@@ -484,6 +489,9 @@ const Session = struct {
                 {
                     count_produced = false;
                 }
+                if (self.broker.options.mode == .never_ack) {
+                    count_produced = false;
+                }
                 if (self.broker.options.mode == .duplicate_seq) {
                     const idx: usize = @intCast(index);
                     if (idx < max_partitions and !self.broker.injected[idx]) {
@@ -551,6 +559,13 @@ const Session = struct {
             return error.ConnectionDropAfterProduce;
         }
 
+        // never_ack: always drop the connection after receiving a Produce (no
+        // response). The producer never gets an ack and keeps retrying. Used by
+        // the drain-timeout test.
+        if (self.broker.options.mode == .never_ack) {
+            return error.ConnectionDropAfterProduce;
+        }
+
         var body: [16 * 1024]u8 = undefined;
         var w: std.Io.Writer = .fixed(&body);
         try produce.encodeResponse(&w, .{ .responses = tr_scratch[0..tr_len], .throttle_time_ms = 0 });
@@ -568,6 +583,7 @@ const Session = struct {
             .out_of_order_once => injectOnce(self.broker, idx, 45), // OUT_OF_ORDER_SEQUENCE
             .unknown_pid_once => injectOnce(self.broker, idx, 73), // UNKNOWN_PRODUCER_ID
             .close_after_first_produce => 0, // ack (but connection drops before response)
+            .never_ack => 0, // would ack, but connection always drops before response
         };
     }
 

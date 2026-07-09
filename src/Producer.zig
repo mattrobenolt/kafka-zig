@@ -119,6 +119,12 @@ pub const Options = struct {
     /// in record batches. When false, the -1 sentinels are used (non-idempotent
     /// mode, the v1 default behavior). Idempotency ON is the production default.
     enable_idempotency: bool = true,
+    /// Graceful shutdown drain timeout in ns. When `requestDrain` is called,
+    /// the network thread continues draining in-flight Produce round-trips
+    /// up to this duration before exiting. Slots still pending after the
+    /// timeout surface `error.Shutdown` (via `requestShutdown`). 0 = no
+    /// drain (the network thread exits immediately on drain). Default 10s.
+    drain_timeout_ns: u64 = 10 * std.time.ns_per_s,
 };
 
 /// A retriable error code that reflects a (possibly) stale leader — retrying
@@ -483,7 +489,8 @@ pub fn deinit(self: *Producer) void {
 // ---------------------------------------------------------------------------
 
 /// The network-thread entry point. Blocks in `waitForData` between drains and
-/// returns when the ring is shut down.
+/// returns when the ring is shut down or the graceful drain completes/times
+/// out.
 pub fn run(self: *Producer) void {
     // Acquire a PID/epoch before the first drain when idempotency is enabled.
     // This is a blocking call to a bootstrap broker; if it fails we log and
@@ -496,18 +503,38 @@ pub fn run(self: *Producer) void {
         };
     }
     self.read_head = self.ring.readHead();
+    // Drain deadline (nanoTimestamp): set when draining is first detected.
+    // -1 = not yet draining. Once set, the loop exits if `now >= deadline`,
+    // bounding the total drain time so a stuck broker cannot hang shutdown.
+    var drain_deadline: i64 = -1;
     while (!self.ring.isShutdown()) {
-        if (!self.ring.waitForData(self.read_head)) break; // shutdown
-        // Linger: after the first pending record arrives, wait up to
-        // `linger_ns` for more records to accumulate before draining, to form
-        // larger batches. Skipped when `linger_ns == 0` (eager drain). If a
-        // batch fills (`max_batch_bytes` worth of pending data) before the
-        // timer expires, the linger exits early — no latency regression under
-        // load. This is a TIMER on the waitForData path, not a sleep: it only
-        // runs when data is already available and we're choosing to wait for
-        // more. The retry backoff (below) is a SEPARATE concern — it sleeps
-        // when a drain made no forward progress.
-        self.linger();
+        if (!self.ring.waitForData(self.read_head)) break; // shutdown or drain complete
+
+        if (self.ring.isDraining()) {
+            // First drain detection: record the deadline.
+            if (drain_deadline < 0) {
+                const now: i64 = @truncate(std.time.nanoTimestamp());
+                drain_deadline = now + @as(i64, @intCast(self.options.drain_timeout_ns));
+            }
+            // Drain timeout expired: stop draining, exit the loop.
+            const now: i64 = @truncate(std.time.nanoTimestamp());
+            if (now >= drain_deadline) break;
+            // Skip linger during drain — flush in-flight acks as fast as
+            // possible, no batching benefit during shutdown.
+        } else {
+            // Linger: after the first pending record arrives, wait up to
+            // `linger_ns` for more records to accumulate before draining, to
+            // form larger batches. Skipped when `linger_ns == 0` (eager
+            // drain). If a batch fills (`max_batch_bytes` worth of pending
+            // data) before the timer expires, the linger exits early — no
+            // latency regression under load. This is a TIMER on the
+            // waitForData path, not a sleep: it only runs when data is
+            // already available and we're choosing to wait for more. The
+            // retry backoff (below) is a SEPARATE concern — it sleeps when a
+            // drain made no forward progress.
+            self.linger();
+        }
+
         const progressed = self.drainOnce() catch |err| brk: {
             log.warn("drain failed: {s}", .{@errorName(err)});
             break :brk false;
@@ -517,7 +544,18 @@ pub fn run(self: *Producer) void {
         // stays below write_head, so `waitForData` returns immediately; the
         // backoff below stops that from becoming a busy-spin.
         self.read_head = self.ring.readHead();
-        if (!progressed) std.Thread.sleep(self.options.retry_backoff_ns);
+        if (!progressed) {
+            if (self.ring.isDraining()) {
+                // Bounded backoff during drain: don't sleep past the deadline.
+                const now: i64 = @truncate(std.time.nanoTimestamp());
+                if (now >= drain_deadline) break;
+                const remaining: u64 = @intCast(drain_deadline - now);
+                const sleep_ns = @min(self.options.retry_backoff_ns, remaining);
+                std.Thread.sleep(sleep_ns);
+            } else {
+                std.Thread.sleep(self.options.retry_backoff_ns);
+            }
+        }
     }
 }
 
