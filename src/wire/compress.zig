@@ -5,14 +5,24 @@
 //! v1 implements plaintext + snappy + zstd; gzip/lz4 return
 //! `error.NotImplemented`.
 //!
-//! Snappy uses Kafka's raw block format (NOT the framed/streaming format).
-//! The encoder is literal-only (no match-finding): it produces valid snappy
-//! blocks that any consumer can decompress, but the ratio is ~1:1. This is
-//! sufficient for interop — the broker accepts and stores it, consumers
-//! decompress it transparently. The decoder is full: it handles all tag types
-//! (literal + copy 1/2/4-byte offset), so it can decompress blocks produced
-//! by any snappy compressor (including the reference C++ snappy with full
-//! match-finding). Snappy is always available (no build flag, no C dep).
+//! Snappy uses Kafka's Xerial-framed format (what org.xerial.snappy's
+//! SnappyOutputStream produces and SnappyInputStream consumes — the format the
+//! Kafka Java client's DefaultRecordBatch.compressedIterator expects). A raw
+//! Snappy block would be rejected by a Java kafka-console-consumer. The frame
+//! is a 16-byte header (8-byte magic `[0x82,'S','N','A','P','P','Y',0]` +
+//! BE int32 version=1 + BE int32 compatible_version=1) followed by one or more
+//! blocks of (BE int32 compressed_size + a raw snappy block of a <=32KB chunk).
+//! Verified against kafka-python's snappy_encode(xerial_compatible=True) and
+//! xerial/snappy-java SnappyOutputStream.
+//!
+//! The underlying raw-block encoder is literal-only (no match-finding): it
+//! produces valid snappy blocks that any consumer can decompress, but the ratio
+//! is ~1:1. The raw-block decoder is full: it handles all tag types (literal +
+//! copy 1/2/4-byte offset), so it can decompress blocks produced by any snappy
+//! compressor (including the reference C++ snappy with full match-finding).
+//! `snappyDecompress` accepts both Xerial-framed input (detected via the magic
+//! header) and bare raw blocks (backward compat). Snappy is always available
+//! (no build flag, no C dep).
 //! Spec: https://github.com/google/snappy/blob/main/format_description.txt
 //!
 //! zstd is optional and gated behind `-Dzstd=true`. The build wires
@@ -162,12 +172,18 @@ pub fn decompressedLen(codec: Codec, input: []const u8) DecompressError!usize {
 }
 
 // ---------------------------------------------------------------------------
-// Snappy block format (raw, not framed) — pure-Zig implementation
+// Snappy — Xerial-framed on the wire, pure-Zig raw-block codec underneath
 //
-// Kafka uses the raw Snappy block format (codec attribute 2): a varint-encoded
-// uncompressed length followed by a sequence of tags. This is the block format
-// from the snappy spec, NOT the framed/streaming format (which has a "\xff\x06"
-// magic header and chunk framing).
+// Kafka's snappy codec (attribute 2) is Xerial-framed: a 16-byte header plus
+// blocks of (BE int32 compressed_size + a raw snappy block of a <=32KB chunk).
+// This is NOT the raw snappy block format on its own, and NOT the
+// framed/streaming format with the "\xff\x06" magic — it is the org.xerial
+// SnappyOutputStream format the Kafka Java client speaks.
+//
+// The framing layer (snappyCompress / snappyDecompress / snappyCompressBound /
+// snappyDecompressedLen) wraps the raw-block primitives (snappyBlock*). The
+// raw-block format is a varint-encoded uncompressed length followed by a
+// sequence of tags, per the snappy spec.
 //
 // Spec: https://github.com/google/snappy/blob/main/format_description.txt
 //
@@ -187,6 +203,105 @@ pub fn decompressedLen(codec: Codec, input: []const u8) DecompressError!usize {
 // Zero heap allocation: both compress and decompress read `input` and write into
 // caller-provided `out` buffers, returning the byte count. No allocator.
 // ---------------------------------------------------------------------------
+
+/// Xerial frame magic: `[0x82,'S','N','A','P','P','Y',0]` (0x82 == -126 as a
+/// signed byte). Followed by BE int32 version=1 and BE int32 compatible=1.
+/// Total header = 16 bytes. Verified against kafka-python / xerial snappy-java.
+const xerial_magic = [8]u8{ 0x82, 'S', 'N', 'A', 'P', 'P', 'Y', 0 };
+const xerial_header = xerial_magic ++ [8]u8{ 0, 0, 0, 1, 0, 0, 0, 1 };
+
+/// Xerial block chunk size: snappy-java / kafka-python default is 32 KiB. Each
+/// block covers at most this many uncompressed bytes.
+const xerial_block_size: usize = 32 * 1024;
+
+/// True when `input` starts with the 16-byte Xerial frame (magic present and at
+/// least the full header available). Bare raw blocks lack the magic.
+fn isXerial(input: []const u8) bool {
+    return input.len >= xerial_header.len and
+        std.mem.eql(u8, input[0..xerial_magic.len], &xerial_magic);
+}
+
+/// Worst-case Xerial-framed compressed size for `input_len` bytes: the 16-byte
+/// header plus, per <=32KB chunk, a 4-byte BE length prefix and that chunk's
+/// raw-block bound. Cold path (sized once at producer init); the exact per-chunk
+/// loop is clearer than an over-estimate.
+fn snappyCompressBound(input_len: usize) usize {
+    var bound: usize = xerial_header.len;
+    var remaining = input_len;
+    while (remaining > 0) {
+        const chunk = @min(remaining, xerial_block_size);
+        bound += 4 + snappyBlockCompressBound(chunk);
+        remaining -= chunk;
+    }
+    return bound;
+}
+
+/// Compress `input` into `out` as Xerial-framed snappy: the 16-byte header then
+/// one block per <=32KB chunk (BE int32 compressed_size + the raw snappy block).
+/// Returns bytes written. `error.BufferTooSmall` when `out` is too small — size
+/// it via `snappyCompressBound`. Zero heap allocation. Empty input yields just
+/// the header (no blocks). Output is decompressible by a Kafka Java consumer's
+/// SnappyInputStream.
+fn snappyCompress(input: []const u8, out: []u8) CompressError!usize {
+    if (out.len < xerial_header.len) return error.BufferTooSmall;
+    @memcpy(out[0..xerial_header.len], &xerial_header);
+    var out_pos: usize = xerial_header.len;
+
+    var in_pos: usize = 0;
+    while (in_pos < input.len) {
+        const chunk = @min(input.len - in_pos, xerial_block_size);
+        // Reserve the 4-byte BE length prefix, compress the chunk after it,
+        // then backfill the prefix with the block's compressed size.
+        if (out_pos + 4 > out.len) return error.BufferTooSmall;
+        const block_out = out[out_pos + 4 ..];
+        const block_len = try snappyBlockCompress(input[in_pos..][0..chunk], block_out);
+        assert(block_len <= 0xFFFFFFFF);
+        std.mem.writeInt(u32, out[out_pos..][0..4], @intCast(block_len), .big);
+        out_pos += 4 + block_len;
+        in_pos += chunk;
+    }
+    return out_pos;
+}
+
+/// Decompressed byte length of a snappy input. Xerial-framed input: sum each
+/// block's raw-block uncompressed length (the varint at the start of every raw
+/// block). Bare raw block: the leading varint. `error.DecompressionFailed` on
+/// truncation/corruption. Cold path (broker responses).
+fn snappyDecompressedLen(input: []const u8) DecompressError!usize {
+    if (!isXerial(input)) return snappyBlockDecompressedLen(input);
+    var pos: usize = xerial_header.len;
+    var total: usize = 0;
+    while (pos < input.len) {
+        if (pos + 4 > input.len) return error.DecompressionFailed;
+        const block_size = std.mem.readInt(u32, input[pos..][0..4], .big);
+        pos += 4;
+        if (pos + block_size > input.len) return error.DecompressionFailed;
+        total += try snappyBlockDecompressedLen(input[pos..][0..block_size]);
+        pos += block_size;
+    }
+    return total;
+}
+
+/// Decompress a snappy input into `out`, returning bytes written. Handles both
+/// Xerial-framed input (detected via the magic header — skip the 16-byte header,
+/// then loop over BE int32 block_size + raw block) and a bare raw block
+/// (backward compat). `error.BufferTooSmall` when `out` is too small (size via
+/// `snappyDecompressedLen`); `error.DecompressionFailed` on corrupt input. Zero
+/// heap allocation.
+fn snappyDecompress(input: []const u8, out: []u8) DecompressError!usize {
+    if (!isXerial(input)) return snappyBlockDecompress(input, out);
+    var in_pos: usize = xerial_header.len;
+    var out_pos: usize = 0;
+    while (in_pos < input.len) {
+        if (in_pos + 4 > input.len) return error.DecompressionFailed;
+        const block_size = std.mem.readInt(u32, input[in_pos..][0..4], .big);
+        in_pos += 4;
+        if (in_pos + block_size > input.len) return error.DecompressionFailed;
+        out_pos += try snappyBlockDecompress(input[in_pos..][0..block_size], out[out_pos..]);
+        in_pos += block_size;
+    }
+    return out_pos;
+}
 
 /// Number of bytes to encode `value` as an unsigned LEB128 varint.
 fn uvarintSize(value: usize) usize {
@@ -234,13 +349,13 @@ fn readUvarint(input: []const u8, pos: *usize) DecompressError!usize {
 /// but the worst case (max tag overhead) is one tag byte per 60-byte chunk
 /// (the smallest literal encoding). Plus the varint-encoded uncompressed
 /// length.
-fn snappyCompressBound(input_len: usize) usize {
+fn snappyBlockCompressBound(input_len: usize) usize {
     return uvarintSize(input_len) + input_len + (input_len + 59) / 60;
 }
 
 /// Compress `input` into `out` using the snappy block format (literal-only
 /// encoder). Returns bytes written. `error.BufferTooSmall` when `out` is too
-/// small — size it via `snappyCompressBound`. Zero heap allocation.
+/// small — size it via `snappyBlockCompressBound`. Zero heap allocation.
 ///
 /// Tag format for literals (type 00):
 ///   length 1–60:   tag = (length - 1) << 2         (1 byte tag)
@@ -248,7 +363,7 @@ fn snappyCompressBound(input_len: usize) usize {
 ///   length 257–65536: tag = 0xF4, then (length - 1) as 2 bytes LE  (3 bytes)
 ///   length 65537–16M: tag = 0xF8, then (length - 1) as 3 bytes LE  (4 bytes)
 ///   length > 16M:  tag = 0xFC, then (length - 1) as 4 bytes LE  (5 bytes)
-fn snappyCompress(input: []const u8, out: []u8) CompressError!usize {
+fn snappyBlockCompress(input: []const u8, out: []u8) CompressError!usize {
     var out_pos: usize = 0;
     out_pos += try writeUvarint(out[out_pos..], input.len);
 
@@ -310,7 +425,7 @@ fn snappyCompress(input: []const u8, out: []u8) CompressError!usize {
 
 /// Decompressed byte length of a snappy block (the varint at the start of
 /// `input`). `error.DecompressionFailed` if the varint is corrupt/truncated.
-fn snappyDecompressedLen(input: []const u8) DecompressError!usize {
+fn snappyBlockDecompressedLen(input: []const u8) DecompressError!usize {
     var pos: usize = 0;
     return readUvarint(input, &pos);
 }
@@ -331,7 +446,7 @@ fn snappyCopy(out: []u8, pos: usize, offset: usize, length: usize) void {
 
 /// Decompress a snappy block from `input` into `out`, returning bytes written.
 /// `error.BufferTooSmall` when `out` is too small (size via
-/// `snappyDecompressedLen`). `error.DecompressionFailed` on corrupt input.
+/// `snappyBlockDecompressedLen`). `error.DecompressionFailed` on corrupt input.
 /// Zero heap allocation.
 ///
 /// Handles all four tag types:
@@ -339,7 +454,7 @@ fn snappyCopy(out: []u8, pos: usize, offset: usize, length: usize) void {
 ///   01: copy with 1-byte offset (3-bit length, 11-bit offset)
 ///   10: copy with 2-byte offset (6-bit length, 16-bit offset LE)
 ///   11: copy with 4-byte offset (6-bit length, 32-bit offset LE)
-fn snappyDecompress(input: []const u8, out: []u8) DecompressError!usize {
+fn snappyBlockDecompress(input: []const u8, out: []u8) DecompressError!usize {
     var in_pos: usize = 0;
     const uncomp_len = try readUvarint(input, &in_pos);
     if (uncomp_len > out.len) return error.BufferTooSmall;
@@ -536,8 +651,9 @@ test "snappy: empty input round-trips" {
     const input = "";
     var comp: [16]u8 = undefined;
     const clen = try compress(.snappy, input, &comp, 0);
-    try testing.expectEqual(@as(usize, 1), clen); // just the varint 0x00
-    try testing.expectEqual(@as(u8, 0x00), comp[0]);
+    // Empty input yields just the 16-byte Xerial header, no blocks.
+    try testing.expectEqual(@as(usize, 16), clen);
+    try testing.expectEqualSlices(u8, &xerial_header, comp[0..16]);
 
     const dlen = try decompressedLen(.snappy, comp[0..clen]);
     try testing.expectEqual(@as(usize, 0), dlen);
@@ -545,6 +661,32 @@ test "snappy: empty input round-trips" {
     var back: [8]u8 = undefined;
     const blen = try decompress(.snappy, comp[0..clen], &back);
     try testing.expectEqual(@as(usize, 0), blen);
+}
+
+test "snappy: Xerial header is present in compressed output" {
+    // The compressed output must begin with the 8-byte Xerial magic so a Kafka
+    // Java consumer's SnappyInputStream accepts it. Magic = [0x82, S,N,A,P,P,Y, 0].
+    const input = "kafka interop requires the xerial frame";
+    var comp: [128]u8 = undefined;
+    const clen = try compress(.snappy, input, &comp, 0);
+    try testing.expect(clen > 16);
+    try testing.expectEqualSlices(u8, &xerial_magic, comp[0..8]);
+    // version = 1, compatible = 1 (BE int32 each).
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, comp[8..12], .big));
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, comp[12..16], .big));
+}
+
+test "snappy: decompresses bare raw block (no Xerial header, backward compat)" {
+    // A bare raw snappy block (no magic) must still decompress — this is what an
+    // older producer or a hand-built block looks like. Block for "ABABABAB":
+    // varint(8)=0x08, literal "AB" (tag 0x04), copy len6 off2 (0x09 0x02).
+    const raw_block = [_]u8{ 0x08, 0x04, 'A', 'B', 0x09, 0x02 };
+    try testing.expect(!isXerial(&raw_block));
+    const dlen = try decompressedLen(.snappy, &raw_block);
+    try testing.expectEqual(@as(usize, 8), dlen);
+    var out: [8]u8 = undefined;
+    const blen = try decompress(.snappy, &raw_block, &out);
+    try testing.expectEqualSlices(u8, "ABABABAB", out[0..blen]);
 }
 
 test "snappy: small input round-trips" {
@@ -562,16 +704,15 @@ test "snappy: small input round-trips" {
     try testing.expectEqualSlices(u8, input, back[0..blen]);
 }
 
-test "snappy: known encoding (literal-only)" {
-    // Verify the exact bytes our literal-only encoder produces for a 13-byte
-    // input. The format is: varint(13) + literal tag + data.
-    // varint(13) = 0x0D (single byte, 13 < 128)
-    // literal tag for 13 bytes: (13 - 1) << 2 = 0x30
-    // data: "hello, kafka!"
+test "snappy: known encoding (Xerial frame + literal-only block)" {
+    // Verify the exact bytes for a 13-byte input: 16-byte Xerial header, then
+    // BE int32 block_size, then the raw snappy block.
+    //   raw block = varint(13)=0x0D + literal tag (13-1)<<2=0x30 + data (13B)
+    //   block_size = 2 + 13 = 15 → BE int32 {0,0,0,15}
     const input = "hello, kafka!";
     var comp: [64]u8 = undefined;
     const clen = try compress(.snappy, input, &comp, 0);
-    const expected = [_]u8{ 0x0D, 0x30 } ++ input.*;
+    const expected = xerial_header ++ [_]u8{ 0, 0, 0, 15, 0x0D, 0x30 } ++ input.*;
     try testing.expectEqualSlices(u8, &expected, comp[0..clen]);
 }
 
@@ -581,8 +722,9 @@ test "snappy: 60-byte boundary (6-bit literal max)" {
     for (&input, 0..) |*b, i| b.* = @intCast(i % 256);
     var comp: [128]u8 = undefined;
     const clen = try compress(.snappy, &input, &comp, 0);
-    // varint(60) = 0x3C, tag = (60-1)<<2 = 0xEC, data = 60 bytes → 62 total
-    try testing.expectEqual(@as(usize, 62), clen);
+    // raw block: varint(60)=0x3C, tag (60-1)<<2=0xEC, data=60 → 62 bytes.
+    // Xerial: 16-byte header + 4-byte block_size + 62 = 82 total.
+    try testing.expectEqual(@as(usize, 82), clen);
 
     var back: [60]u8 = undefined;
     const blen = try decompress(.snappy, comp[0..clen], &back);
@@ -596,10 +738,12 @@ test "snappy: 61-byte input (1-byte extended literal)" {
     for (&input, 0..) |*b, i| b.* = @intCast(i % 256);
     var comp: [128]u8 = undefined;
     const clen = try compress(.snappy, &input, &comp, 0);
-    // varint(61) = 0x3D, tag 0xF0, length-1 = 60 = 0x3C, data = 61 → 64 total
-    try testing.expectEqual(@as(usize, 64), clen);
-    try testing.expectEqual(@as(u8, 0xF0), comp[1]);
-    try testing.expectEqual(@as(u8, 60), comp[2]);
+    // raw block: varint(61)=0x3D, tag 0xF0, length-1=60=0x3C, data=61 → 64 bytes.
+    // Xerial: 16-byte header + 4-byte block_size + 64 = 84 total. The raw block
+    // starts at offset 20 (16 header + 4 size prefix).
+    try testing.expectEqual(@as(usize, 84), clen);
+    try testing.expectEqual(@as(u8, 0xF0), comp[21]);
+    try testing.expectEqual(@as(u8, 60), comp[22]);
 
     var back: [61]u8 = undefined;
     const blen = try decompress(.snappy, comp[0..clen], &back);
@@ -613,10 +757,11 @@ test "snappy: 257-byte input (2-byte extended literal)" {
     for (&input, 0..) |*b, i| b.* = @intCast(i % 256);
     var comp: [520]u8 = undefined;
     const clen = try compress(.snappy, &input, &comp, 0);
-    // varint(257) = 0x81 0x02, tag 0xF4, length-1 = 256 = 0x00 0x01 LE, data = 257
-    // total = 2 + 3 + 257 = 262
-    try testing.expectEqual(@as(usize, 262), clen);
-    try testing.expectEqual(@as(u8, 0xF4), comp[2]);
+    // raw block: varint(257)=0x81 0x02, tag 0xF4, length-1=256=0x00 0x01 LE,
+    // data=257 → 2 + 3 + 257 = 262 bytes. Xerial: 16 + 4 + 262 = 282 total.
+    // The raw block starts at offset 20; the 0xF4 tag is after the 2-byte varint.
+    try testing.expectEqual(@as(usize, 282), clen);
+    try testing.expectEqual(@as(u8, 0xF4), comp[22]);
 
     var back: [257]u8 = undefined;
     const blen = try decompress(.snappy, comp[0..clen], &back);
@@ -633,6 +778,29 @@ test "snappy: large input round-trips" {
     defer testing.allocator.free(comp);
     const clen = try compress(.snappy, &input, comp, 0);
     try testing.expect(bound >= clen);
+
+    const dlen = try decompressedLen(.snappy, comp[0..clen]);
+    try testing.expectEqual(input.len, dlen);
+
+    const back = try testing.allocator.alloc(u8, dlen);
+    defer testing.allocator.free(back);
+    const blen = try decompress(.snappy, comp[0..clen], back);
+    try testing.expectEqualSlices(u8, &input, back[0..blen]);
+}
+
+test "snappy: multi-block round-trips (input > 32KB Xerial chunk)" {
+    // Input larger than xerial_block_size (32KB) must split into multiple
+    // blocks and reassemble on decompress. 80KB → 3 blocks (32K + 32K + 16K).
+    var input: [80 * 1024]u8 = undefined;
+    var rng = std.Random.DefaultPrng.init(0xB10C5);
+    for (&input, 0..) |*b, i| b.* = @truncate(rng.random().int(u8) ^ @as(u8, @truncate(i)));
+
+    const bound = compressBound(.snappy, input.len);
+    const comp = try testing.allocator.alloc(u8, bound);
+    defer testing.allocator.free(comp);
+    const clen = try compress(.snappy, &input, comp, 0);
+    try testing.expect(bound >= clen);
+    try testing.expectEqualSlices(u8, &xerial_magic, comp[0..8]);
 
     const dlen = try decompressedLen(.snappy, comp[0..clen]);
     try testing.expectEqual(input.len, dlen);
