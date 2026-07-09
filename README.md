@@ -43,9 +43,7 @@ var m = try client.acquire();   // blocks (futex) when the ring is full
 try m.setTopic("events");
 m.setPartition(null);           // null → partitioner decides at batch time
 try m.setKey("entity-42");
-const dst = m.value();           // []u8, len == max_message_size
-@memcpy(dst[0..payload.len], payload);
-try m.commit(payload.len);       // submits to the network thread
+try m.writeMessage(payload);     // copies into the slot + commits to the network thread
 try m.await();                   // blocks until the broker acks
 ```
 

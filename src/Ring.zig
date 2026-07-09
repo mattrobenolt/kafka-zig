@@ -210,6 +210,17 @@ pub const Message = struct {
         return self.ring.slotValue(self.slot_index);
     }
 
+    /// Convenience: copy `payload` into the slot's value buffer and commit in
+    /// one call. Returns `error.MessageTooLarge` if the payload exceeds
+    /// `max_message_size`. This is the common-case replacement for the
+    /// `value()` + `@memcpy` + `commit(len)` two-step.
+    pub fn writeMessage(self: Message, payload: []const u8) Error!void {
+        const buf = self.ring.slotValue(self.slot_index);
+        if (payload.len > buf.len) return error.MessageTooLarge;
+        @memcpy(buf[0..payload.len], payload);
+        try self.ring.commit(self.slot_index, @intCast(payload.len));
+    }
+
     /// Publish the message to the network thread. After this the message is a
     /// pure await token; the slot (and its buffers) are the network thread's.
     pub fn commit(self: Message, value_len: u32) Error!void {
@@ -912,6 +923,25 @@ test "MessageTooLarge on oversized topic/key/value" {
     // A within-bounds commit still works afterwards.
     try m.setTopic("t");
     try m.commit(10);
+}
+
+test "writeMessage convenience: copies payload + commits in one call" {
+    var ring = try Ring.init(testing.allocator, tinyConfig(4));
+    defer ring.deinit(testing.allocator);
+
+    var m = try ring.acquire();
+    try m.setTopic("events");
+    try m.writeMessage("hello world");
+    // The message is now committed (pending) — await would block without a
+    // consumer, so just verify it's in-flight via tryAwait.
+    try testing.expectError(error.WouldBlock, m.tryAwait());
+
+    // Oversized payload → MessageTooLarge, message NOT committed.
+    var m2 = try ring.acquire();
+    try m2.setTopic("events");
+    const big: [65]u8 = @splat(0xAA);
+    try testing.expectError(error.MessageTooLarge, m2.writeMessage(&big));
+    try testing.expectError(error.WouldBlock, m2.tryAwait()); // still in-flight, not committed
 }
 
 test "tryAcquire returns WouldBlock when full" {
