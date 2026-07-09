@@ -517,3 +517,96 @@ e2e-lz4: kafka-up
 
     echo "e2e-lz4: PASS — produced {{ e2e_msgs }} lz4, consumed $COUNT"
     just kafka-down
+
+# ---------------------------------------------------------------------------
+# Real MSK integration test (issue #11) — MANUAL, requires VPC access.
+#
+# This recipe runs the e2e binary against a real AWS MSK cluster. Unlike the
+# local e2e (which starts a KRaft broker), this needs:
+#   - VPC access to the MSK cluster (the brokers are VPC-internal).
+#   - SCRAM-SHA-512 credentials (created via AWS Secrets Manager + MSK CLI).
+#   - The CA bundle that signed the MSK broker TLS certs. MSK uses AWS-issued
+#     certs by default — the system trust store may already have the AWS CA.
+#     If not, provide the CA PEM path via MSK_CA.
+#   - All 3 bootstrap endpoints (comma-separated) to exercise HA failover.
+#
+# The recipe is NOT in the default CI gate (`just ci`) — it requires real
+# creds + VPC access. Run it manually from inside the VPC:
+#
+#   MSK_BOOTSTRAP="b1:9096,b2:9096,b3:9096" \
+#     MSK_CA=/path/to/ca.pem MSK_USER=alice MSK_PASS=secret \
+#     just msk-e2e
+#
+# Variables (all required unless noted):
+#   MSK_BOOTSTRAP  — comma-separated bootstrap endpoints (all 3 for HA)
+#   MSK_CA         — path to the CA PEM that signed the MSK broker certs
+#   MSK_USER       — SCRAM-SHA-512 username
+#   MSK_PASS       — SCRAM-SHA-512 password
+#   MSK_TOPIC      — topic name (default: msk-e2e)
+#   MSK_NUM        — number of messages (default: 50)
+#   MSK_COMPRESSION — none|zstd|snappy|gzip|lz4 (default: none; zstd needs -Dzstd=true)
+# ---------------------------------------------------------------------------
+
+msk_topic := env_var_or_default("MSK_TOPIC", "msk-e2e")
+msk_num := env_var_or_default("MSK_NUM", "50")
+msk_compression := env_var_or_default("MSK_COMPRESSION", "none")
+
+[doc("Run the e2e against a real AWS MSK cluster (requires VPC access + SCRAM creds)")]
+[group("e2e")]
+msk-e2e:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "$(git rev-parse --show-toplevel)"
+
+    : "${MSK_BOOTSTRAP:?MSK_BOOTSTRAP is required (comma-separated bootstrap endpoints, e.g. b1:9096,b2:9096,b3:9096)}"
+    : "${MSK_CA:?MSK_CA is required (path to the CA PEM that signed the MSK broker certs)}"
+    : "${MSK_USER:?MSK_USER is required (SCRAM-SHA-512 username)}"
+    : "${MSK_PASS:?MSK_PASS is required (SCRAM-SHA-512 password)}"
+
+    echo "msk-e2e: building..."
+    zig build e2e
+
+    # --- Produce N messages through kafka-zig with all bootstrap endpoints ---
+    echo "msk-e2e: producing {{ msk_num }} messages to {{ msk_topic }} via kafka-zig..."
+    zig-out/bin/e2e --bootstrap "$MSK_BOOTSTRAP" \
+        --ca "$MSK_CA" \
+        --user "$MSK_USER" --pass "$MSK_PASS" \
+        --topic {{ msk_topic }} --num {{ msk_num }} \
+        --compression {{ msk_compression }}
+
+    # --- Consume with kafka-console-consumer (proves records are real) ---
+    # MSK-specific consumer properties: SASL_SSL + SCRAM-SHA-512 over TLS.
+    # ssl.endpoint.identification.algorithm is blanked because MSK broker certs
+    # may not have the bootstrap DNS names in their SANs — verify and adjust.
+    CONSUMER_PROPS="$(mktemp)"
+    trap 'rm -f "$CONSUMER_PROPS"' EXIT
+    printf '%s\n' \
+        'security.protocol=SASL_SSL' \
+        'sasl.mechanism=SCRAM-SHA-512' \
+        "sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username=\"$MSK_USER\" password=\"$MSK_PASS\";" \
+        'ssl.truststore.type=PEM' \
+        "ssl.truststore.location=$MSK_CA" \
+        'ssl.endpoint.identification.algorithm=' \
+        > "$CONSUMER_PROPS"
+
+    echo "msk-e2e: consuming {{ msk_num }} messages via kafka-console-consumer..."
+    # Use the first bootstrap endpoint for the consumer (kafka-console-consumer
+    # takes a single bootstrap-server; it discovers the rest via metadata).
+    FIRST_BROKER="${MSK_BOOTSTRAP%%,*}"
+    OUTPUT="$(kafka-console-consumer.sh \
+        --bootstrap-server "$FIRST_BROKER" \
+        --topic {{ msk_topic }} \
+        --from-beginning \
+        --max-messages {{ msk_num }} \
+        --command-config "$CONSUMER_PROPS" \
+        --timeout-ms 30000 2>&1)"
+    COUNT="$(echo "$OUTPUT" | grep -c '^msg-' || true)"
+    echo "$OUTPUT" | tail -5
+    echo "msk-e2e: consumed $COUNT messages"
+
+    if [ "$COUNT" -ne "{{ msk_num }}" ]; then
+        echo "msk-e2e: FAIL — expected {{ msk_num }}, got $COUNT"
+        exit 1
+    fi
+
+    echo "msk-e2e: PASS — produced {{ msk_num }}, consumed $COUNT"

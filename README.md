@@ -83,10 +83,73 @@ just test-zstd   # run tests with zstd compression (needs the devshell's static 
 just e2e         # start a local Kafka broker and run the end-to-end smoke (plaintext)
 just e2e-zstd    # same, with zstd-compressed batches
 just e2e-snappy  # same, with snappy-compressed batches
+just msk-e2e     # run against a real AWS MSK cluster (requires VPC access + creds)
 just docs        # generate Zig API docs into zig-out/docs/
 just fmt-check   # check formatting
 just lint        # run ziglint (needs the devshell)
 ```
+
+## Testing against real MSK
+
+The local e2e (`just e2e`) runs against a self-hosted KRaft broker with
+mkcert certs. To test against a real AWS MSK cluster, use `just msk-e2e`.
+This is a **manual** test — it requires VPC access to the MSK brokers and
+real SCRAM credentials, so it is not part of the default CI gate.
+
+### Prerequisites
+
+- **VPC access:** MSK brokers are VPC-internal. Run from a machine or pod
+  inside the VPC (e.g. an EC2 instance or k8s pod in the same VPC as the
+  cluster).
+- **SCRAM credentials:** Create SCRAM-SHA-512 credentials via AWS Secrets
+  Manager and associate them with the MSK cluster (see the [AWS MSK SCRAM
+docs](https://docs.aws.amazon.com/msk/latest/developerguide/msk-password.html)).
+  MSK supports SCRAM-SHA-512 only.
+- **CA bundle:** MSK broker TLS certs are signed by AWS's CA. The system trust
+  store on most Linux images already includes the AWS CA. If not, export the
+  CA PEM (e.g. from the AWS ACM cert or the broker's cert chain) and pass it
+  via `MSK_CA`. If the system trust store has the AWS CA, you can still pass
+  it explicitly for determinism.
+- **Bootstrap endpoints:** Get all 3 bootstrap endpoints from the MSK
+  console or CLI (`aws kafka get-bootstrap-brokers`). Pass them
+  comma-separated via `MSK_BOOTSTRAP` — the e2e binary configures all of them
+  as `bootstrap_brokers`, exercising the HA failover path.
+- **Topic:** Create a test topic on the MSK cluster (auto-create is usually
+  disabled). The default topic name is `msk-e2e`.
+
+### Running
+
+```sh
+MSK_BOOTSTRAP="b1-xxx:9096,b2-xxx:9096,b3-xxx:9096" \
+  MSK_CA=/path/to/aws-ca.pem \
+  MSK_USER=alice MSK_PASS='...' \
+  just msk-e2e
+```
+
+Optional variables:
+
+- `MSK_TOPIC` — topic name (default: `msk-e2e`)
+- `MSK_NUM` — number of messages (default: `50`)
+- `MSK_COMPRESSION` — `none`|`zstd`|`snappy`|`gzip`|`lz4` (default: `none`;
+  `zstd` requires a build with `-Dzstd=true`)
+
+The recipe produces N messages through kafka-zig (TLS 1.3 + SCRAM-SHA-512),
+then consumes them back with `kafka-console-consumer.sh` and asserts the count
+matches.
+
+### MSK-specific notes for Matt to verify
+
+- **Hostname verification:** The recipe blanks
+  `ssl.endpoint.identification.algorithm` for the consumer, matching the local
+  e2e. If the MSK broker certs have the bootstrap DNS names in their SANs,
+  remove this override to enable hostname verification (more secure). Check
+  with `openssl s_client -connect <broker>:9096 | openssl x509 -text | grep -A1 'Subject Alternative Name'`.
+- **CA path:** If the MSK certs are signed by the AWS root CA that's already
+  in the system trust store, `MSK_CA` can point to the system bundle (e.g.
+  `/etc/ssl/certs/ca-bundle.crt`). Verify the chain with `openssl verify -CAfile
+  $MSK_CA <broker-cert.pem>`.
+- **Port:** MSK's SASL/SCRAM-over-TLS port is **9096** (not 9093, which is
+  mTLS client-cert). PLAN §9 confirmed this.
 
 ## Roadmap
 
