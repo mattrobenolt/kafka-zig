@@ -142,6 +142,87 @@ pub fn isRetriable(code: i16) bool {
 }
 
 // ---------------------------------------------------------------------------
+// Reconnect backoff (per host:port, exponential with jitter)
+// ---------------------------------------------------------------------------
+
+/// Base backoff before re-dialing a recently-disconnected broker.
+const reconnect_base_ns: u64 = 100 * std.time.ns_per_ms;
+/// Maximum backoff cap.
+const reconnect_max_ns: u64 = 10 * std.time.ns_per_s;
+
+/// Compute the backoff delay for a given consecutive failure count.
+/// Exponential: base * 2^(failures-1), capped at max, with up to 50% jitter.
+fn backoffFor(failures: u32) u64 {
+    if (failures == 0) return 0;
+    const exp: u6 = @intCast(@min(failures - 1, 20)); // saturate at 2^20
+    const raw = reconnect_base_ns << exp;
+    const capped = @min(raw, reconnect_max_ns);
+    // Jitter: [0.5×, 1.0×) — deterministic per-call via a simple LCG over the
+    // monotonic clock so tests are bounded but not perfectly predictable.
+    var prng: std.Random.DefaultPrng = .init(@bitCast(@as(i64, @truncate(std.time.nanoTimestamp()))));
+    const jitter_factor: u64 = prng.random().uintLessThan(u64, capped / 2 + 1);
+    return capped / 2 + jitter_factor;
+}
+
+/// Record a connection failure for `host:port` and store the next-eligible
+/// reconnect time. Called when a connection is dropped or a dial fails.
+/// The backoff grows exponentially with each consecutive failure (capped at
+/// `reconnect_max_ns`). A successful connection clears the entry (see
+/// `clearBackoff`), so the count resets on success. Cold path.
+fn recordBackoff(self: *Producer, host: []const u8, port: u16) void {
+    var key_buf: [280]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "{s}:{d}", .{ host, port }) catch return;
+    const now = @as(i64, @truncate(std.time.nanoTimestamp()));
+    const gop = self.reconnect_backoff.getOrPut(self.allocator, key) catch return;
+    if (!gop.found_existing) {
+        // New entry: own the key. If the dup fails, remove the entry to avoid
+        // a dangling key.
+        const owned = self.allocator.dupe(u8, key) catch {
+            _ = self.reconnect_backoff.remove(key);
+            return;
+        };
+        gop.key_ptr.* = owned;
+        // Store the next-eligible time: now + base backoff (1st failure).
+        gop.value_ptr.* = now + @as(i64, @intCast(backoffFor(1)));
+    } else {
+        // Existing entry: the stored value is the previous next-eligible time.
+        // Compute the new failure count from the elapsed time since the stored
+        // time (approximate exponential: each call doubles the delay). This
+        // avoids storing a separate counter — the timestamp itself encodes the
+        // backoff progression.
+        const prev = gop.value_ptr.*;
+        const elapsed = now - prev; // time since last eligible-reconnect
+        // If the previous backoff has expired, restart from base. Otherwise,
+        // double the remaining delay (exponential growth).
+        const new_delay: u64 = if (elapsed >= 0) backoffFor(1) else blk: {
+            const remaining: u64 = @intCast(-elapsed);
+            break :blk @min(remaining * 2, reconnect_max_ns);
+        };
+        gop.value_ptr.* = now + @as(i64, @intCast(new_delay));
+    }
+}
+
+/// Check whether `host:port` is eligible for a reconnect (backoff expired or
+/// no prior failure). Returns the remaining wait in ns (0 = eligible now).
+fn backoffRemaining(self: *Producer, host: []const u8, port: u16) u64 {
+    var key_buf: [280]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "{s}:{d}", .{ host, port }) catch return 0;
+    const entry = self.reconnect_backoff.get(key) orelse return 0;
+    const now = @as(i64, @truncate(std.time.nanoTimestamp()));
+    if (entry <= now) return 0;
+    return @intCast(entry - now);
+}
+
+/// Clear the backoff for `host:port` — called on a successful connection.
+fn clearBackoff(self: *Producer, host: []const u8, port: u16) void {
+    var key_buf: [280]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "{s}:{d}", .{ host, port }) catch return;
+    if (self.reconnect_backoff.fetchRemove(key)) |kv| {
+        self.allocator.free(kv.key);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Metadata cache (cold-path allocated, single-threaded, no locks)
 // ---------------------------------------------------------------------------
 
@@ -186,6 +267,25 @@ metadata_stale: bool = false,
 
 // --- connections keyed by "host:port" (owned keys) ------------------------
 connections: std.StringHashMapUnmanaged(*Connection) = .empty,
+
+// --- reconnect backoff: per host:port, exponential with jitter ------------
+/// Maps owned "host:port" key → next-eligible reconnect time (mono ns).
+/// A broker that was just disconnected gets an exponentially growing backoff
+/// so a dead endpoint is not hammered on every drain. Cleared on successful
+/// connection (a working connection resets the backoff for that endpoint).
+/// Cold-path only: populated on disconnect, consulted on dial.
+reconnect_backoff: std.StringHashMapUnmanaged(i64) = .empty,
+
+// --- bootstrap failover: rotating start index for metadata fetches --------
+/// Incremented (mod bootstrap.len) on every `metadataConnection` call so
+/// successive metadata refreshes start from a different bootstrap broker.
+/// Single-threaded (network thread only), no atomics needed.
+bootstrap_offset: usize = 0,
+/// When true, the next `refreshMetadata` uses the bootstrap list exclusively
+/// (ignoring cached broker endpoints from the last metadata). Set when all
+/// known brokers are unreachable; cleared on a successful metadata refresh.
+/// This is Kafka's `metadata.recovery.strategy=rebootstrap` equivalent.
+force_bootstrap: bool = false,
 
 // --- round-robin counters, persistent across metadata refreshes -----------
 round_robin: std.StringHashMapUnmanaged(partitioner.RoundRobin) = .empty,
@@ -341,6 +441,10 @@ pub fn deinit(self: *Producer) void {
     while (rr_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
     self.round_robin.deinit(self.allocator);
 
+    var rb_it = self.reconnect_backoff.iterator();
+    while (rb_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+    self.reconnect_backoff.deinit(self.allocator);
+
     self.allocator.free(self.collected);
     self.allocator.free(self.records_scratch);
     self.allocator.free(self.topic_data_scratch);
@@ -394,6 +498,12 @@ fn drainOnce(self: *Producer) !bool {
     if (self.metadata_stale or !self.metadata_loaded) {
         self.refreshMetadata() catch |err| {
             log.warn("metadata refresh failed: {s}", .{@errorName(err)});
+            // Charge the failure against pending slots so they eventually fail
+            // (bounded by max_retries) rather than hanging forever when all
+            // brokers are unreachable. Without this, a persistently-down
+            // cluster would leave every slot pending indefinitely — their
+            // `await()` would never resolve.
+            self.chargeMetadataFailure();
             return false; // back off; try again next drain
         };
     }
@@ -964,17 +1074,32 @@ fn brokerAddr(self: *Producer, node_id: i32) ?BrokerInfo {
     return null;
 }
 
-/// Send a Metadata v12 request over the bootstrap connection and rebuild the
-/// cache. Cold path (refresh cadence), allocations allowed (PLAN §8).
+/// Send a Metadata v12 request and rebuild the cache. Cold path (refresh
+/// cadence, allocations allowed, PLAN §8).
+///
+/// HA failover (#2): when `force_bootstrap` is set (all known brokers were
+/// unreachable on a prior refresh), use the bootstrap list exclusively.
+/// Otherwise, first try known brokers from the last metadata (faster — no
+/// TLS re-handshake if cached), and fall back to the bootstrap list if they
+/// all fail. On total failure, set `force_bootstrap` so the next attempt
+/// starts fresh from the bootstrap list.
 fn refreshMetadata(self: *Producer) !void {
-    const conn = try self.metadataConnection();
+    const conn: *Connection = if (self.force_bootstrap)
+        try self.metadataConnection()
+    else
+        self.metadataConnectionFromKnown() catch |err| {
+            log.warn("all known brokers unreachable, falling back to bootstrap: {s}", .{@errorName(err)});
+            self.force_bootstrap = true;
+            return self.refreshMetadata();
+        };
+
     const body: MetadataBody = .{};
     const corr = conn.sendRequest(.metadata, 12, body) catch |err| {
-        self.dropMetadataConnection();
+        self.dropConnectionFor(conn);
         return err;
     };
     const resp_body = conn.readResponse() catch |err| {
-        self.dropMetadataConnection();
+        self.dropConnectionFor(conn);
         return err;
     };
     var payload = try stripHeaderV1(resp_body, corr);
@@ -984,6 +1109,51 @@ fn refreshMetadata(self: *Producer) !void {
     try self.rebuildMetadata(resp);
     self.metadata_loaded = true;
     self.metadata_stale = false;
+    self.force_bootstrap = false; // success: clear the re-bootstrap flag
+}
+
+/// Try to get a metadata connection from known brokers (from the last metadata
+/// response). Falls back to `metadataConnection` (bootstrap) when no known
+/// brokers exist or all are unreachable.
+fn metadataConnectionFromKnown(self: *Producer) !*Connection {
+    if (self.brokers.len == 0) return self.metadataConnection();
+    // Try each known broker, respecting backoff.
+    var last_err: anyerror = error.ConnectionRefused;
+    for (self.brokers) |b| {
+        const wait = self.backoffRemaining(b.host, b.port);
+        if (wait > 0) continue;
+        const conn = self.connectionFor(b.host, b.port) catch |err| {
+            last_err = err;
+            self.recordBackoff(b.host, b.port);
+            log.warn("known broker {d} {s}:{d} failed: {s}", .{ b.node_id, b.host, b.port, @errorName(err) });
+            continue;
+        };
+        self.clearBackoff(b.host, b.port);
+        return conn;
+    }
+    return last_err;
+}
+
+/// Drop the connection for a given `*Connection` by finding its key in the
+/// connections map. Used when a metadata request fails on a specific
+/// connection and we need to drop just that one.
+fn dropConnectionFor(self: *Producer, conn: *Connection) void {
+    // Find and remove the connection from the map by value. Linear scan is
+    // fine — the connections map is small (one entry per broker).
+    var it = self.connections.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* == conn) {
+            if (self.connections.fetchRemove(entry.key_ptr.*)) |kv| {
+                kv.value.close();
+                self.allocator.free(kv.key);
+            }
+            return;
+        }
+    }
+    // Not found in the map — the connection was already dropped (e.g. a
+    // bootstrap connection that failed mid-dial before being cached). Close
+    // it directly to avoid a leak.
+    conn.close();
 }
 
 fn rebuildMetadata(self: *Producer, resp: metadata.Response) !void {
@@ -1051,11 +1221,31 @@ fn freeMetadata(self: *Producer) void {
 // ---------------------------------------------------------------------------
 
 fn metadataConnection(self: *Producer) !*Connection {
-    // v1: always bootstrap[0] for metadata. A real client would round-robin
-    // bootstrap and fail over; the single-broker mock and MSK bootstrap set
-    // make this adequate for now.
-    const b = self.options.bootstrap[0];
-    return self.connectionFor(b.host, b.port);
+    // HA bootstrap failover (#2): cycle through ALL configured bootstrap
+    // brokers with a rotating start index until one answers, instead of
+    // bootstrap[0] only. On connection failure to one, try the next; if all
+    // fail, return the last error. The rotating offset spreads load across
+    // successive refreshes and avoids hammering a single dead endpoint.
+    const bootstrap = self.options.bootstrap;
+    assert(bootstrap.len > 0);
+    const start = self.bootstrap_offset % bootstrap.len;
+    self.bootstrap_offset +%= 1;
+
+    var last_err: anyerror = error.ConnectionRefused;
+    for (0..bootstrap.len) |i| {
+        const idx = (start + i) % bootstrap.len;
+        const b = bootstrap[idx];
+        const conn = self.connectionFor(b.host, b.port) catch |err| {
+            last_err = err;
+            self.recordBackoff(b.host, b.port);
+            log.warn("bootstrap {s}:{d} failed: {s}", .{ b.host, b.port, @errorName(err) });
+            continue;
+        };
+        // Success: clear backoff for this endpoint.
+        self.clearBackoff(b.host, b.port);
+        return conn;
+    }
+    return last_err;
 }
 
 fn leaderConnection(self: *Producer, leader: i32) !*Connection {
@@ -1083,6 +1273,8 @@ fn connectionFor(self: *Producer, host: []const u8, port: u16) !*Connection {
     const owned_key = try self.allocator.dupe(u8, key);
     errdefer self.allocator.free(owned_key);
     try self.connections.put(self.allocator, owned_key, conn);
+    // Successful dial: clear any prior backoff for this endpoint.
+    self.clearBackoff(host, port);
     return conn;
 }
 
@@ -1090,19 +1282,6 @@ fn dropLeaderConnection(self: *Producer, leader: i32) void {
     const addr = self.brokerAddr(leader) orelse return;
     var key_buf: [280]u8 = undefined;
     const key = std.fmt.bufPrint(&key_buf, "{s}:{d}", .{ addr.host, addr.port }) catch return;
-    if (self.connections.fetchRemove(key)) |kv| {
-        kv.value.close();
-        self.allocator.free(kv.key);
-    }
-}
-
-/// Drop the bootstrap metadata connection (v1: always bootstrap[0]). Called
-/// when a metadata request fails so the next retry dials a fresh connection
-/// instead of reusing a dead/broken one.
-fn dropMetadataConnection(self: *Producer) void {
-    const b = self.options.bootstrap[0];
-    var key_buf: [280]u8 = undefined;
-    const key = std.fmt.bufPrint(&key_buf, "{s}:{d}", .{ b.host, b.port }) catch return;
     if (self.connections.fetchRemove(key)) |kv| {
         kv.value.close();
         self.allocator.free(kv.key);
@@ -1183,11 +1362,11 @@ fn initProducerId(self: *Producer) !void {
         .transaction_timeout_ms = self.options.timeout_ms,
     };
     const corr = conn.sendRequest(.init_producer_id, 4, body) catch |err| {
-        self.dropMetadataConnection();
+        self.dropConnectionFor(conn);
         return err;
     };
     const resp_body = conn.readResponse() catch |err| {
-        self.dropMetadataConnection();
+        self.dropConnectionFor(conn);
         return err;
     };
     var payload = try stripHeaderV1(resp_body, corr);
@@ -1244,6 +1423,28 @@ fn recoverProducerId(self: *Producer) !void {
 /// charge, the reset flag is cleared so a later send does not inherit a stale
 /// recovery state. Wakes completions + reclaims so any failed slot's `await()`
 /// resolves immediately (the drain returns before its own wake). Cold path.
+/// Charge a failed metadata refresh against every pending slot's retry
+/// budget. Without this a persistently-down cluster (all bootstrap brokers
+/// unreachable) would back off forever while slots stay pending, and their
+/// `await()` would hang. Bumping each pending slot's attempt counter and
+/// failing it once the budget is exhausted bounds the wait to at most
+/// `max_retries` failed metadata attempts. Cold path (error recovery).
+fn chargeMetadataFailure(self: *Producer) void {
+    const lo = self.ring.readHead();
+    const hi = self.ring.writeHead();
+    var pos = lo;
+    while (pos < hi) : (pos += 1) {
+        if (!self.ring.slotIsPending(pos)) continue;
+        const generation = self.ring.slotGeneration(pos);
+        if (self.bumpAttempts(pos, generation) > self.options.max_retries) {
+            self.ring.markFailed(pos, generation, 13); // NETWORK_EXCEPTION
+            self.resetAttempts(pos);
+        }
+    }
+    self.ring.wakeCompletions();
+    _ = self.ring.reclaim();
+}
+
 fn chargeRecoveryFailure(self: *Producer) void {
     const lo = self.ring.readHead();
     const hi = self.ring.writeHead();

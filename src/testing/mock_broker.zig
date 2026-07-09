@@ -56,6 +56,11 @@ pub const Mode = enum {
     /// a lost-ack retry where the first write is already durable. The
     /// idempotent producer must treat 37 as an ACK.
     duplicate_seq,
+    /// Close the TLS connection immediately after receiving the first Produce
+    /// request (no response sent). The producer must drop the dead connection,
+    /// re-dial, and retry — the second Produce succeeds. Tests reconnect-on-drop
+    /// on the produce hot path (#2).
+    close_after_first_produce,
 };
 
 /// A captured record-batch from a Produce request, for idempotency assertions.
@@ -95,6 +100,9 @@ pub const Broker = struct {
     /// InitProducerId requests served. Startup acquisition is call #1; a PID
     /// reset on OUT_OF_ORDER_SEQUENCE / UNKNOWN_PRODUCER_ID bumps this to >=2.
     init_producer_id_requests: std.atomic.Value(u32) = .init(0),
+    /// Number of accepted connections. The reconnect-on-drop test asserts this
+    /// is >= 2 (the initial connection + the re-dial after the drop).
+    connections_accepted: std.atomic.Value(u32) = .init(0),
     /// Per-partition "already injected a retriable error" flags (mock thread
     /// only; no synchronization needed).
     injected: [max_partitions]bool = @splat(false),
@@ -122,6 +130,9 @@ pub const Broker = struct {
     /// test calls `openGate()`.
     first_produce_seen: std.atomic.Value(bool) = .init(false),
     gate_open: std.atomic.Value(bool) = .init(false),
+    /// Used by `close_after_first_produce` to ensure only the first connection
+    /// is dropped; subsequent connections get normal acks.
+    first_produce_dropped: std.atomic.Value(bool) = .init(false),
 
     pub fn start(allocator: Allocator, options: Options) !*Broker {
         std.debug.assert(options.num_partitions <= max_partitions);
@@ -175,6 +186,7 @@ pub const Broker = struct {
                 conn.stream.close();
                 return;
             }
+            _ = self.connections_accepted.fetchAdd(1, .acq_rel);
             self.serve(conn.stream) catch |err| {
                 std.debug.print("mock broker serve error: {s}\n", .{@errorName(err)});
             };
@@ -232,7 +244,14 @@ pub const Broker = struct {
             };
             if (hs.isConnected()) {
                 while (req_buf.next() catch return error.MalformedRequest) |frame| {
-                    try sess.dispatch(frame, &scram_state);
+                    sess.dispatch(frame, &scram_state) catch |err| switch (err) {
+                        // close_after_first_produce: the broker intentionally
+                        // drops the connection after the first Produce (no
+                        // response sent). Returning here closes the TCP stream,
+                        // causing the client to see ConnectionClosed.
+                        error.ConnectionDropAfterProduce => return,
+                        else => return err,
+                    };
                 }
             }
         }
@@ -415,6 +434,13 @@ const Session = struct {
                 // duplicate_seq — exactly once per partition (the first write
                 // whose ack was "lost", modelled via the injected[] flag).
                 var count_produced = err == 0;
+                // close_after_first_produce: don't count the dropped Produce
+                // (the ack was lost; the retry is what makes it durable).
+                if (self.broker.options.mode == .close_after_first_produce and
+                    !self.broker.first_produce_dropped.load(.acquire))
+                {
+                    count_produced = false;
+                }
                 if (self.broker.options.mode == .duplicate_seq) {
                     const idx: usize = @intCast(index);
                     if (idx < max_partitions and !self.broker.injected[idx]) {
@@ -472,6 +498,16 @@ const Session = struct {
             while (!self.broker.gate_open.load(.acquire)) std.Thread.sleep(std.time.ns_per_ms);
         }
 
+        // close_after_first_produce: drop the connection on the FIRST Produce
+        // request (no response sent). The client sees ConnectionClosed, drops
+        // the dead connection, re-dials, and retries. Subsequent Produces (on
+        // the new connection) get normal acks.
+        if (self.broker.options.mode == .close_after_first_produce and
+            self.broker.first_produce_dropped.cmpxchgStrong(false, true, .acq_rel, .acquire) == null)
+        {
+            return error.ConnectionDropAfterProduce;
+        }
+
         var body: [16 * 1024]u8 = undefined;
         var w: std.Io.Writer = .fixed(&body);
         try produce.encodeResponse(&w, .{ .responses = tr_scratch[0..tr_len], .throttle_time_ms = 0 });
@@ -488,6 +524,7 @@ const Session = struct {
             .retriable_once => injectOnce(self.broker, idx, 6), // NOT_LEADER_OR_FOLLOWER
             .out_of_order_once => injectOnce(self.broker, idx, 45), // OUT_OF_ORDER_SEQUENCE
             .unknown_pid_once => injectOnce(self.broker, idx, 73), // UNKNOWN_PRODUCER_ID
+            .close_after_first_produce => 0, // ack (but connection drops before response)
         };
     }
 

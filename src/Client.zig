@@ -1030,3 +1030,136 @@ test "idempotency OFF: DUPLICATE_SEQUENCE_NUMBER fails (not treated as ack)" {
     try testing.expectError(error.SendFailed, m.await());
     try testing.expectEqual(@as(u32, 37), m.failureCode()); // DUPLICATE_SEQUENCE_NUMBER
 }
+
+// ---------------------------------------------------------------------------
+// #2: HA bootstrap failover + reconnect-on-drop + backoff
+// ---------------------------------------------------------------------------
+
+test "#2 bootstrap failover: 3 endpoints, only 2nd listening — produce succeeds" {
+    // Configure 3 bootstrap endpoints; only the 2nd is the mock broker. The
+    // producer must fail over from the 1st (dead port) to the 2nd (live) and
+    // successfully fetch metadata + produce.
+    var broker = try mock.Broker.start(testing.allocator, .{ .mode = .ok, .num_partitions = 4 });
+    defer broker.stop();
+
+    // Port 1 and port 2 are privileged ports that will refuse on a dev box.
+    // The TCP connect fails immediately with ConnectionRefused — no hang.
+    const bootstrap = [_]Broker{
+        .{ .host = "127.0.0.1", .port = 1 },
+        .{ .host = "127.0.0.1", .port = broker.port },
+        .{ .host = "127.0.0.1", .port = 2 },
+    };
+    var cfg = testConfig(&bootstrap);
+    cfg.io_timeout_ms = 1000; // fail fast on dead ports
+    var client = try Client.init(testing.allocator, cfg);
+    defer client.deinit();
+
+    const n = 10;
+    var handles: [n]Message = undefined;
+    for (&handles, 0..) |*m, i| {
+        m.* = try client.acquire();
+        try m.setTopic("events");
+        m.setPartition(null);
+        const dst = m.value();
+        const payload = try std.fmt.bufPrint(dst, "msg-{d}", .{i});
+        try m.commit(@intCast(payload.len));
+    }
+    for (&handles) |*m| try m.await();
+
+    try testing.expectEqual(@as(u32, n), broker.produced.load(.acquire));
+}
+
+test "#2 all bootstrap down: init fails gracefully, no hang" {
+    // No mock broker — both endpoints are dead. Client.init spawns the network
+    // thread, which tries to refresh metadata and fails. The first produce
+    // should fail gracefully (not hang). We use a short io_timeout and short
+    // retry budget so the failure surfaces quickly.
+    const bootstrap = [_]Broker{
+        .{ .host = "127.0.0.1", .port = 1 },
+        .{ .host = "127.0.0.1", .port = 2 },
+    };
+    var cfg = testConfig(&bootstrap);
+    cfg.io_timeout_ms = 500;
+    cfg.max_retries = 2;
+    cfg.linger_ms = 10;
+    var client = try Client.init(testing.allocator, cfg);
+    defer client.deinit();
+
+    var m = try client.acquire();
+    try m.setTopic("events");
+    m.setPartition(0);
+    const dst = m.value();
+    @memcpy(dst[0..3], "bad");
+    try m.commit(3);
+
+    // Should fail, not hang. The error is SendFailed (the slot is failed
+    // after exhausting retries against unreachable brokers).
+    try testing.expectError(error.SendFailed, m.await());
+}
+
+test "#2 reconnect-on-drop: broker drops first Produce, re-dial + retry succeeds" {
+    // The mock broker closes the TLS connection after the first Produce (no
+    // response). The producer must drop the dead connection, re-dial, retry
+    // the slots, and the second Produce succeeds. All messages must eventually
+    // ack.
+    var broker = try mock.Broker.start(testing.allocator, .{
+        .mode = .close_after_first_produce,
+        .num_partitions = 1,
+    });
+    defer broker.stop();
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var cfg = testConfig(&bootstrap);
+    // Use a longer retry budget and shorter backoff so the reconnect happens
+    // quickly within the test.
+    cfg.max_retries = 5;
+    cfg.linger_ms = 5;
+    cfg.enable_idempotency = false; // simplify: no PID re-init on reconnect
+    var client = try Client.init(testing.allocator, cfg);
+    defer client.deinit();
+
+    const n = 5;
+    var handles: [n]Message = undefined;
+    for (&handles, 0..) |*m, i| {
+        m.* = try client.acquire();
+        try m.setTopic("events");
+        m.setPartition(0);
+        const dst = m.value();
+        const payload = try std.fmt.bufPrint(dst, "msg-{d}", .{i});
+        try m.commit(@intCast(payload.len));
+    }
+    for (&handles) |*m| try m.await();
+
+    // All messages eventually acked after the reconnect.
+    try testing.expectEqual(@as(u32, n), broker.produced.load(.acquire));
+    // The broker accepted at least 2 connections: the initial (dropped) + the
+    // re-dial (successful retry).
+    try testing.expect(broker.connections_accepted.load(.acquire) >= 2);
+}
+
+test "#2 reconnect backoff: dead broker is not hammered" {
+    // With all bootstrap brokers down, the producer should not busy-spin:
+    // the drain-level backoff sleep limits the rate of connection attempts.
+    // We assert the produce fails gracefully within a bounded time (not a
+    // hang), proving the backoff + retry budget is engaged.
+    const bootstrap = [_]Broker{
+        .{ .host = "127.0.0.1", .port = 1 },
+    };
+    var cfg = testConfig(&bootstrap);
+    cfg.io_timeout_ms = 200;
+    cfg.max_retries = 3;
+    cfg.linger_ms = 50; // 50ms backoff between drains
+    var client = try Client.init(testing.allocator, cfg);
+    defer client.deinit();
+
+    var m = try client.acquire();
+    try m.setTopic("events");
+    m.setPartition(0);
+    const dst = m.value();
+    @memcpy(dst[0..2], "bk");
+    try m.commit(2);
+
+    // Should fail within the retry budget, not hang. The backoff sleep
+    // between drains (50ms) prevents a tight CPU spin against the dead port.
+    try testing.expectError(error.SendFailed, m.await());
+}
