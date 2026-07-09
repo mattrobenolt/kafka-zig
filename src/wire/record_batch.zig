@@ -149,9 +149,14 @@ pub const Batch = struct {
         self.* = undefined;
     }
 
-    /// The compression codec from the attributes field (bits 0–2).
+    /// The compression codec from the attributes field (bits 0–2). u3 values
+    /// 5–7 are valid bit patterns but invalid Kafka codecs, so use
+    /// `std.enums.fromInt` (returns null) rather than `@enumFromInt`
+    /// (safety-panics on an invalid tag). A getter cannot return an error, and
+    /// the CRC check in `decodeBatch` catches corruption first, so a malformed
+    /// codec maps to `.none`.
     pub fn compression(self: Batch) Compression {
-        return @enumFromInt(@as(u3, @truncate(self.attributes)));
+        return std.enums.fromInt(Compression, @as(u3, @truncate(self.attributes))) orelse .none;
     }
 
     /// Whether the batch is transactional (bit 4).
@@ -590,7 +595,11 @@ pub fn decodeBatch(allocator: std.mem.Allocator, reader: *Reader) (DecodeError |
     // buffer (decode is the cold mock-broker/test path, so an allocator is
     // permitted per the module allocator policy) and parse records from there.
     // recordsCount is the ORIGINAL uncompressed count, unchanged by compression.
-    const codec: compress.Codec = @enumFromInt(@as(u3, @truncate(attributes)));
+    // u3 values 5–7 are valid bit patterns but invalid Kafka codecs; use
+    // `std.enums.fromInt` (returns null) so malformed input yields an error
+    // instead of safety-panicking like `@enumFromInt`.
+    const codec_bits: u3 = @truncate(attributes);
+    const codec: compress.Codec = std.enums.fromInt(compress.Codec, codec_bits) orelse return error.Malformed;
     var records_reader: *Reader = &sub;
     var decompressed_reader: Reader = undefined;
     var decompressed: ?[]u8 = null;
@@ -1088,6 +1097,42 @@ test "decodeBatch: bad magic returns BadMagic" {
 
     var r: Reader = .init(corrupted[0..batch_bytes.len]);
     try testing.expectError(error.BadMagic, decodeBatch(testing.allocator, &r));
+}
+
+test "Batch.compression: invalid codec bits (5-7) map to .none, no panic" {
+    // u3 values 5–7 are valid bit patterns but not Kafka codecs. `@enumFromInt`
+    // would safety-panic on these; `intToEnum` (used by the getter) must map
+    // them to `.none` instead of crashing on a malformed/corrupt batch.
+    var no_records: [0]Record = .{};
+    inline for (.{ 5, 6, 7 }) |bad| {
+        const b: Batch = .{
+            .base_offset = 0,
+            .partition_leader_epoch = -1,
+            .attributes = bad,
+            .last_offset_delta = 0,
+            .base_timestamp = 0,
+            .max_timestamp = 0,
+            .producer_id = -1,
+            .producer_epoch = -1,
+            .base_sequence = -1,
+            .records = &no_records,
+        };
+        try testing.expectEqual(Compression.none, b.compression());
+    }
+    // Valid codecs still decode correctly through the same path.
+    var v: Batch = .{
+        .base_offset = 0,
+        .partition_leader_epoch = -1,
+        .attributes = 4, // zstd
+        .last_offset_delta = 0,
+        .base_timestamp = 0,
+        .max_timestamp = 0,
+        .producer_id = -1,
+        .producer_epoch = -1,
+        .base_sequence = -1,
+        .records = &no_records,
+    };
+    try testing.expectEqual(Compression.zstd, v.compression());
 }
 
 test "decodeBatch: truncated batch returns EndOfStream" {

@@ -389,6 +389,16 @@ sequences: std.AutoHashMapUnmanaged(SeqKey, i32) = .empty,
 /// counters to 0, and clear the `base_sequence` stamp on every pending slot so
 /// each re-sends fresh from 0 under the new PID (see `recoverProducerId`).
 pid_reset_pending: bool = false,
+/// Set by `run()` when the startup `initProducerId` fails while
+/// `enable_idempotency` is true. Gates Produce exactly like `pid_reset_pending`:
+/// the next drain retries acquisition BEFORE building any batch and does not
+/// send until a PID is in hand, so the default idempotency contract is never
+/// silently downgraded to non-idempotent (sentinel -1) batches. Distinct from
+/// `pid_reset_pending` (mid-flight loss after a 45/73 error) only in WHEN it is
+/// set — both block Produce until the PID is acquired. Persistent acquisition
+/// failure is bounded via `chargeRecoveryFailure` so in-flight slots eventually
+/// fail rather than hang.
+pid_pending: bool = false,
 
 /// A (topic, partition) run in the sorted `collected` array: `[start, end)`
 /// map to one record batch / one partition_response.
@@ -526,13 +536,16 @@ pub fn deinit(self: *Producer) void {
 /// out.
 pub fn run(self: *Producer) void {
     // Acquire a PID/epoch before the first drain when idempotency is enabled.
-    // This is a blocking call to a bootstrap broker; if it fails we log and
-    // proceed in non-idempotent mode (sentinel -1) rather than hanging.
-    // (Startup-acquisition retry is a follow-up; mid-flight PID recovery on
-    // sequence errors is handled by `recoverProducerId`.)
+    // This is a blocking call to a bootstrap broker; if it fails we set
+    // `pid_pending` so the next drain retries acquisition BEFORE sending any
+    // Produce. We must NOT silently proceed with sentinel -1 batches — that
+    // would downgrade the caller's default no-duplicates contract without
+    // their knowledge. `drainOnce` gates Produce on `pid_pending`; mid-flight
+    // PID recovery on sequence errors is handled by `recoverProducerId`.
     if (self.options.enable_idempotency) {
         self.initProducerId() catch |err| {
-            log.warn("PID acquisition failed, proceeding non-idempotent: {s}", .{@errorName(err)});
+            log.warn("PID acquisition failed, deferring send until acquired: {s}", .{@errorName(err)});
+            self.pid_pending = true;
         };
     }
     self.read_head = self.ring.readHead();
@@ -671,6 +684,23 @@ fn drainOnce(self: *Producer) !bool {
             log.warn("PID reset failed, retrying next drain: {s}", .{@errorName(err)});
             return false;
         };
+    }
+
+    // Startup PID acquisition, deferred here when the initial `initProducerId`
+    // in `run()` failed. With `enable_idempotency` true the producer must NOT
+    // send Produce until a PID is acquired — silently downgrading to sentinel
+    // -1 batches would violate the caller's no-duplicates contract. Retry
+    // acquisition before building any batch; on persistent failure charge
+    // pending slots' retry budgets so they eventually fail (bounded) rather
+    // than hang. `pid_pending` clears only on a successful acquisition, so a
+    // later send never inherits the non-idempotent path by accident.
+    if (self.pid_pending) {
+        self.initProducerId() catch |err| {
+            log.warn("PID acquisition failed, retrying next drain: {s}", .{@errorName(err)});
+            self.chargeRecoveryFailure();
+            return false;
+        };
+        self.pid_pending = false;
     }
 
     const base = self.ring.readHead();
