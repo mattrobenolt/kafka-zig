@@ -104,8 +104,22 @@ all codecs):**
   decoder but FAIL against `kafka-console-consumer` (Java/Xerial). Always
   Xerial-frame snappy for Kafka interop. (Verified against kafka-python
   `snappy_encode(xerial_compatible=True)` + snappy-java `SnappyOutputStream`.)
-- **gzip** (attr 1): standard DEFLATE.
-- **lz4** (attr 3): lz4 block format (verify — Kafka may use framed, not raw).
+- **gzip** (attr 1): full gzip container format (RFC 1952), NOT raw DEFLATE.
+  Kafka's `GzipCompression` wraps `java.util.zip.GZIPOutputStream`/
+  `GZIPInputStream`, which produce/consume the gzip container (10-byte header
+  + DEFLATE body + 8-byte CRC32/ISIZE footer). A raw-DEFLATE encoder will FAIL
+  against `kafka-console-consumer` (Java `GZIPInputStream` expects the gzip
+  header). Always use the full gzip container for Kafka interop. (Verified
+  against the Kafka Java client `GzipCompression` / `GzipOutputStream` source.)
+- **lz4** (attr 3): LZ4 Frame format (v1.5.1), NOT the raw LZ4 block format and
+  NOT lz4-java's "LZ4Block" format. Kafka's `Lz4Compression` wraps
+  `org.apache.kafka.common.compress.Lz4BlockOutputStream`, which is "A partial
+  implementation of the v1.5.1 LZ4 Frame format" with magic 0x184D2204. This
+  is a format surprise comparable to the snappy Xerial framing. The frame is:
+  4-byte magic (LE) + FLG byte + BD byte + HC byte (XXHash32 of FLG+BD >> 8) +
+  blocks (4-byte LE block_size with bit 31 = uncompressed flag + block data) +
+  4-byte LE end mark (0). (Verified against the Kafka Java client
+  `Lz4BlockOutputStream` / `Lz4BlockInputStream` source — trunk.)
 
 **Non-idempotent producer sentinels:** `producerId = -1`, `producerEpoch = -1`,
 `baseSequence = -1` (Java `RecordBatch` defaults). State these exactly.

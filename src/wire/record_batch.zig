@@ -187,7 +187,9 @@ pub const EncodeOptions = struct {
     /// Compression codec. `.none` writes the records region verbatim. `.zstd`
     /// (requires `-Dzstd=true`) and `.snappy` (always available, pure-Zig)
     /// compress the records region in place before CRC/length finalize, per
-    /// PLAN §2.1. gzip/lz4 return `error.CompressionNotImplemented`.
+    /// `.gzip` (always available, pure-Zig stored DEFLATE blocks) and
+    /// `.lz4` (always available, pure-Zig LZ4 Frame format) also compress the
+    /// records region in place before CRC/length finalize, per PLAN §2.1.
     compression: Compression = .none,
     /// zstd compression level, used only when `compression == .zstd`.
     compression_level: i32 = compress.default_level,
@@ -232,7 +234,8 @@ pub const EncodeOptions = struct {
 /// writes into `options.scratch` (required for a compressed batch), then the
 /// compressed bytes are copied back into `out` — no heap allocation. `.zstd`
 /// requires `-Dzstd=true`; without it, compress returns
-/// `error.CompressionNotImplemented`. gzip/lz4 are unimplemented.
+/// `error.CompressionNotImplemented`. `.gzip` and `.lz4` are always available
+/// (pure-Zig, no build flag).
 /// recordsCount stays the ORIGINAL uncompressed count — Kafka keeps the record
 /// count even when the region is compressed.
 ///
@@ -1073,26 +1076,130 @@ test "encodeBatch: non-idempotent sentinels (producerId=-1, epoch=-1, seq=-1)" {
     try testing.expect(!batch.isIdempotent());
 }
 
-test "encodeBatch: rejects gzip/lz4 (unimplemented codecs)" {
-    // gzip/lz4 are out of v1 scope; the codec slot returns NotImplemented and
-    // encodeBatch surfaces it as CompressionNotImplemented regardless of the
-    // -Dzstd flag. snappy is implemented (pure-Zig, no build flag).
+test "encodeBatch + decodeBatch: gzip round-trip (records region compressed)" {
+    // Gzip compression (codec attribute 1, Kafka's GzipCompression/GZIPOutputStream).
+    // The encoder uses stored DEFLATE blocks (no match-finding), but the output
+    // is a valid gzip container that the decoder (std.compress.flate.Decompress)
+    // can decompress. Verifies the compress-before-CRC ordering and that
+    // recordsCount stays the uncompressed count.
+    const v1 = "payload-payload-payload-payload-payload" ** 4;
+    const v2 = "another-record-value-another-record-value" ** 4;
+    const records = [_]Record{
+        .{ .offset_delta = 0, .timestamp_delta = 0, .key = "k1", .value = v1, .headers = &.{} },
+        .{ .offset_delta = 1, .timestamp_delta = 5, .key = "k2", .value = v2, .headers = &.{} },
+    };
+
+    var buf: [2048]u8 = undefined;
+    var scratch: [2048]u8 = undefined;
+    const bytes = try encodeBatch(&buf, &records, .{ .compression = .gzip, .scratch = &scratch });
+
+    // The attributes field (offset 21, u16 big-endian) must carry gzip bits (1).
+    try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, bytes[21..23], .big));
+
+    var r: Reader = .init(bytes);
+    var batch = try decodeBatch(testing.allocator, &r);
+    defer batch.deinit(testing.allocator);
+
+    try testing.expectEqual(Compression.gzip, batch.compression());
+    try testing.expectEqual(@as(usize, 2), batch.records.len);
+    try testing.expectEqualStrings("k1", batch.records[0].key.?);
+    try testing.expectEqualStrings(v1, batch.records[0].value.?);
+    try testing.expectEqualStrings("k2", batch.records[1].key.?);
+    try testing.expectEqualStrings(v2, batch.records[1].value.?);
+    try testing.expectEqual(@as(i32, 1), batch.last_offset_delta);
+    // All bytes consumed.
+    try testing.expectEqual(@as(usize, 0), r.remaining().len);
+}
+
+test "encodeBatch: gzip CRC verifies over compressed bytes" {
+    // The CRC covers attributes→end, so it must be computed over the
+    // gzip-compressed records region (not the uncompressed records). Flip a
+    // byte in the compressed region → decode must reject on CRC.
     const records = [_]Record{.{
         .offset_delta = 0,
         .timestamp_delta = 0,
         .key = "k1",
-        .value = "v1",
+        .value = "compressible-compressible-compressible" ** 4,
         .headers = &.{},
     }};
+    var buf: [1024]u8 = undefined;
+    var scratch: [1024]u8 = undefined;
+    const bytes = try encodeBatch(&buf, &records, .{ .compression = .gzip, .scratch = &scratch });
 
-    var buf: [256]u8 = undefined;
-    var scratch: [256]u8 = undefined;
-    inline for (.{ Compression.gzip, Compression.lz4 }) |codec| {
-        try testing.expectError(
-            error.CompressionNotImplemented,
-            encodeBatch(&buf, &records, .{ .compression = codec, .scratch = &scratch }),
-        );
-    }
+    // Recompute CRC over attributes→end (offset 21) and compare to stored.
+    const stored = std.mem.readInt(u32, bytes[17..21], .big);
+    const recomputed = Crc32C.hash(bytes[21..]);
+    try testing.expectEqual(recomputed, stored);
+
+    // Flip a byte in the compressed region → decode must reject on CRC.
+    var corrupt: [1024]u8 = undefined;
+    @memcpy(corrupt[0..bytes.len], bytes);
+    corrupt[bytes.len - 1] ^= 0xff;
+    var r: Reader = .init(corrupt[0..bytes.len]);
+    try testing.expectError(error.CrcMismatch, decodeBatch(testing.allocator, &r));
+}
+
+test "encodeBatch + decodeBatch: lz4 round-trip (records region compressed)" {
+    // LZ4 compression (codec attribute 3, Kafka's Lz4Compression/LZ4 Frame
+    // format). The encoder writes uncompressed blocks (no LZ4 match-finding),
+    // but the output is a valid LZ4 frame that the decoder can decompress.
+    // Verifies the compress-before-CRC ordering and that recordsCount stays
+    // the uncompressed count.
+    const v1 = "payload-payload-payload-payload-payload" ** 4;
+    const v2 = "another-record-value-another-record-value" ** 4;
+    const records = [_]Record{
+        .{ .offset_delta = 0, .timestamp_delta = 0, .key = "k1", .value = v1, .headers = &.{} },
+        .{ .offset_delta = 1, .timestamp_delta = 5, .key = "k2", .value = v2, .headers = &.{} },
+    };
+
+    var buf: [2048]u8 = undefined;
+    var scratch: [2048]u8 = undefined;
+    const bytes = try encodeBatch(&buf, &records, .{ .compression = .lz4, .scratch = &scratch });
+
+    // The attributes field (offset 21, u16 big-endian) must carry lz4 bits (3).
+    try testing.expectEqual(@as(u16, 3), std.mem.readInt(u16, bytes[21..23], .big));
+
+    var r: Reader = .init(bytes);
+    var batch = try decodeBatch(testing.allocator, &r);
+    defer batch.deinit(testing.allocator);
+
+    try testing.expectEqual(Compression.lz4, batch.compression());
+    try testing.expectEqual(@as(usize, 2), batch.records.len);
+    try testing.expectEqualStrings("k1", batch.records[0].key.?);
+    try testing.expectEqualStrings(v1, batch.records[0].value.?);
+    try testing.expectEqualStrings("k2", batch.records[1].key.?);
+    try testing.expectEqualStrings(v2, batch.records[1].value.?);
+    try testing.expectEqual(@as(i32, 1), batch.last_offset_delta);
+    // All bytes consumed.
+    try testing.expectEqual(@as(usize, 0), r.remaining().len);
+}
+
+test "encodeBatch: lz4 CRC verifies over compressed bytes" {
+    // The CRC covers attributes→end, so it must be computed over the
+    // lz4-compressed records region (not the uncompressed records). Flip a
+    // byte in the compressed region → decode must reject on CRC.
+    const records = [_]Record{.{
+        .offset_delta = 0,
+        .timestamp_delta = 0,
+        .key = "k1",
+        .value = "compressible-compressible-compressible" ** 4,
+        .headers = &.{},
+    }};
+    var buf: [1024]u8 = undefined;
+    var scratch: [1024]u8 = undefined;
+    const bytes = try encodeBatch(&buf, &records, .{ .compression = .lz4, .scratch = &scratch });
+
+    // Recompute CRC over attributes→end (offset 21) and compare to stored.
+    const stored = std.mem.readInt(u32, bytes[17..21], .big);
+    const recomputed = Crc32C.hash(bytes[21..]);
+    try testing.expectEqual(recomputed, stored);
+
+    // Flip a byte in the compressed region → decode must reject on CRC.
+    var corrupt: [1024]u8 = undefined;
+    @memcpy(corrupt[0..bytes.len], bytes);
+    corrupt[bytes.len - 1] ^= 0xff;
+    var r: Reader = .init(corrupt[0..bytes.len]);
+    try testing.expectError(error.CrcMismatch, decodeBatch(testing.allocator, &r));
 }
 
 test "encodeBatch: zstd without -Dzstd=true returns CompressionNotImplemented" {

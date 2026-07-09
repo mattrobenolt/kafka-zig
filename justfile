@@ -405,3 +405,115 @@ e2e-snappy: kafka-up
 
     echo "e2e-snappy: PASS — produced {{ e2e_msgs }} snappy, consumed $COUNT"
     just kafka-down
+
+# Real-Kafka e2e with gzip-compressed batches. Gzip is always available
+# (pure-Zig stored DEFLATE, no build flag), so this builds the default e2e
+# binary and produces with --compression gzip. Exercises the full gzip
+# compression path against a real broker (the unit/mock tests cover the codec;
+# this proves it interops with kafka-console-consumer's gzip decode).
+[doc("Run the gzip-compression e2e against a real Kafka broker")]
+[group("e2e")]
+e2e-gzip: kafka-up
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "$(git rev-parse --show-toplevel)"
+
+    echo "e2e-gzip: building..."
+    zig build e2e
+
+    # Create the gzip topic before producing.
+    printf '%s\n' \
+        'security.protocol=SASL_SSL' \
+        'sasl.mechanism=SCRAM-SHA-512' \
+        'sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="{{ scram_user }}" password="{{ scram_pass }}";' \
+        'ssl.truststore.type=PEM' \
+        'ssl.truststore.location={{ e2e_dir }}/rootCA.pem' \
+        'ssl.endpoint.identification.algorithm=' \
+        > {{ e2e_dir }}/consumer.properties
+    kafka-topics.sh --bootstrap-server localhost:{{ sasl_ssl_port }} \
+        --create --if-not-exists --topic {{ e2e_topic }}-gzip \
+        --partitions 4 --replication-factor 1 \
+        --command-config {{ e2e_dir }}/consumer.properties
+
+    echo "e2e-gzip: producing {{ e2e_msgs }} gzip-compressed messages via kafka-zig..."
+    zig-out/bin/e2e --broker localhost:{{ sasl_ssl_port }} \
+        --ca {{ e2e_dir }}/rootCA.pem \
+        --user {{ scram_user }} --pass {{ scram_pass }} \
+        --topic {{ e2e_topic }}-gzip --num {{ e2e_msgs }} --compression gzip
+
+    echo "e2e-gzip: consuming {{ e2e_msgs }} messages via kafka-console-consumer..."
+    OUTPUT="$(kafka-console-consumer.sh \
+        --bootstrap-server localhost:{{ sasl_ssl_port }} \
+        --topic {{ e2e_topic }}-gzip \
+        --from-beginning \
+        --max-messages {{ e2e_msgs }} \
+        --command-config {{ e2e_dir }}/consumer.properties \
+        --timeout-ms 10000 2>&1)"
+    COUNT="$(echo "$OUTPUT" | grep -c '^msg-' || true)"
+    echo "$OUTPUT" | tail -5
+    echo "e2e-gzip: consumed $COUNT messages"
+
+    if [ "$COUNT" -ne "{{ e2e_msgs }}" ]; then
+        echo "e2e-gzip: FAIL — expected {{ e2e_msgs }}, got $COUNT"
+        just kafka-down
+        exit 1
+    fi
+
+    echo "e2e-gzip: PASS — produced {{ e2e_msgs }} gzip, consumed $COUNT"
+    just kafka-down
+
+# Real-Kafka e2e with lz4-compressed batches. LZ4 is always available
+# (pure-Zig LZ4 Frame format, no build flag), so this builds the default e2e
+# binary and produces with --compression lz4. Exercises the full lz4
+# compression path against a real broker (the unit/mock tests cover the codec;
+# this proves it interops with kafka-console-consumer's lz4 decode).
+[doc("Run the lz4-compression e2e against a real Kafka broker")]
+[group("e2e")]
+e2e-lz4: kafka-up
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "$(git rev-parse --show-toplevel)"
+
+    echo "e2e-lz4: building..."
+    zig build e2e
+
+    # Create the lz4 topic before producing.
+    printf '%s\n' \
+        'security.protocol=SASL_SSL' \
+        'sasl.mechanism=SCRAM-SHA-512' \
+        'sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="{{ scram_user }}" password="{{ scram_pass }}";' \
+        'ssl.truststore.type=PEM' \
+        'ssl.truststore.location={{ e2e_dir }}/rootCA.pem' \
+        'ssl.endpoint.identification.algorithm=' \
+        > {{ e2e_dir }}/consumer.properties
+    kafka-topics.sh --bootstrap-server localhost:{{ sasl_ssl_port }} \
+        --create --if-not-exists --topic {{ e2e_topic }}-lz4 \
+        --partitions 4 --replication-factor 1 \
+        --command-config {{ e2e_dir }}/consumer.properties
+
+    echo "e2e-lz4: producing {{ e2e_msgs }} lz4-compressed messages via kafka-zig..."
+    zig-out/bin/e2e --broker localhost:{{ sasl_ssl_port }} \
+        --ca {{ e2e_dir }}/rootCA.pem \
+        --user {{ scram_user }} --pass {{ scram_pass }} \
+        --topic {{ e2e_topic }}-lz4 --num {{ e2e_msgs }} --compression lz4
+
+    echo "e2e-lz4: consuming {{ e2e_msgs }} messages via kafka-console-consumer..."
+    OUTPUT="$(kafka-console-consumer.sh \
+        --bootstrap-server localhost:{{ sasl_ssl_port }} \
+        --topic {{ e2e_topic }}-lz4 \
+        --from-beginning \
+        --max-messages {{ e2e_msgs }} \
+        --command-config {{ e2e_dir }}/consumer.properties \
+        --timeout-ms 10000 2>&1)"
+    COUNT="$(echo "$OUTPUT" | grep -c '^msg-' || true)"
+    echo "$OUTPUT" | tail -5
+    echo "e2e-lz4: consumed $COUNT messages"
+
+    if [ "$COUNT" -ne "{{ e2e_msgs }}" ]; then
+        echo "e2e-lz4: FAIL — expected {{ e2e_msgs }}, got $COUNT"
+        just kafka-down
+        exit 1
+    fi
+
+    echo "e2e-lz4: PASS — produced {{ e2e_msgs }} lz4, consumed $COUNT"
+    just kafka-down

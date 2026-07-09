@@ -160,6 +160,8 @@ pub const Config = struct {
     max_retries: u8 = 8,
     /// Record-batch compression. `.none` (default) sends plaintext batches;
     /// `.snappy` compresses each batch (always available, pure-Zig);
+    /// `.gzip` compresses each batch (always available, pure-Zig stored DEFLATE);
+    /// `.lz4` compresses each batch (always available, pure-Zig LZ4 Frame format);
     /// `.zstd` compresses each batch (requires `-Dzstd=true` at build time).
     compression: Compression = .none,
     /// When true (production default), the producer acquires a PID/epoch at

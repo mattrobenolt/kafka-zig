@@ -85,7 +85,8 @@ pub const Options = struct {
     max_batch_bytes: u32,
     max_message_size: u32,
     strategy: partitioner.Strategy,
-    /// Record-batch compression applied to every batch. `.zstd` requires the
+    /// Record-batch compression applied to every batch. `.gzip` and `.lz4`
+    /// are always available (pure-Zig, no build flag). `.zstd` requires the
     /// library to be built with `-Dzstd=true`; requesting it without that is
     /// rejected at `Client.init` with `error.CompressionUnavailable`.
     compression: record_batch.Compression = .none,
