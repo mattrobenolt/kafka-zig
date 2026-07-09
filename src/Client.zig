@@ -132,6 +132,11 @@ pub const Config = struct {
     /// network thread continues draining in-flight Produce round-trips up to
     /// this duration before closing connections. Slots still pending after
     /// the timeout surface `error.Shutdown`. Default 10s.
+    ///
+    /// This bounds the TOTAL drain, checked between blocking I/O operations,
+    /// not mid-syscall: a single in-flight Produce response read may overshoot
+    /// it by up to `io_timeout_ms` (the socket read timeout). See
+    /// `Producer.Options.drain_timeout_ns` for the full contract.
     drain_timeout_ms: u32 = 10_000,
 };
 
@@ -213,6 +218,14 @@ pub fn init(allocator: Allocator, config: Config) !*Client {
 /// round-trips up to `drain_timeout_ms`, then exit. Phase 2: full shutdown
 /// (`requestShutdown`) to wake any remaining `await` waiters with
 /// `error.Shutdown`, close connections, and free everything.
+///
+/// CONTRACT: all outstanding `Message`s must be awaited (or dropped without
+/// touching them again) BEFORE calling `deinit`. `deinit` is NOT safe to call
+/// concurrently with `await`/`tryAwait`/`acquire` on the same client: phase 2
+/// frees the ring, and a concurrent `await` would use it after free. This
+/// matches real Kafka clients (librdkafka `rd_kafka_flush` before
+/// `rd_kafka_destroy`; the Java client's `close()` blocks in-flight sends
+/// first). Await-then-deinit, single-threaded from the caller's side.
 pub fn deinit(self: *Client) void { // ziglint-ignore: Z030 -- self is heap-owned, destroyed here
     // Phase 1: stop accepting new acquires, wake the network thread to drain.
     self.ring.requestDrain();
@@ -1460,10 +1473,15 @@ test "#3 silent leader change: producer routes to new leader after refresh" {
 // #4: graceful shutdown drain
 // ---------------------------------------------------------------------------
 
-test "#4 graceful drain: in-flight acks complete, await succeeds" {
-    // Produce N messages, immediately call deinit (which drains). The network
-    // thread finishes in-flight Produce round-trips within the drain timeout.
-    // await() on those messages returns success, not error.Shutdown.
+test "#4 graceful drain: in-flight records are all acked before shutdown" {
+    // Produce N messages WITHOUT awaiting, then call deinit. Phase 1
+    // (requestDrain) keeps the network thread draining until every pending
+    // Produce round-trip completes (bounded by drain_timeout_ms), so all N are
+    // acked by the broker before the thread exits. We verify the drain via the
+    // broker's `produced` counter, NOT via `await`: deinit frees the ring in
+    // phase 2, so a concurrent `await` would be a use-after-free. The contract
+    // is await-then-deinit, and here we exercise the pure drain path (nothing
+    // awaited) with no concurrency against deinit at all.
     var broker = try mock.Broker.start(testing.allocator, .{ .mode = .ok, .num_partitions = 4 });
     defer broker.stop();
 
@@ -1474,9 +1492,8 @@ test "#4 graceful drain: in-flight acks complete, await succeeds" {
     var client = try Client.init(testing.allocator, cfg);
 
     const n = 20;
-    var handles: [n]Message = undefined;
-    for (&handles, 0..) |*m, i| {
-        m.* = try client.acquire();
+    for (0..n) |i| {
+        var m = try client.acquire();
         try m.setTopic("events");
         m.setPartition(@intCast(i % 4));
         const dst = m.value();
@@ -1484,32 +1501,24 @@ test "#4 graceful drain: in-flight acks complete, await succeeds" {
         try m.commit(@intCast(payload.len));
     }
 
-    // Spawn a thread to call deinit (which triggers the drain). The main
-    // thread awaits all messages concurrently — the drain lets the acks
-    // complete before requestShutdown is called.
-    const DeinitCtx = struct {
-        client: *Client,
-        fn run(c: *Client) void {
-            c.deinit();
-        }
-    };
-    const dt = try std.Thread.spawn(.{}, DeinitCtx.run, .{client});
+    // deinit on the main thread: blocks in requestDrain -> thread.join while
+    // the network thread flushes all in-flight acks, then requestShutdown +
+    // free. No await runs concurrently with the free.
+    client.deinit();
 
-    // All awaits should succeed (acks completed during the drain, before
-    // requestShutdown).
-    for (&handles) |*m| try m.await();
-
-    dt.join();
-
-    // Every message was acked by the broker.
+    // Every message was acked by the broker during the drain.
     try testing.expectEqual(@as(u32, n), broker.produced.load(.acquire));
 }
 
-test "#4 drain timeout: un-acked slots surface Shutdown, no hang" {
-    // Produce N messages to a broker that NEVER responds to Produce (drops
-    // the connection after receiving the request). deinit waits up to the
-    // drain timeout, then the network thread exits. Remaining pending slots
-    // surface error.Shutdown via requestShutdown.
+test "#4 drain timeout: deinit returns in bounded time, no hang" {
+    // Produce N messages to a broker that NEVER responds to Produce (drops the
+    // connection after receiving the request). The slots stay pending forever,
+    // so the drain can never complete on its own — the drain TIMEOUT is what
+    // bounds it. We assert deinit returns within the timeout (plus generous
+    // slack for the in-flight read to time out and connect/backoff churn), i.e.
+    // no hang. No `await` is called: deinit frees the ring, so an await racing
+    // the free would be a use-after-free. The bounded return of deinit IS the
+    // "un-acked slots don't hang shutdown" guarantee.
     var broker = try mock.Broker.start(testing.allocator, .{
         .mode = .never_ack,
         .num_partitions = 1,
@@ -1526,9 +1535,8 @@ test "#4 drain timeout: un-acked slots surface Shutdown, no hang" {
     var client = try Client.init(testing.allocator, cfg);
 
     const n = 5;
-    var handles: [n]Message = undefined;
-    for (&handles, 0..) |*m, i| {
-        m.* = try client.acquire();
+    for (0..n) |i| {
+        var m = try client.acquire();
         try m.setTopic("events");
         m.setPartition(0);
         const dst = m.value();
@@ -1536,20 +1544,17 @@ test "#4 drain timeout: un-acked slots surface Shutdown, no hang" {
         try m.commit(@intCast(payload.len));
     }
 
-    // Spawn deinit in a thread; await from the main thread.
-    const DeinitCtx = struct {
-        client: *Client,
-        fn run(c: *Client) void {
-            c.deinit();
-        }
-    };
-    const dt = try std.Thread.spawn(.{}, DeinitCtx.run, .{client});
+    // deinit on the main thread. The drain deadline (500ms) plus one in-flight
+    // read timeout (io_timeout_ms = 200ms, the single-syscall overshoot the
+    // drain contract documents) bound the total; 5s is a wide no-hang ceiling.
+    var timer = try std.time.Timer.start();
+    client.deinit();
+    const elapsed_ms = timer.read() / std.time.ns_per_ms;
+    try testing.expect(elapsed_ms < 5_000);
 
-    // All awaits should return error.Shutdown (the drain timed out without
-    // any acks). No hang.
-    for (&handles) |*m| try testing.expectError(error.Shutdown, m.await());
-
-    dt.join();
+    // The broker did receive at least one Produce request (the records were
+    // sent, just never acked), so this was a real drain-timeout, not a no-op.
+    try testing.expect(broker.produce_requests.load(.acquire) >= 1);
 }
 
 test "#4 no new acquires during drain: acquire returns Shutdown" {
@@ -1571,8 +1576,9 @@ test "#4 no new acquires during drain: acquire returns Shutdown" {
     var client = try Client.init(testing.allocator, cfg);
 
     // Produce one message — the broker gates on the first Produce, so the
-    // network thread is blocked in readResponse.
-    var m = try client.acquire();
+    // network thread is blocked in readResponse. We never await it (see below),
+    // so the token is const.
+    const m = try client.acquire();
     try m.setTopic("events");
     m.setPartition(0);
     const dst = m.value();
@@ -1596,14 +1602,20 @@ test "#4 no new acquires during drain: acquire returns Shutdown" {
     std.Thread.sleep(50 * std.time.ns_per_ms);
 
     // acquire must fail with error.Shutdown (draining blocks new acquires).
+    // This is safe to call while deinit is in progress because deinit is
+    // parked in thread.join() (the network thread is stuck in the gated
+    // readResponse), so the ring is NOT yet freed — the free only happens in
+    // phase 2, after join returns, which cannot happen until we openGate below.
     try testing.expectError(error.Shutdown, client.tryAcquire());
 
     // Release the gate so the broker acks the Produce, the network thread
-    // finishes the drain, and deinit completes.
+    // finishes the drain and exits, join returns, and deinit frees the ring.
     broker.openGate();
 
-    // The in-flight message should ack successfully (drain completed).
-    try m.await();
-
+    // Join deinit BEFORE asserting anything ring-touching. We deliberately do
+    // NOT await `m`: that would race deinit's phase-2 free of the ring. The
+    // drain completing the gated message is verified via the broker's counter
+    // (independent of the freed ring).
     dt.join();
+    try testing.expectEqual(@as(u32, 1), broker.produced.load(.acquire));
 }

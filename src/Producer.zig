@@ -124,6 +124,17 @@ pub const Options = struct {
     /// up to this duration before exiting. Slots still pending after the
     /// timeout surface `error.Shutdown` (via `requestShutdown`). 0 = no
     /// drain (the network thread exits immediately on drain). Default 10s.
+    ///
+    /// Contract (not a hard real-time bound): the deadline is checked BETWEEN
+    /// blocking I/O operations, at the top of each drain iteration — not
+    /// mid-syscall. A single in-flight Produce response read is bounded only by
+    /// the socket read timeout (`io_timeout_ms`), so total drain time can
+    /// overshoot `drain_timeout_ns` by up to `io_timeout_ms` when the thread is
+    /// parked in `conn.readResponse()` at the moment the deadline passes. Size
+    /// `io_timeout_ms` accordingly if a tight shutdown bound matters (the
+    /// default 30s I/O timeout dominates a sub-second drain timeout). Capping
+    /// the per-read timeout by the remaining drain time is a deliberate
+    /// follow-up, not done here.
     drain_timeout_ns: u64 = 10 * std.time.ns_per_s,
 };
 

@@ -810,6 +810,16 @@ pub fn retry(self: *Ring, index: u64, generation: u32) Error!u64 {
 /// `requestShutdown` (phase 2) to wake any remaining awaiters.
 pub fn requestDrain(self: *Ring) void {
     self.draining.store(true, .release);
+    // Bump the two dedicated counter words BEFORE waking them, exactly as
+    // `requestShutdown` does. Without the bump, a producer that snapshotted the
+    // old `handle_freed` value and races into `Futex.wait` (passed the
+    // `draining` re-check, then parked before the wake landed) would sleep on
+    // an unchanged word until phase-2 `requestShutdown` — a lost-wakeup hang
+    // for the whole drain window. The bump makes `wait` return immediately
+    // (value-guard self-heal). `completions` is bumped for symmetry (harmless,
+    // keeps the self-heal invariant uniform across both counter waits).
+    _ = self.completions.fetchAdd(1, .release);
+    _ = self.handle_freed.fetchAdd(1, .release);
     // Wake every kind of waiter so nobody is stuck waiting for data/slots
     // that will never come (no new acquires during drain).
     if (self.data_waiter.load(.acquire)) Futex.wake(writeHeadLow(self), 1);
@@ -894,6 +904,13 @@ fn waitPool(self: *Ring) Error!void {
     const seq = self.handle_freed.load(.acquire);
     if (@as(u32, @truncate(self.pool_head.load(.acquire))) != handle_nil) return;
     if (self.shutdown.load(.acquire)) return error.Shutdown;
+    // A producer that entered `waitPool` after `requestDrain` fired must see
+    // `draining` and bail instead of parking: acquire is closed during drain,
+    // so no handle will ever be freed back for it (this mirrors the shutdown
+    // guard above). `requestDrain` also bumps `handle_freed`, so even a park
+    // that races the store is recovered by the value guard — both guards close
+    // the window from opposite sides.
+    if (self.draining.load(.acquire)) return error.Shutdown;
     Futex.wait(&self.handle_freed, seq);
 }
 

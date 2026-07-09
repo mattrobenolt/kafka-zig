@@ -50,6 +50,13 @@ try m.await();                   // blocks until the broker acks
 The only copy on the produce path is slot payload → record-batch buffer, in
 the network thread (unavoidable under TLS + Kafka's v2 record format).
 
+Shutdown contract: await (or drop) every outstanding `Message` **before**
+calling `client.deinit()`. `deinit` runs a graceful drain (finishing in-flight
+acks up to `drain_timeout_ms`) and then frees the ring, so it must not run
+concurrently with `await`/`acquire` on that client — the same discipline
+librdkafka (`flush` before `destroy`) and the Java client (`close()` blocks
+in-flight sends) require.
+
 ## Dev setup
 
 Requires Zig 0.15.2 and the Nix flake devshell (`nix develop`) for the full
