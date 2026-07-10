@@ -1,10 +1,10 @@
 //! TCP + TLS 1.3 (ztls) + SASL/SCRAM connection to a Kafka broker.
 //!
-//! This is the first I/O slice (PLAN §2.5, phase 5). It composes three
+//! This is the transport layer. It composes three
 //! already-built pieces: `ztls` (TLS 1.3 client over a blocking
 //! `std.net.Stream`), `scram` (SCRAM-SHA-256/512 client), and `wire` (request
 //! framing + SASL body codecs). A dialed `Connection` is authenticated and
-//! ready for Metadata/Produce request/response exchange (phase 6).
+//! ready for Metadata/Produce request/response exchange.
 //!
 //! ## Buffer / allocation discipline
 //!
@@ -22,7 +22,7 @@
 //! the `ResponseBuffer` accumulator. That copy is inherent to TLS (ztls hands
 //! back plaintext in its own record buffer, which is reused on the next
 //! record) and is distinct from the single produce-path copy discussed in
-//! PLAN §8. No heap is involved.
+//! No heap is involved.
 //!
 //! ## SASL flow (KIP-152, KIP-84)
 //!
@@ -47,7 +47,7 @@ const Reader = primitives.Reader;
 const ResponseBuffer = wire.ResponseBuffer;
 
 /// SASL/SCRAM mechanism. MSK is SHA-512 only; SHA-256 is kept for other
-/// brokers (PLAN §9).
+/// brokers.
 pub const Mechanism = enum { scram_sha256, scram_sha512 };
 
 /// SCRAM credentials + mechanism selection.
@@ -250,7 +250,7 @@ pub fn deinit(self: *Connection) void { // ziglint-ignore: Z030 -- self is heap-
 }
 
 // ---------------------------------------------------------------------------
-// Public request/response primitives (phase 6 drives these)
+// Public request/response primitives
 // ---------------------------------------------------------------------------
 
 /// Frame and send a request. `body_ctx` exposes
@@ -460,7 +460,7 @@ fn authenticate(self: *Connection, config: Config) !void {
     }
 }
 
-/// ApiVersions v0 pre-auth probe (PLAN §2.1): brokers historically treat a
+/// ApiVersions v0 pre-auth probe: brokers historically treat a
 /// schema exception in the first request as a GSSAPI token, so the Java client
 /// sends v0 as cheap insurance. We send it, read the response, and discard it.
 fn apiVersionsProbe(self: *Connection) !void {
@@ -558,8 +558,8 @@ fn mechanismName(mechanism: Mechanism) []const u8 {
 /// header v0. Verifies the correlation_id matches the request we sent; a
 /// mismatch means we are decoding the wrong response and the stream is desynced.
 ///
-/// NOTE (phase 6): the public `readResponse` returns the whole body including
-/// this header and does NOT perform this check — the phase-6 request/response
+/// The public `readResponse` returns the whole body including
+/// this header and does NOT perform this check — the request/response
 /// dispatcher must apply the same correlation_id verification when it strips
 /// per-API response headers.
 fn stripResponseHeaderV0(body: []const u8, expected_correlation_id: i32) !Reader {

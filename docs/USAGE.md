@@ -14,23 +14,23 @@ doc comments), run `just docs` and open `zig-out/docs/index.html`.
 ```zig
 const kafka = @import("kafka");
 
-var client: kafka.Client = try .init(allocator, .{
+var client = try kafka.Client.init(allocator, .{
     .bootstrap_brokers = &.{
         .{ .host = "broker-1.example.com", .port = 9096 },
         .{ .host = "broker-2.example.com", .port = 9096 },
     },
-    .tls = .{ .ca_bundle = &ca, .sni = "broker-1.example.com" },
+    .tls = .{ .ca_bundle = &ca }, // each connection uses its broker host as SNI
     .sasl = .{ .scram_sha512 = .{ .username = "user", .password = "pass" } },
     .acks = .all,
     .compression = .zstd,    // requires -Dzstd=true
 });
 defer client.deinit();
 
-var m = try client.acquire();    // blocks (futex) when the ring is full
+var m = try client.acquire(.awaitable); // blocks when the ring is full
 try m.setTopic("events");
 try m.setKey("entity-42");
-try m.writeMessage(payload);      // copies into the slot + commits
-try m.await();                    // blocks until the broker acks
+try m.writeMessage(payload);             // copies into the slot + commits
+try m.await();                           // blocks until the broker acks
 ```
 
 The CA bundle (`std.crypto.Certificate.Bundle`) is borrowed for the client's
@@ -49,23 +49,28 @@ manage.
 
 ### 1. Acquire a slot
 
+Choose the completion mode when acquiring:
+
 ```zig
-var m = try client.acquire();    // blocks when the ring is full (backpressure)
+var m = try client.acquire(.awaitable); // per-message completion handle
 ```
 
-`acquire` blocks on a futex when all ring slots are occupied. This is the
-sole backpressure mechanism: the ring is a fixed-size buffer, and when it's
-full, producers naturally stall until the network thread reclaims acked
-slots.
+`acquire` blocks on a futex when all ring slots are occupied. In `.awaitable`
+mode it can also wait for a completion handle. The ring is fixed-size, so a
+full ring stalls producers until the network thread reclaims completed slots.
 
 For a non-blocking variant:
 
 ```zig
-var m = client.tryAcquire() catch |err| switch (err) {
-    error.WouldBlock => return,  // ring full — try again later
+var m = client.tryAcquire(.awaitable) catch |err| switch (err) {
+    error.WouldBlock => return, // ring or completion-handle pool is full
     else => return err,
 };
 ```
+
+Use `.fire_and_forget` when no caller will await the individual result. That
+mode allocates no completion handle; outcomes are available only through
+`client.stats()`. See [Fire-and-forget](#fire-and-forget).
 
 ### 2. Set topic, key, partition
 
@@ -128,6 +133,9 @@ code. If the client is torn down first, it returns `error.Shutdown`.
 | `await()` | Block until the broker acks or fails. **Single-use.** |
 | `tryAwait()` | Non-blocking `await`; `error.WouldBlock` if still in flight. |
 | `failureCode()` | The Kafka error code after `await` returned `SendFailed`. |
+
+`await()` and `tryAwait()` are valid only for messages acquired with
+`.awaitable`.
 
 ---
 
@@ -236,17 +244,17 @@ the supported codecs.
 
 ## Backpressure and lifetime contract
 
-The ring is a fixed-size circular buffer of slots. Each slot pre-allocates
-its inline buffers (`max_topic_len + max_key_len + max_message_size`). The
-slot count is the sole backpressure bound:
+The ring is a fixed-size circular buffer of slots. Each slot reserves payload
+storage (`max_topic_len + max_key_len + max_message_size`) at initialization.
+The slot count is the payload backpressure bound:
 
 - **When the ring is full**, `acquire` blocks (futex) until the network
   thread reclaims an acked/failed slot. This is natural backpressure — no
   unbounded buffering, no OOM under load.
-- **Reserved memory** at init is `ring_slots × (max_topic_len + max_key_len
-  + max_message_size)`. With defaults (8192 × ~16.5 KB) that's ~128 MB.
-  Tune `ring_slots` and the size fields to match your workload and memory
-  budget.
+- **Reserved payload memory** at init is approximately `ring_slots ×
+  (max_topic_len + max_key_len + max_message_size)`, plus slot and completion
+  metadata. With defaults, the payload arena alone is about 130 MiB. Tune
+  `ring_slots` and the size fields to match your workload and memory budget.
 - **The only copy** on the produce path is slot payload → record-batch
   buffer, in the network thread (unavoidable under TLS + Kafka's v2 record
   format). The producer writes directly into the ring slot — no intermediate
@@ -267,7 +275,7 @@ now just an await token.
 | `MessageTooLarge` | Payload, topic, or key exceeds the configured maximum. |
 | `WouldBlock` | `tryAcquire` / `tryAwait` would have blocked. |
 | `Shutdown` | The ring was shut down while blocked (or before it began). |
-| `SendFailed` | The broker rejected the message with a non-retriable error (after exhausting retries). |
+| `SendFailed` | The send failed permanently: a non-retriable broker error, an oversized batch, or retry-budget exhaustion. |
 
 ### SendFailed and failure codes
 
@@ -312,8 +320,8 @@ Leadership errors (3, 5, 6, 9) also invalidate the metadata cache, forcing
 a refresh before the next send. Connection drops during a Produce send are
 retried with exponential backoff (100ms base, 10s cap, 50% jitter).
 
-All other error codes are terminal: the message fails with `SendFailed`
-after `max_retries` exhaustion.
+All other error codes are terminal and fail the message with `SendFailed`
+without retry.
 
 ---
 
@@ -340,20 +348,38 @@ then connects directly to each partition's leader for Produce requests.
 
 ## The `await` single-use contract
 
-A `Message` is **single-use**: exactly one `await` (or `tryAwait` that
-completes). A double-await is a caller contract violation that would
-double-free the handle pool. In Debug/ReleaseSafe, the `handle_nil`
-sentinel catches it with an assertion. In ReleaseFast, it's undefined
-behavior.
+A message acquired with `.awaitable` must complete exactly one `await` (or a
+`tryAwait` that does not return `error.WouldBlock`). A double-await is a caller
+contract violation that would double-free the handle pool. In
+Debug/ReleaseSafe, the `handle_nil` sentinel catches it with an assertion. In
+ReleaseFast, it is undefined behavior.
 
 After `await` returns (success or failure), the handle is freed back to the
-pool. `failureCode()` remains valid — it reads the value cached into the
-`Message` token before the handle was freed.
+pool. `failureCode()` remains valid because it reads the value cached into the
+`Message` token before the handle was freed. Dropping an awaitable message
+without awaiting it leaks its completion handle until client teardown.
 
-If you don't need the ack, you can simply drop the `Message` without
-calling `await`. The slot will still be processed by the network thread;
-you just won't get the result. This is fine for fire-and-forget with
-`acks = .none`.
+## Fire-and-forget
+
+Acquire with `.fire_and_forget` when the caller does not need an individual
+result:
+
+```zig
+var m = try client.acquire(.fire_and_forget);
+try m.setTopic("events");
+try m.writeMessage(payload);
+// Do not call await or tryAwait on m.
+```
+
+This mode consumes no completion handle. The network thread still sends and
+reclaims the slot, including when `acks` is `.leader` or `.all`; success and
+failure are visible only in `client.stats()`. `tryAcquire(.fire_and_forget)` is
+the non-blocking load-shedding form and returns `error.WouldBlock` only when the
+ring itself is full.
+
+`acks = .none` is a separate wire-level choice: Kafka sends no Produce
+response. It can be used with either acquire mode. An awaitable message then
+completes after the request has been written.
 
 ---
 
@@ -400,7 +426,7 @@ acceptable; it's metrics, not accounting).
 ```zig
 const s = client.stats();
 // s.queue_depth       — pending slots (committed, not yet reclaimed)
-// s.in_flight         — messages in flight (equals queue_depth in v1)
+// s.in_flight         — currently equals queue_depth
 // s.messages_produced — total messages committed by producer threads
 // s.bytes_produced    — total bytes committed by producer threads
 // s.batches_sent      — total Produce requests sent to brokers
@@ -422,8 +448,9 @@ atomic (multi-threaded). The network-thread counters are read with
 When `enable_idempotency = true` (the default), the producer:
 
 1. Acquires a **PID (producer ID) and epoch** from the broker via
-   InitProducerId v4 at startup. If acquisition fails, it logs a warning and
-   proceeds in non-idempotent mode (sentinel -1) rather than hanging.
+   InitProducerId v4 at startup. If acquisition fails, Produce is held back
+   while acquisition is retried; pending messages eventually fail when their
+   retry budgets are exhausted rather than being silently sent without a PID.
 2. Tracks **per-(topic, partition) sequence numbers**. Each batch's
    `base_sequence` is assigned from a per-partition counter. On retry, the
    slot's stored `base_sequence` is reused — the broker dedupes by sequence,
@@ -449,7 +476,12 @@ duplicate.
 
 When `enable_idempotency = false`, the producer uses sentinel -1 for
 producer_id/epoch and -1 for base_sequence (non-idempotent mode). No
-InitProducerId round-trip, no sequence tracking.
+InitProducerId round-trip or sequence tracking is performed.
+
+Sequence state is stored in an allocator-backed per-partition map. The current
+implementation falls back to a non-idempotent batch if growing that map returns
+`OutOfMemory`. Treat allocator exhaustion as loss of the idempotency guarantee;
+this is a known limitation, not a useful operating mode.
 
 ---
 

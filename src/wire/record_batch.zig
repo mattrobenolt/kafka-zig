@@ -43,7 +43,7 @@
 //! the crc field itself are NOT covered. The partitionLeaderEpoch is excluded
 //! so the broker can assign it without recomputing the CRC.
 //!
-//! Compression ordering (non-negotiable, per PLAN §2.1):
+//! Compression ordering required by the Kafka batch format:
 //!   1. Serialize the records region.
 //!   2. Compress it (when compression attr set) via `compress.zig`.
 //!   3. Compute CRC32C over attributes→end (so over the compressed bytes).
@@ -196,7 +196,7 @@ pub const EncodeOptions = struct {
     /// Compression codec. `.none` writes the records region verbatim. `.snappy`
     /// (always available, pure-Zig) and `.zstd` (requires `-Dzstd=true`)
     /// compress the records region in place before CRC/length finalize, per
-    /// PLAN §2.1. `.gzip` and `.lz4` are wire-format constants but return
+    /// `.gzip` and `.lz4` are wire-format constants but return
     /// `error.CompressionNotImplemented` (not yet implemented).
     compression: Compression = .none,
     /// zstd compression level, used only when `compression == .zstd`.
@@ -250,7 +250,7 @@ pub const EncodeBatchResult = struct {
 ///   [21..)   CRC-covered region: attributes → recordsCount → records
 ///
 /// When `options.compression != .none`, the records region is compressed in
-/// place BEFORE the CRC/batchLength patches (PLAN §2.1 ordering). The codec
+/// place BEFORE the CRC/batchLength patches. The codec
 /// writes into `options.scratch` (required for a compressed batch), then the
 /// compressed bytes are copied back into `out` — no heap allocation. `.zstd`
 /// requires `-Dzstd=true`; without it, compress returns
@@ -289,7 +289,7 @@ pub fn encodeBatch(
     var written = w.buffered();
     assert(written.len >= records_region_off);
 
-    // --- Compression: compress records region BEFORE CRC (PLAN §2.1) ---
+    // --- Compression: compress records region BEFORE CRC ---
     if (options.compression != .none) {
         const codec: compress.Codec = @enumFromInt(@intFromEnum(options.compression));
         const uncompressed = written[records_region_off..];

@@ -2,7 +2,7 @@
 //!
 //! Multiple producer threads acquire a slot, write their message *directly into
 //! the slot's inline buffers* (zero-copy from the producer's side), then commit.
-//! A single consumer (the network thread, phase 6) drains committed slots,
+//! A single consumer (the network thread) drains committed slots,
 //! builds Produce requests, and — only after the broker acks — marks slots done
 //! and reclaims them. The one unavoidable copy on the whole produce path is
 //! slot payload -> record-batch buffer, and it happens in the network thread,
@@ -33,8 +33,8 @@
 //!      Handles are a small pool decoupled from slots. `retry()` re-arms the
 //!      message *in place* (same slot, still pending) and re-notifies the
 //!      network thread — no new slot, so a full ring can never deadlock the
-//!      retry path (the earlier move-to-a-new-slot design, sketched in PLAN
-//!      §2.4, deadlocks when every slot is pending and needs re-enqueue). A
+//!      retry path (moving retries to a new slot deadlocks when every slot is
+//!      pending and needs re-enqueue). A
 //!      per-slot `generation` counter still guards attribution so a *recycled*
 //!      slot's stale ack is never misapplied, and `completeSlot` no-ops on any
 //!      non-pending slot. See `Handle`, `retry`, `markAcked`, `completeSlot`.
@@ -45,16 +45,10 @@
 //!      batch of acks. `await()` waits on it. See `Handle`, `await`,
 //!      `wakeCompletions`.
 //!
-//! Judgment call (flagged for review): the task sketch offered a slot-based
-//! `await()` that loads the handle's `(slot_index, generation)`, reads *that
-//! slot's* status, and generation-checks. That has a genuine race — the slot can
-//! be recycled between the slot_index load and the status load, and generation
-//! alone can't recover the completion result once the slot is gone. Storing the
-//! result in the *handle* (which is not recycled until `await()` frees it) makes
-//! `await()` race-free with zero dependence on slot lifetime, and the generation
-//! counter still does its real job: guarding the network thread's
-//! slot -> handle attribution against stale acks for recycled slots. This is
-//! strictly more correct, so that's what's implemented.
+//! Completion is stored in the handle rather than the slot. A slot can be
+//! recycled between loading its index and checking its status; the handle is
+//! not recycled until `await()` frees it, so it preserves the result while the
+//! generation counter guards stale slot-to-handle attribution.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -105,7 +99,7 @@ pub const partition_unassigned: u32 = math.maxInt(u32);
 /// never awaits, the network thread reclaims the slot on ack/fail, and outcomes
 /// are observed only in aggregate via `Client.stats()`. This is the shape the
 /// ring was ported from (exosphere's fire-and-forget `AtomicRingBuffer`); the
-/// handle/await layer is the opt-in addition (issue #18).
+/// handle/await layer is an opt-in addition.
 pub const Mode = enum { awaitable, fire_and_forget };
 
 pub const Error = error{
@@ -603,7 +597,7 @@ fn finishAwait(self: *Ring, handle_index: u32, result: u32, err_out: *u32) Error
 }
 
 // ---------------------------------------------------------------------------
-// Consumer side (network thread, phase 6): drain -> send -> ack -> reclaim
+// Consumer side (network thread): drain -> send -> ack -> reclaim
 // ---------------------------------------------------------------------------
 
 /// Wait for a committed slot at or beyond `read_pos`. Returns false on shutdown.
@@ -840,7 +834,7 @@ pub fn reclaim(self: *Ring) u64 {
 /// logical position, or `error.WouldBlock` if the slot is stale/no longer
 /// pending (a late ack won the race — caller drops the retry).
 ///
-/// In-place is deliberate. The earlier design (PLAN §2.4) claimed a *new* slot
+/// In-place is deliberate. Moving a retry to a *new* slot
 /// and marked the old one stale, but that deadlocks when the ring is full and
 /// every slot needs re-enqueue: no old slot can become reclaimable until a
 /// retry succeeds, and no retry can succeed until a slot is free. Staying in
@@ -1822,7 +1816,7 @@ test "requestDrain unblocks an in-flight acquire" {
 }
 
 // ===========================================================================
-// Fire-and-forget mode (issue #18): no handle, no await required.
+// Fire-and-forget mode: no handle, no await required.
 // ===========================================================================
 
 test "fire_and_forget: acquire consumes no handle, slot reclaims on ack without await" {

@@ -1,5 +1,5 @@
-//! In-process mock Kafka broker for the phase-6 producer integration tests
-//! (PLAN §5.2). Speaks the protocol with our own `wire` codec (dogfooded) over
+//! In-process mock Kafka broker for producer integration tests. Speaks the
+//! protocol with our own `wire` codec (dogfooded) over
 //! a real ztls TLS 1.3 server on loopback:
 //!
 //!   - ApiVersions v0 pre-auth probe → advertise our target versions.
@@ -10,7 +10,7 @@
 //!     the first Produce per partition, or a fatal error, per `Mode`.
 //!
 //! Deterministic, single connection, sequential request/response. The TLS +
-//! SCRAM server code is adapted from the phase-5 `Connection.zig` mock.
+//! SCRAM server code is shared with the `Connection.zig` test setup.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -791,7 +791,7 @@ fn buildAuthMessage(
 }
 
 // Self-signed ECDSA P-256 fixture (SAN = "ztls.server.test"), copied from the
-// phase-5 Connection.zig mock. Test fixture, not a production credential.
+// Connection.zig mock. Test fixture, not a production credential.
 const mock_cert_der = fixtureDecode(
     "MIIByzCCAXKgAwIBAgIUbmarzBd+vWR/mRLY6OMXZSPvVQQwCgYIKoZIzj0EAwIwGzEZMBcGA1UE" ++
         "AwwQenRscy5zZXJ2ZXIudGVzdDAeFw0yNjA2MDEwMTA3MzFaFw0zNjA1MjkwMTA3MzFaMBsxGTAX" ++

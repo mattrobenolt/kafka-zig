@@ -78,18 +78,15 @@ bench-args *args:
     zig-out/bin/bench {{ args }}
 
 # ---------------------------------------------------------------------------
-# Phase 7 — real Kafka e2e (KRaft + SASL_SSL/SCRAM-SHA-512 over TLS)
+# Real Kafka e2e (KRaft + SASL_SSL/SCRAM-SHA-512 over TLS)
 #
-# The heavy lifting lives in scripts/*.sh (extracted so shellcheck can lint
-# them and so they run standalone without `just`). Each script bakes in
-# sensible defaults and reads overrides from env vars — see the script headers
-# for the full variable list (E2E_DIR, SASL_SSL_PORT, SCRAM_USER, ...).
+# The heavy lifting lives in scripts/*.sh so shellcheck can lint it and each
+# script can run without `just`. See the script headers for environment
+# overrides (E2E_DIR, SASL_SSL_PORT, SCRAM_USER, ...).
 #
-# Local single-node Kafka 4.x in KRaft mode with three listeners:
-#   - PLAINTEXT :9092 — admin (kafka-topics, health checks)
-#   - SASL_SSL  :9093 — the real client path (SCRAM-SHA-512 over TLS 1.3)
-#   - CONTROLLER:9094 — KRaft quorum (internal, PLAINTEXT)
-# The MSK target is port 9096; we use 9093 locally (PLAN §9).
+# The local Kafka 4.x broker uses :9092 for plaintext admin traffic, :9093 for
+# the SASL_SSL client path, and :9094 for the KRaft controller. AWS MSK uses
+# :9096 for SASL/SCRAM over TLS.
 # ---------------------------------------------------------------------------
 
 [doc("Start a local Kafka broker (KRaft + SASL_SSL/SCRAM-SHA-512) for e2e")]

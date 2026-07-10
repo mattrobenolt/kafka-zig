@@ -1,4 +1,4 @@
-//! Compression codec slot for the v2 record batch (PLAN §1, §2.1, §6).
+//! Compression codecs for v2 record batches.
 //!
 //! The record batch stores its records region either verbatim (`none`) or
 //! compressed with one codec (compression bits 0–2 of the attributes field).

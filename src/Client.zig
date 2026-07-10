@@ -1,4 +1,4 @@
-//! The public producer API (PLAN §3).
+//! The public producer API.
 //!
 //! `Client.init` spawns the network thread (a `Producer` draining the `Ring`)
 //! and returns a handle. Submission is slot-first: `acquire` a `Message`, write
@@ -43,7 +43,7 @@ const build_options = @import("build_options");
 /// `error.CompressionNotImplemented`.
 pub const Compression = record_batch.Compression;
 
-/// A snapshot of producer statistics (issue #7). Pull-based: the caller
+/// A snapshot of producer statistics. Pull-based: the caller
 /// fetches it via `Client.stats()`. All values are a relaxed-consistency
 /// snapshot -- torn or stale reads are acceptable (it's metrics, not
 /// accounting). No locks, no allocation.
@@ -86,7 +86,7 @@ const Client = @This();
 pub const Message = Ring.Message;
 pub const Error = Ring.Error;
 pub const Strategy = partitioner.Strategy;
-/// Awaitable (default) vs fire-and-forget produce (issue #18). A fire-and-forget
+/// Awaitable vs fire-and-forget produce. A fire-and-forget
 /// message consumes no await handle and must never be awaited; outcomes are
 /// observed via `stats()`.
 pub const Mode = Ring.Mode;
@@ -113,7 +113,7 @@ pub const Credentials = struct {
     password: []const u8,
 };
 
-/// SASL/SCRAM mechanism + credentials. MSK is SHA-512 only (PLAN §9).
+/// SASL/SCRAM mechanism + credentials. AWS MSK uses SHA-512.
 pub const Sasl = union(enum) {
     scram_sha256: Credentials,
     scram_sha512: Credentials,
@@ -305,7 +305,7 @@ pub fn tryAcquire(self: *Client, mode: Mode) Error!Message {
     return self.ring.tryAcquire(mode);
 }
 
-/// Fetch a relaxed-consistency snapshot of producer statistics (issue #7).
+/// Fetch a relaxed-consistency snapshot of producer statistics.
 /// No locks, no allocation -- returns a value struct. Torn/stale reads are
 /// acceptable. `queue_depth` and `in_flight` are read from `Ring.depth()`
 /// (which loads `read_head` before `write_head` to avoid underflow); the
@@ -1123,8 +1123,8 @@ test "idempotency OFF: batches carry -1 sentinels, no PID" {
 
 // ---------------------------------------------------------------------------
 // 1c: idempotent re-ack error handling (OUT_OF_ORDER_SEQUENCE=45,
-// UNKNOWN_PRODUCER_ID=73, DUPLICATE_SEQUENCE_NUMBER=37). See PLAN §-idempotent
-// and issue #1. Codes verified against the Kafka error-code table
+// UNKNOWN_PRODUCER_ID=73, DUPLICATE_SEQUENCE_NUMBER=37). Codes verified
+// against the Kafka error-code table
 // (https://kafka.apache.org/protocol.html#protocol_error_codes); recovery
 // semantics against KIP-360 (PID reset / sequence reset) and KIP-98 (dedup).
 // ---------------------------------------------------------------------------

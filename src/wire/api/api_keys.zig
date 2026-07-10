@@ -55,7 +55,7 @@ pub const HeaderVersion = struct {
 };
 
 /// Pinned version for each in-scope API. These are the versions we negotiate
-/// and implement; see PLAN §1.
+/// and implemented by this client.
 pub const pinned_version: std.EnumMap(ApiKey, u16) = .init(.{
     .produce = 9,
     .metadata = 12,

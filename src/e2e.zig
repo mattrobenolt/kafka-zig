@@ -1,4 +1,4 @@
-//! E2e smoke binary (PLAN §5.3, phase 7): produces N messages through the
+//! E2e smoke binary: produces N messages through the
 //! real kafka-zig Client against a live Kafka broker (SASL_SSL +
 //! SCRAM-SHA-512 over TLS), then the justfile recipe consumes them back with
 //! kafka-console-consumer.sh and asserts the count matches.
@@ -10,7 +10,7 @@
 //!   e2e --broker localhost:9093 --ca rootCA.pem --user kafka-zig \
 //!       --pass <password> --topic e2e-events --num 20
 //!
-//! Usage (multi-broker HA — real MSK, exercises failover from #2):
+//! Usage (multi-broker HA — real MSK):
 //!   e2e --bootstrap b1:9096,b2:9096,b3:9096 --ca /path/to/ca.pem \
 //!       --user <scram-user> --pass <password> --topic msk-e2e --num 50
 
@@ -77,8 +77,8 @@ pub fn main() !void {
 
     // --- Parse bootstrap brokers ---
     // --broker gives a single host:port; --bootstrap gives comma-separated
-    // host:port pairs (for HA — all configured as bootstrap_brokers,
-    // exercising the failover from #2). When multiple brokers are provided,
+    // host:port pairs (for HA — all configured as bootstrap_brokers). When
+    // multiple brokers are provided,
     // SNI is left null so each connection uses its own broker hostname.
     var brokers: std.ArrayList(kafka.Client.Broker) = .empty;
     defer brokers.deinit(allocator);

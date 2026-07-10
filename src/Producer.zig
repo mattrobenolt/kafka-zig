@@ -1,4 +1,4 @@
-//! The producer network thread: the single consumer of the `Ring` (PLAN §2.5).
+//! The producer network thread: the single consumer of the `Ring`.
 //!
 //! One thread owns everything I/O: the broker connections, the metadata cache,
 //! the ring drain loop, batching, and ack/retry signalling. Nothing here is
@@ -9,7 +9,7 @@
 //!
 //! The loop is fully synchronous per broker: build a Produce request, send it,
 //! block reading its response, apply acks, repeat. This synchronicity is what
-//! makes in-place retry safe (PLAN §2.4 point 3): a slot is only ever "in the
+//! makes in-place retry safe: a slot is only ever "in the
 //! air" for the duration of one blocking round-trip, so there is never an
 //! older Produce for a slot that "may still complete" while we consider a
 //! retry. A pending slot observed at the top of a drain is therefore always
@@ -43,9 +43,9 @@
 //! `self.allocator` is never touched on the produce path. The remaining
 //! allocations are cold-path: dialing a connection (once per broker), the
 //! metadata-cache rebuild on refresh, and the first-use-per-topic round-robin
-//! counter key (allocated once per topic, with a safe fallback if it fails —
-//! PLAN §8). The one copy on the produce path is slot payload -> record-batch
-//! buffer, inside `record_batch.encodeBatch`.
+//! counter key (allocated once per topic, with a safe fallback if it fails).
+//! The one copy on the produce path is slot payload -> record-batch buffer,
+//! inside `record_batch.encodeBatch`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -331,7 +331,7 @@ round_robin: std.StringHashMapUnmanaged(partitioner.RoundRobin) = .empty,
 // --- sticky partition state, per topic, persistent across metadata refreshes ---
 sticky: std.StringHashMapUnmanaged(partitioner.Sticky) = .empty,
 
-// --- network-thread stats counters (issue #7, read by stats() from another thread) ---
+// --- network-thread stats counters (read by stats() from another thread) ---
 // Single-writer (network thread) / multi-reader (stats). Monotonic stores
 // from the network thread, monotonic loads from stats() -- relaxed consistency,
 // torn/stale reads are acceptable (it's metrics, not accounting).
@@ -381,7 +381,7 @@ pid_acquired: bool = false,
 /// (topic, partition). On retry, the slot's stored `base_sequence` is reused
 /// — this counter is NOT advanced on retry (the broker dedupes by sequence).
 /// Sequence numbers wrap at i32 max; the wraparound full-reset is a follow-up
-/// (out of scope for the idempotent milestone, see #1).
+/// and requires a full producer-ID and sequence reset.
 sequences: std.AutoHashMapUnmanaged(SeqKey, i32) = .empty,
 /// Set by `applyResponse` when a partition returns OUT_OF_ORDER_SEQUENCE (45)
 /// or UNKNOWN_PRODUCER_ID (73): the PID's sequence state is unrecoverable, so
@@ -1171,7 +1171,7 @@ fn findGroup(groups: []const Group, topic: []const u8, partition: i32) ?Group {
 }
 
 // ---------------------------------------------------------------------------
-// Stats helpers (issue #7): record terminal failures in the counters.
+// Stats helpers: record terminal failures in the counters.
 // ---------------------------------------------------------------------------
 
 /// Record a single permanent slot failure in the stats counters.
@@ -1347,7 +1347,7 @@ fn metadataAged(self: *Producer) bool {
 }
 
 /// Send a Metadata v12 request and rebuild the cache. Cold path (refresh
-/// cadence, allocations allowed, PLAN §8).
+/// cadence; allocations are allowed here).
 ///
 /// HA failover (#2): when `force_bootstrap` is set (all known brokers were
 /// unreachable on a prior refresh), use the bootstrap list exclusively.

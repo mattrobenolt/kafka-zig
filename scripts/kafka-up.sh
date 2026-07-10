@@ -7,7 +7,7 @@
 #   - CONTROLLER :9094 — KRaft quorum (internal, PLAINTEXT)
 #
 # The MSK target is port 9096 (SASL/SCRAM-over-TLS); we use 9093 locally — the
-# config shape is identical, only the port differs (PLAN §9).
+# config shape is identical; only the port differs.
 #
 # Certs: mkcert generates a locally-trusted cert for "localhost" + "127.0.0.1"
 # + "::1". The SCRAM user is created at storage-format time via

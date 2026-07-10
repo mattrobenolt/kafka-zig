@@ -1,4 +1,4 @@
-//! Benchmark harness (issue #9): measures produce throughput (msgs/s, bytes/s)
+//! Benchmark harness: measures produce throughput (msgs/s, bytes/s)
 //! and per-message latency (min/max/avg from commit to ack) through the real
 //! `Client` against the in-process mock broker (ztls + SCRAM over loopback).
 //!

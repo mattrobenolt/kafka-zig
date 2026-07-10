@@ -28,7 +28,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const testing = std.testing;
 
-/// Partition-selection strategy (public config; PLAN §3).
+/// Partition-selection strategy for producer configuration.
 pub const Strategy = enum {
     /// Modern Java-default behavior (KIP-794): hash the key when present,
     /// sticky-partition keyless records (one partition per topic per drain,

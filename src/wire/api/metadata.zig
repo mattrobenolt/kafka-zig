@@ -17,9 +17,8 @@
 //! Allocator policy: the request encode path is zero-alloc (writes to a
 //! caller-provided `*std.Io.Writer`). The response decode path takes an
 //! `std.mem.Allocator` for the nested arrays (brokers, topics, partitions,
-//! replica/isr/offline node arrays) because metadata refresh is cold-path
-//! (PLAN §2.1: "metadata copy on refresh is fine"). The parsed response owns
-//! its data; call `deinit` to free.
+//! replica/isr/offline node arrays) because metadata refresh is a cold path.
+//! The parsed response owns its data; call `deinit` to free.
 
 const std = @import("std");
 const assert = std.debug.assert;
