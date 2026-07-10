@@ -135,7 +135,7 @@ pub fn main() !void {
     defer allocator.free(handles);
 
     for (handles, 0..) |*m, i| {
-        m.* = try client.acquire();
+        m.* = try client.acquire(.awaitable);
         try m.setTopic(topic);
         m.setPartition(null); // round-robin across partitions
         const dst = m.value();

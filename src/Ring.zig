@@ -100,6 +100,14 @@ const shutdown_poll_ns: u64 = 20 * std.time.ns_per_ms;
 // Sentinel partition meaning "let the partitioner decide at batch time".
 pub const partition_unassigned: u32 = math.maxInt(u32);
 
+/// Whether an acquired message carries an await token (a pooled handle) or is
+/// fire-and-forget. Fire-and-forget skips the handle pool entirely: the caller
+/// never awaits, the network thread reclaims the slot on ack/fail, and outcomes
+/// are observed only in aggregate via `Client.stats()`. This is the shape the
+/// ring was ported from (exosphere's fire-and-forget `AtomicRingBuffer`); the
+/// handle/await layer is the opt-in addition (issue #18).
+pub const Mode = enum { awaitable, fire_and_forget };
+
 pub const Error = error{
     /// The payload/topic/key exceeds the ring's configured maximum.
     MessageTooLarge,
@@ -394,26 +402,43 @@ pub fn deinit(self: *Ring, gpa: Allocator) void {
 /// Acquire a slot, blocking (futex) while the ring is full. This is the sole
 /// backpressure path. Returns `error.Shutdown` if the ring is torn down.
 ///
-/// A handle is claimed FIRST (blocking on the handle pool if exhausted), then
-/// the slot. Claiming the slot advances `write_head`, which publishes the slot
-/// to the consumer as "data available"; doing that before we own a handle would
-/// leave a phantom `status_free` slot below `write_head` with no bound handle
-/// (breaks the invariant and spins the consumer). Handle-first keeps the
-/// invariant: every claimed slot has a bound handle.
-pub fn acquire(self: *Ring) Error!Message {
-    const handle_index = try self.poolAlloc(.block);
-    errdefer self.poolFree(handle_index);
-    const pos = try self.claimSlot(.block);
-    return self.bindMessage(pos, handle_index);
+/// In `.awaitable` mode a handle is claimed FIRST (blocking on the handle pool
+/// if exhausted), then the slot. Claiming the slot advances `write_head`, which
+/// publishes the slot to the consumer as "data available"; doing that before we
+/// own a handle would leave a phantom `status_free` slot below `write_head`
+/// with no bound handle (breaks the invariant and spins the consumer).
+/// Handle-first keeps the invariant: every awaitable slot has a bound handle.
+///
+/// In `.fire_and_forget` mode there is no handle: the slot is claimed with
+/// `handle_nil`, the caller receives a `Message` it must not await, and the
+/// network thread reclaims the slot on ack/fail. No handle-pool consumption
+/// means a fire-and-forget consumer that never awaits cannot leak handles
+/// (issue #18).
+pub fn acquire(self: *Ring, mode: Mode) Error!Message {
+    return self.acquireMode(mode, .block);
 }
 
-/// Non-blocking `acquire`: `error.WouldBlock` when the ring is full or handles
-/// are exhausted.
-pub fn tryAcquire(self: *Ring) Error!Message {
-    const handle_index = try self.poolAlloc(.no_block);
-    errdefer self.poolFree(handle_index);
-    const pos = try self.claimSlot(.no_block);
-    return self.bindMessage(pos, handle_index);
+/// Non-blocking `acquire`: `error.WouldBlock` when the ring is full or (in
+/// `.awaitable` mode) handles are exhausted.
+pub fn tryAcquire(self: *Ring, mode: Mode) Error!Message {
+    return self.acquireMode(mode, .no_block);
+}
+
+fn acquireMode(self: *Ring, mode: Mode, claim: ClaimMode) Error!Message {
+    switch (mode) {
+        .awaitable => {
+            const handle_index = try self.poolAlloc(claim);
+            errdefer self.poolFree(handle_index);
+            const pos = try self.claimSlot(claim);
+            return self.bindMessage(pos, handle_index);
+        },
+        .fire_and_forget => {
+            // No handle to claim or free — just the slot. A fire-and-forget
+            // slot binds `handle_nil` and is never awaited.
+            const pos = try self.claimSlot(claim);
+            return self.bindMessage(pos, handle_nil);
+        },
+    }
 }
 
 const ClaimMode = enum { block, no_block };
@@ -470,21 +495,25 @@ fn waitNotFull(self: *Ring, read_head_seen: u64) Error!void {
     Futex.timedWait(readHeadLow(self), @truncate(read_head_seen), shutdown_poll_ns) catch {};
 }
 
-/// Bind an already-owned handle to the claimed slot and return the producer
-/// token. The handle is acquired by the caller (`acquire`/`tryAcquire`) before
-/// the slot is claimed — see `acquire` for why.
+/// Bind the claimed slot to `handle_index` (or `handle_nil` for fire-and-forget)
+/// and return the producer token. In `.awaitable` mode the handle is acquired
+/// by the caller (`acquire`/`tryAcquire`) before the slot is claimed — see
+/// `acquire` for why. In `.fire_and_forget` mode `handle_index == handle_nil`
+/// and there is no handle to initialize.
 fn bindMessage(self: *Ring, pos: u64, handle_index: u32) Message {
     const slot_index: u32 = @intCast(pos & self.mask);
     const slot = &self.slots[slot_index];
-    // Generation left by the reclaim that last freed this physical slot,
-    // published to us via the read_head acquire-load in `claimSlot`.
-    const generation = slot.generation.load(.acquire);
 
-    const handle = &self.handles[handle_index];
-    handle.result.store(result_in_flight, .monotonic);
-    handle.err.store(0, .monotonic);
-    handle.slot_index = slot_index;
-    handle.generation = generation;
+    if (handle_index != handle_nil) {
+        // Generation left by the reclaim that last freed this physical slot,
+        // published to us via the read_head acquire-load in `claimSlot`.
+        const generation = slot.generation.load(.acquire);
+        const handle = &self.handles[handle_index];
+        handle.result.store(result_in_flight, .monotonic);
+        handle.err.store(0, .monotonic);
+        handle.slot_index = slot_index;
+        handle.generation = generation;
+    }
 
     // Reset per-slot metadata. handle_index is published to the network thread
     // by the commit release-store, so a plain write is fine here.
@@ -748,12 +777,19 @@ fn completeSlot(self: *Ring, index: u64, generation: u32, status: u32, result: u
     if (slot.status.load(.acquire) != status_pending) return;
     if (slot.generation.load(.acquire) != generation) return; // stale: recycled.
 
-    const handle = &self.handles[slot.handle_index];
     slot.err = err;
-    if (err != 0) handle.err.store(err, .monotonic);
-    // Publish completion to `await()`. Release so the waiter's acquire-load sees
-    // the err write above.
-    handle.result.store(result, .release);
+    // Fire-and-forget slots (issue #18) carry `handle_nil`: there is no handle
+    // to write a completion to — the caller never awaits, and outcomes are
+    // observed only via `Client.stats()` aggregate counters (incremented by the
+    // Producer's ack/fail paths, which don't touch the handle). Skip the handle
+    // writes and just mark the slot terminal so `reclaim` recycles it.
+    if (slot.handle_index != handle_nil) {
+        const handle = &self.handles[slot.handle_index];
+        if (err != 0) handle.err.store(err, .monotonic);
+        // Publish completion to `await()`. Release so the waiter's acquire-load
+        // sees the err write above.
+        handle.result.store(result, .release);
+    }
     // Mark the slot terminal so `reclaim` can free it.
     slot.status.store(status, .release);
 }
@@ -999,7 +1035,7 @@ test "single producer/consumer: acquire, commit, ack, await" {
     var ring = try Ring.init(testing.allocator, tinyConfig(8));
     defer ring.deinit(testing.allocator);
 
-    var m = try ring.acquire();
+    var m = try ring.acquire(.awaitable);
     try m.setTopic("events");
     m.setPartition(null);
     try m.setKey("k1");
@@ -1026,7 +1062,7 @@ test "MessageTooLarge on oversized topic/key/value" {
     var ring = try Ring.init(testing.allocator, tinyConfig(4));
     defer ring.deinit(testing.allocator);
 
-    var m = try ring.acquire();
+    var m = try ring.acquire(.awaitable);
     try testing.expectError(error.MessageTooLarge, m.setTopic("this-topic-name-is-way-too-long"));
     try testing.expectError(error.MessageTooLarge, m.setKey("this-key-is-too-long-too"));
     try testing.expectError(error.MessageTooLarge, m.commit(65));
@@ -1039,7 +1075,7 @@ test "writeMessage convenience: copies payload + commits in one call" {
     var ring = try Ring.init(testing.allocator, tinyConfig(4));
     defer ring.deinit(testing.allocator);
 
-    var m = try ring.acquire();
+    var m = try ring.acquire(.awaitable);
     try m.setTopic("events");
     try m.writeMessage("hello world");
     // The message is now committed (pending) — await would block without a
@@ -1047,7 +1083,7 @@ test "writeMessage convenience: copies payload + commits in one call" {
     try testing.expectError(error.WouldBlock, m.tryAwait());
 
     // Oversized payload → MessageTooLarge, message NOT committed.
-    var m2 = try ring.acquire();
+    var m2 = try ring.acquire(.awaitable);
     try m2.setTopic("events");
     const big: [65]u8 = @splat(0xAA);
     try testing.expectError(error.MessageTooLarge, m2.writeMessage(&big));
@@ -1060,18 +1096,18 @@ test "tryAcquire returns WouldBlock when full" {
 
     var msgs: [4]Message = undefined;
     for (&msgs) |*m| {
-        m.* = try ring.tryAcquire();
+        m.* = try ring.tryAcquire(.awaitable);
         try m.setTopic("t");
         try m.commit(1);
     }
     // Ring is full: 4 in-flight, none reclaimed.
-    try testing.expectError(error.WouldBlock, ring.tryAcquire());
+    try testing.expectError(error.WouldBlock, ring.tryAcquire(.awaitable));
 
     // Ack + reclaim one, then a slot frees up.
     try testing.expect(ackOne(&ring, 0));
     try msgs[0].await();
     try testing.expectEqual(@as(u64, 1), ring.reclaim());
-    var m5 = try ring.tryAcquire();
+    var m5 = try ring.tryAcquire(.awaitable);
     try m5.setTopic("t");
     try m5.commit(1);
 
@@ -1088,7 +1124,7 @@ test "tryAwait reports in-flight then completion" {
     var ring = try Ring.init(testing.allocator, tinyConfig(4));
     defer ring.deinit(testing.allocator);
 
-    var m = try ring.acquire();
+    var m = try ring.acquire(.awaitable);
     try m.setTopic("t");
     try m.commit(1);
     try testing.expectError(error.WouldBlock, m.tryAwait());
@@ -1100,7 +1136,7 @@ test "failed send surfaces error.SendFailed with error code" {
     var ring = try Ring.init(testing.allocator, tinyConfig(4));
     defer ring.deinit(testing.allocator);
 
-    var m = try ring.acquire();
+    var m = try ring.acquire(.awaitable);
     try m.setTopic("t");
     try m.commit(1);
     ring.markFailed(0, ring.slotGeneration(0), 37);
@@ -1115,7 +1151,7 @@ test "partial ack: out-of-order completion, no head-of-line block" {
 
     var msgs: [4]Message = undefined;
     for (&msgs) |*m| {
-        m.* = try ring.acquire();
+        m.* = try ring.acquire(.awaitable);
         try m.setTopic("t");
         try m.commit(1);
     }
@@ -1141,7 +1177,7 @@ test "partial ack: a stuck head slot delays reclaim but not later completions" {
 
     var msgs: [4]Message = undefined;
     for (&msgs) |*m| {
-        m.* = try ring.acquire();
+        m.* = try ring.acquire(.awaitable);
         try m.setTopic("t");
         try m.commit(1);
     }
@@ -1171,7 +1207,7 @@ test "stable handle across retry: message re-armed in place, ack completes it" {
     var ring = try Ring.init(testing.allocator, tinyConfig(4));
     defer ring.deinit(testing.allocator);
 
-    var m = try ring.acquire();
+    var m = try ring.acquire(.awaitable);
     try m.setTopic("orders");
     try m.setKey("k");
     const dst = m.value();
@@ -1201,7 +1237,7 @@ test "completeSlot no-ops on a non-pending slot (stale/double ack)" {
     var ring = try Ring.init(testing.allocator, tinyConfig(4));
     defer ring.deinit(testing.allocator);
 
-    var m = try ring.acquire();
+    var m = try ring.acquire(.awaitable);
     try m.setTopic("t");
     try m.commit(1);
     const gen0 = ring.slotGeneration(0);
@@ -1230,7 +1266,7 @@ test "generation counter rejects a recycled slot's stale ack" {
     try testing.expectEqual(@as(u32, 1), ring.numSlots());
 
     // Handle A on slot 0, generation gA.
-    var a = try ring.acquire();
+    var a = try ring.acquire(.awaitable);
     try a.setTopic("t");
     try a.commit(1);
     const gen_a = ring.slotGeneration(0);
@@ -1240,7 +1276,7 @@ test "generation counter rejects a recycled slot's stale ack" {
     try testing.expectEqual(@as(u64, 1), ring.reclaim()); // frees slot 0, bumps gen.
 
     // Handle B reuses physical slot 0 at generation gB > gA.
-    var b = try ring.acquire();
+    var b = try ring.acquire(.awaitable);
     try b.setTopic("t");
     try b.commit(1);
     const gen_b = ring.slotGeneration(1); // logical pos 1, physical slot 0.
@@ -1263,7 +1299,7 @@ test "backpressure: acquire blocks until the consumer reclaims" {
 
     var msgs: [4]Message = undefined;
     for (&msgs) |*m| {
-        m.* = try ring.acquire();
+        m.* = try ring.acquire(.awaitable);
         try m.setTopic("t");
         try m.commit(1);
     }
@@ -1273,7 +1309,7 @@ test "backpressure: acquire blocks until the consumer reclaims" {
         ring: *Ring,
         done: *atomic.Value(bool),
         fn run(r: *Ring, done: *atomic.Value(bool)) void {
-            var m = r.acquire() catch return;
+            var m = r.acquire(.awaitable) catch return;
             m.setTopic("t") catch return;
             m.commit(1) catch return;
             done.store(true, .release);
@@ -1318,7 +1354,7 @@ test "multi-producer, single consumer: no loss, all acked" {
         fn run(r: *Ring, acked: *atomic.Value(u32)) void {
             var i: u32 = 0;
             while (i < per_producer) : (i += 1) {
-                var m = r.acquire() catch return;
+                var m = r.acquire(.awaitable) catch return;
                 m.setTopic("t") catch return;
                 const dst = m.value();
                 dst[0] = @truncate(i);
@@ -1389,7 +1425,7 @@ fn expectUnblocksBy(result: *atomic.Value(u32), want: u32, deadline_ns: u64) !vo
 test "shutdown unblocks an in-flight acquire (no park-first assumption)" {
     const Waiter = struct {
         fn run(r: *Ring, result: *atomic.Value(u32)) void {
-            if (r.acquire()) |_| {
+            if (r.acquire(.awaitable)) |_| {
                 result.store(1, .release); // unexpected success
             } else |err| switch (err) {
                 error.Shutdown => result.store(2, .release),
@@ -1405,7 +1441,7 @@ test "shutdown unblocks an in-flight acquire (no park-first assumption)" {
         // Fill the ring so acquire must block on the full futex.
         var msgs: [2]Message = undefined;
         for (&msgs) |*m| {
-            m.* = try ring.acquire();
+            m.* = try ring.acquire(.awaitable);
             try m.setTopic("t");
             try m.commit(1);
         }
@@ -1439,7 +1475,7 @@ test "shutdown unblocks an in-flight await (no park-first assumption)" {
     while (iter < 200) : (iter += 1) {
         var ring = try Ring.init(testing.allocator, tinyConfig(4));
         defer ring.deinit(testing.allocator);
-        var m = try ring.acquire();
+        var m = try ring.acquire(.awaitable);
         try m.setTopic("t");
         try m.commit(1);
 
@@ -1466,7 +1502,7 @@ test "failureCode survives the handle being recycled by another producer (Fix 1)
         var ring = try Ring.init(testing.allocator, tinyConfig(1));
         defer ring.deinit(testing.allocator);
 
-        var a = try ring.acquire();
+        var a = try ring.acquire(.awaitable);
         try a.setTopic("t");
         try a.commit(1);
         ring.markFailed(0, ring.slotGeneration(0), 42);
@@ -1477,7 +1513,7 @@ test "failureCode survives the handle being recycled by another producer (Fix 1)
         const Grabber = struct {
             fn run(r: *Ring, started: *atomic.Value(bool)) void {
                 started.store(true, .release);
-                var b = r.acquire() catch return;
+                var b = r.acquire(.awaitable) catch return;
                 b.setTopic("t") catch return;
                 b.commit(1) catch return;
                 r.markAcked(b.slot_index, r.slotGeneration(b.slot_index));
@@ -1507,7 +1543,7 @@ test "full ring: every slot fails retriably, retry all in place, then ack all (F
 
     var msgs: [8]Message = undefined;
     for (&msgs) |*m| {
-        m.* = try ring.acquire();
+        m.* = try ring.acquire(.awaitable);
         try m.setTopic("t");
         try m.commit(1);
     }
@@ -1534,7 +1570,7 @@ test "acquire blocks on handle exhaustion, not a phantom write_head slot (Fix 6)
     // owned. Ring is now empty (read_head caught up) yet 0 handles are free.
     var msgs: [2]Message = undefined;
     for (&msgs) |*m| {
-        m.* = try ring.acquire();
+        m.* = try ring.acquire(.awaitable);
         try m.setTopic("t");
         try m.commit(1);
     }
@@ -1547,7 +1583,7 @@ test "acquire blocks on handle exhaustion, not a phantom write_head slot (Fix 6)
     // advance write_head into a phantom, handle-less slot.
     const Waiter = struct {
         fn run(r: *Ring, done: *atomic.Value(bool)) void {
-            var m = r.acquire() catch return;
+            var m = r.acquire(.awaitable) catch return;
             m.setTopic("t") catch return;
             m.commit(1) catch return;
             done.store(true, .release);
@@ -1590,7 +1626,7 @@ test "stress: multi-producer + consumer with randomized ack/retry/reclaim/shutdo
             const rng = prng.random();
             var i: u32 = 0;
             while (i < per_producer) : (i += 1) {
-                var m = r.acquire() catch return;
+                var m = r.acquire(.awaitable) catch return;
                 m.setTopic("t") catch return;
                 const dst = m.value();
                 dst[0] = @truncate(i);
@@ -1662,7 +1698,7 @@ test "double-await guard: handle_index is handle_nil after await" {
     var ring = try Ring.init(testing.allocator, tinyConfig(4));
     defer ring.deinit(testing.allocator);
 
-    var m = try ring.acquire();
+    var m = try ring.acquire(.awaitable);
     try m.setTopic("t");
     try m.commit(1);
 
@@ -1677,7 +1713,7 @@ test "handle_index is handle_nil after failed await" {
     var ring = try Ring.init(testing.allocator, tinyConfig(4));
     defer ring.deinit(testing.allocator);
 
-    var m = try ring.acquire();
+    var m = try ring.acquire(.awaitable);
     try m.setTopic("t");
     try m.commit(1);
 
@@ -1694,7 +1730,7 @@ test "handle_index is NOT handle_nil after tryAwait WouldBlock" {
     var ring = try Ring.init(testing.allocator, tinyConfig(4));
     defer ring.deinit(testing.allocator);
 
-    var m = try ring.acquire();
+    var m = try ring.acquire(.awaitable);
     try m.setTopic("t");
     try m.commit(1);
 
@@ -1722,7 +1758,7 @@ test "requestDrain blocks new acquires but lets pending slots drain" {
     defer ring.deinit(testing.allocator);
 
     // Commit a message (pending) — it stays drainable.
-    var m = try ring.acquire();
+    var m = try ring.acquire(.awaitable);
     try m.setTopic("t");
     try m.commit(1);
     try testing.expect(ring.slotIsPending(0));
@@ -1733,7 +1769,7 @@ test "requestDrain blocks new acquires but lets pending slots drain" {
     try testing.expect(!ring.isShutdown());
 
     // New acquires are blocked with error.Shutdown.
-    try testing.expectError(error.Shutdown, ring.tryAcquire());
+    try testing.expectError(error.Shutdown, ring.tryAcquire(.awaitable));
 
     // The pending slot is still drainable: the consumer can still ack it.
     try testing.expect(ackOne(&ring, 0));
@@ -1755,7 +1791,7 @@ test "requestDrain unblocks an in-flight acquire" {
     // is called, not hang.
     const Waiter = struct {
         fn run(r: *Ring, result: *atomic.Value(u32)) void {
-            if (r.acquire()) |_| {
+            if (r.acquire(.awaitable)) |_| {
                 result.store(1, .release);
             } else |err| switch (err) {
                 error.Shutdown => result.store(2, .release),
@@ -1770,7 +1806,7 @@ test "requestDrain unblocks an in-flight acquire" {
     // Fill the ring so acquire must block.
     var msgs: [2]Message = undefined;
     for (&msgs) |*m| {
-        m.* = try ring.acquire();
+        m.* = try ring.acquire(.awaitable);
         try m.setTopic("t");
         try m.commit(1);
     }
@@ -1783,6 +1819,127 @@ test "requestDrain unblocks an in-flight acquire" {
         return e;
     };
     t.join();
+}
+
+// ===========================================================================
+// Fire-and-forget mode (issue #18): no handle, no await required.
+// ===========================================================================
+
+test "fire_and_forget: acquire consumes no handle, slot reclaims on ack without await" {
+    var ring = try Ring.init(testing.allocator, tinyConfig(4));
+    defer ring.deinit(testing.allocator);
+
+    var m = try ring.acquire(.fire_and_forget);
+    try testing.expectEqual(handle_nil, m.handle_index);
+    try m.setTopic("events");
+    try m.writeMessage("payload");
+    try testing.expectEqual(handle_nil, ring.slotAt(0).handle_index);
+
+    // The network thread acks and reclaims — no await from the producer.
+    try testing.expect(ackOne(&ring, 0));
+    try testing.expectEqual(status_acked, ring.slotAt(0).status.load(.acquire));
+    try testing.expectEqual(@as(u64, 1), ring.reclaim());
+    try testing.expectEqual(@as(u64, 1), ring.readHead());
+}
+
+test "fire_and_forget: > num_slots produces never exhaust the handle pool" {
+    // The whole point of issue #18: a consumer that commits fire-and-forget and
+    // never awaits must NOT leak handles. With awaitable mode, num_slots
+    // un-awaited commits would drain the handle pool and every subsequent
+    // tryAcquire would return WouldBlock. Fire-and-forget allocates no handle,
+    // so as long as the network thread keeps reclaiming, we can produce
+    // arbitrarily many messages.
+    var ring = try Ring.init(testing.allocator, tinyConfig(4));
+    defer ring.deinit(testing.allocator);
+
+    const total: u64 = 4 * 8; // 8x the ring depth.
+    var produced: u64 = 0;
+    while (produced < total) : (produced += 1) {
+        var m = try ring.acquire(.fire_and_forget); // blocks on full, never on handles.
+        try m.setTopic("t");
+        try m.commit(1);
+        // Network thread: ack the just-committed slot and reclaim so acquire
+        // can make progress. (Single-threaded drive keeps the test
+        // deterministic.)
+        const pos = produced;
+        try testing.expect(ackOne(&ring, pos));
+        try testing.expectEqual(@as(u64, 1), ring.reclaim());
+    }
+    try testing.expectEqual(total, ring.readHead());
+    // The handle pool is fully intact: an awaitable acquire still succeeds.
+    var aw = try ring.tryAcquire(.awaitable);
+    try aw.setTopic("t");
+    try aw.commit(1);
+    try testing.expect(ackOne(&ring, total));
+    ring.wakeCompletions();
+    try aw.await();
+}
+
+test "fire_and_forget: failed send marks slot failed and reclaims, no handle touched" {
+    var ring = try Ring.init(testing.allocator, tinyConfig(4));
+    defer ring.deinit(testing.allocator);
+
+    var m = try ring.acquire(.fire_and_forget);
+    try m.setTopic("t");
+    try m.commit(1);
+    ring.markFailed(0, ring.slotGeneration(0), 37);
+    // No handle exists, so failureCode stays 0 (outcome is observed via stats).
+    try testing.expectEqual(@as(u32, 0), m.failureCode());
+    try testing.expectEqual(status_failed, ring.slotAt(0).status.load(.acquire));
+    try testing.expectEqual(@as(u32, 37), ring.slotAt(0).err);
+    try testing.expectEqual(@as(u64, 1), ring.reclaim());
+}
+
+test "fire_and_forget: message is born in the await-guard state (await would panic)" {
+    // `Message.await`/`tryAwait`/`failureCode`(guarded ones) assert
+    // `handle_index != handle_nil`. A fire-and-forget message carries
+    // `handle_nil` from birth, so awaiting it by accident trips the assert in
+    // Debug/ReleaseSafe rather than corrupting the handle pool. The assert
+    // panics (it cannot be caught with expectError), so the sentinel state is
+    // the testable surface — same contract the double-await guard test relies
+    // on.
+    var ring = try Ring.init(testing.allocator, tinyConfig(4));
+    defer ring.deinit(testing.allocator);
+
+    var m = try ring.acquire(.fire_and_forget);
+    try m.setTopic("t");
+    try m.commit(1);
+    try testing.expectEqual(handle_nil, m.handle_index); // await would assert on this.
+    // failureCode does NOT assert the guard and is always safe: stays 0.
+    try testing.expectEqual(@as(u32, 0), m.failureCode());
+
+    // Drain so the ring tears down clean.
+    try testing.expect(ackOne(&ring, 0));
+    try testing.expectEqual(@as(u64, 1), ring.reclaim());
+}
+
+test "fire_and_forget: tryAcquire never blocks on handle exhaustion" {
+    // All handles owned (awaitable acquires, never awaited), ring empty. An
+    // awaitable tryAcquire would WouldBlock on the pool; fire_and_forget still
+    // succeeds because it needs no handle.
+    var ring = try Ring.init(testing.allocator, tinyConfig(2));
+    defer ring.deinit(testing.allocator);
+
+    var msgs: [2]Message = undefined;
+    for (&msgs) |*m| {
+        m.* = try ring.acquire(.awaitable);
+        try m.setTopic("t");
+        try m.commit(1);
+    }
+    for (0..2) |pos| ring.markAcked(pos, ring.slotGeneration(pos));
+    ring.wakeCompletions();
+    try testing.expectEqual(@as(u64, 2), ring.reclaim());
+    // Ring empty, but 0 handles free (msgs never awaited).
+    try testing.expectError(error.WouldBlock, ring.tryAcquire(.awaitable));
+    // Fire-and-forget sidesteps the pool entirely.
+    var ff = try ring.tryAcquire(.fire_and_forget);
+    try testing.expectEqual(handle_nil, ff.handle_index);
+    try ff.setTopic("t");
+    try ff.commit(1);
+    try testing.expect(ackOne(&ring, 2));
+    try testing.expectEqual(@as(u64, 1), ring.reclaim());
+    // Free the leaked awaitable handles so the ring tears down clean.
+    for (&msgs) |*m| try m.await();
 }
 
 test {

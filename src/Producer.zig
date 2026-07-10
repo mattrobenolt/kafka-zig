@@ -1801,7 +1801,7 @@ test "single-partition backlog above max_batch_bytes splits across drains" {
 
     var msgs: [4]Ring.Message = undefined;
     for (&msgs) |*m| {
-        m.* = try ring.acquire();
+        m.* = try ring.acquire(.awaitable);
         try m.setTopic("events");
         m.setPartition(0);
         @memset(m.value()[0..200], 'x');
@@ -1871,7 +1871,7 @@ test "stamped retry sub-run above max_batch_bytes is not split" {
 
     var msgs: [3]Ring.Message = undefined;
     for (&msgs) |*m| {
-        m.* = try ring.acquire();
+        m.* = try ring.acquire(.awaitable);
         try m.setTopic("events");
         m.setPartition(0);
         @memset(m.value()[0..200], 'x');

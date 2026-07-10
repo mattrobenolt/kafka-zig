@@ -10,7 +10,7 @@
 //! ```
 //! var client = try Client.init(allocator, .{ .bootstrap_brokers = ..., ... });
 //! defer client.deinit();
-//! var m = try client.acquire();     // blocks when the ring is full (backpressure)
+//! var m = try client.acquire(.awaitable);     // blocks when the ring is full (backpressure)
 //! try m.setTopic("events");
 //! m.setPartition(null);             // null → partitioner decides at batch time
 //! const dst = m.value();
@@ -86,6 +86,10 @@ const Client = @This();
 pub const Message = Ring.Message;
 pub const Error = Ring.Error;
 pub const Strategy = partitioner.Strategy;
+/// Awaitable (default) vs fire-and-forget produce (issue #18). A fire-and-forget
+/// message consumes no await handle and must never be awaited; outcomes are
+/// observed via `stats()`.
+pub const Mode = Ring.Mode;
 
 /// A bootstrap broker endpoint.
 pub const Broker = struct {
@@ -291,13 +295,14 @@ pub fn deinit(self: *Client) void { // ziglint-ignore: Z030 -- self is heap-owne
 
 /// Acquire a slot, blocking (futex) while the ring is full — the backpressure
 /// path. Returns `error.Shutdown` if the client is tearing down.
-pub fn acquire(self: *Client) Error!Message {
-    return self.ring.acquire();
+pub fn acquire(self: *Client, mode: Mode) Error!Message {
+    return self.ring.acquire(mode);
 }
 
-/// Non-blocking `acquire`: `error.WouldBlock` when the ring is full.
-pub fn tryAcquire(self: *Client) Error!Message {
-    return self.ring.tryAcquire();
+/// Non-blocking `acquire`: `error.WouldBlock` when the ring is full (or, in
+/// `.awaitable` mode, when the handle pool is exhausted).
+pub fn tryAcquire(self: *Client, mode: Mode) Error!Message {
+    return self.ring.tryAcquire(mode);
 }
 
 /// Fetch a relaxed-consistency snapshot of producer statistics (issue #7).
@@ -424,7 +429,7 @@ test "produce N messages: all ack, no loss" {
     const n = 50;
     var handles: [n]Message = undefined;
     for (&handles, 0..) |*m, i| {
-        m.* = try client.acquire();
+        m.* = try client.acquire(.awaitable);
         try m.setTopic("events");
         m.setPartition(null);
         var key_buf: [16]u8 = undefined;
@@ -437,6 +442,102 @@ test "produce N messages: all ack, no loss" {
     for (&handles) |*m| try m.await();
 
     try testing.expectEqual(@as(u32, n), broker.produced.load(.acquire));
+}
+
+/// Poll `broker.produced` until it reaches `want`, up to 5s. Fire-and-forget
+/// produces have no per-message await, so the test observes completion in
+/// aggregate the same way a real fire-and-forget consumer would.
+fn expectProducedReaches(broker: *mock.Broker, want: u32) !void {
+    const start: u64 = @intCast(@as(i64, @truncate(std.time.nanoTimestamp())));
+    const deadline_ns: u64 = start + 5 * std.time.ns_per_s;
+    while (true) {
+        if (broker.produced.load(.acquire) >= want) return;
+        const now: u64 = @intCast(@as(i64, @truncate(std.time.nanoTimestamp())));
+        if (now >= deadline_ns) return error.Timeout;
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+}
+
+test "fire-and-forget: produce > ring_slots messages, no handle exhaustion, all ack" {
+    // Issue #18: a fire-and-forget consumer commits and walks away, never
+    // awaiting. With awaitable acquires this would leak handles — after
+    // ring_slots un-awaited commits the pool is empty and every tryAcquire
+    // returns WouldBlock. Fire-and-forget allocates no handle, so producing far
+    // more than ring_slots messages never exhausts anything; the network thread
+    // reclaims slots on ack and acquire's backpressure alone bounds the flight.
+    var broker = try mock.Broker.start(testing.allocator, .{ .mode = .ok, .num_partitions = 4 });
+    defer broker.stop();
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var cfg = testConfig(&bootstrap);
+    cfg.ring_slots = 16; // small ring so n far exceeds it.
+    var client = try Client.init(testing.allocator, cfg);
+    defer client.deinit();
+
+    const n: u32 = 16 * 8; // 8x the ring depth — would exhaust handles if awaitable.
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        // acquire blocks on ring-full backpressure (never on handle exhaustion),
+        // and never returns WouldBlock here because it is the blocking variant.
+        var m = try client.acquire(.fire_and_forget);
+        // No await handle was consumed: the sentinel means "no awaiter".
+        try testing.expectEqual(std.math.maxInt(u32), m.handle_index);
+        try m.setTopic("events");
+        m.setPartition(null);
+        const dst = m.value();
+        const payload = try std.fmt.bufPrint(dst, "ff-{d}", .{i});
+        try m.commit(@intCast(payload.len));
+        // Intentionally NO await: this is the fire-and-forget contract.
+    }
+
+    // Outcomes observed in aggregate, not per-message.
+    try expectProducedReaches(broker, n);
+    try expectQueueDepthZero(client);
+    try testing.expectEqual(@as(u32, n), broker.produced.load(.acquire));
+    try testing.expectEqual(@as(u64, n), client.stats().messages_acked);
+    try testing.expectEqual(@as(u64, 0), client.stats().messages_failed);
+}
+
+test "fire-and-forget: tryAcquire never returns WouldBlock from handle exhaustion" {
+    // A load-shedding fire-and-forget sink uses tryAcquire and drops on a full
+    // ring. It must never see spurious WouldBlock from a drained handle pool
+    // (there is no handle pool in this mode). Produce until the ring backs up,
+    // dropping on WouldBlock, and assert everything that WAS committed acks.
+    var broker = try mock.Broker.start(testing.allocator, .{ .mode = .ok, .num_partitions = 4 });
+    defer broker.stop();
+
+    const bootstrap = [_]Broker{.{ .host = "127.0.0.1", .port = broker.port }};
+    var cfg = testConfig(&bootstrap);
+    cfg.ring_slots = 16;
+    var client = try Client.init(testing.allocator, cfg);
+    defer client.deinit();
+
+    // Target well past the ring depth so we necessarily hit the full ring
+    // (WouldBlock) many times. On WouldBlock we sleep briefly and retry rather
+    // than assert immediately: WouldBlock is the ring-full backpressure signal,
+    // never a drained handle pool. The key invariant is that it is always
+    // *recoverable* (the network thread reclaims), so we always make progress.
+    const n: u32 = 100;
+    var committed: u32 = 0;
+    while (committed < n) {
+        var m = client.tryAcquire(.fire_and_forget) catch |err| switch (err) {
+            error.WouldBlock => {
+                std.Thread.sleep(std.time.ns_per_ms); // let the drain reclaim.
+                continue;
+            },
+            else => return err,
+        };
+        try m.setTopic("events");
+        m.setPartition(null);
+        try m.writeMessage("x");
+        committed += 1;
+    }
+    try testing.expectEqual(n, committed);
+    try testing.expect(committed > cfg.ring_slots); // we did exceed the ring depth.
+    try expectProducedReaches(broker, committed);
+    try expectQueueDepthZero(client);
+    try testing.expectEqual(committed, broker.produced.load(.acquire));
+    try testing.expectEqual(@as(u64, committed), client.stats().messages_acked);
 }
 
 test "retriable error on first produce, then ack after retry + metadata refresh" {
@@ -453,7 +554,7 @@ test "retriable error on first produce, then ack after retry + metadata refresh"
     const n = 20;
     var handles: [n]Message = undefined;
     for (&handles, 0..) |*m, i| {
-        m.* = try client.acquire();
+        m.* = try client.acquire(.awaitable);
         try m.setTopic("events");
         // Explicit partition so every partition sees the inject-once path.
         m.setPartition(@intCast(i % 4));
@@ -479,7 +580,7 @@ test "non-retriable error surfaces error.SendFailed" {
     var client = try Client.init(testing.allocator, testConfig(&bootstrap));
     defer client.deinit();
 
-    var m = try client.acquire();
+    var m = try client.acquire(.awaitable);
     try m.setTopic("events");
     m.setPartition(0);
     const dst = m.value();
@@ -575,7 +676,7 @@ test "produce hot path: zero general-allocator allocs after cold-path setup" {
     defer client.deinit();
 
     // First batch: triggers metadata + dial + RR key (cold path).
-    var m1 = try client.acquire();
+    var m1 = try client.acquire(.awaitable);
     try m1.setTopic("events");
     m1.setPartition(0);
     const dst1 = m1.value();
@@ -587,7 +688,7 @@ test "produce hot path: zero general-allocator allocs after cold-path setup" {
 
     // Second batch: same broker, same topic — should be zero general-allocator
     // allocs. The FBA absorbs the produce response decode.
-    var m2 = try client.acquire();
+    var m2 = try client.acquire(.awaitable);
     try m2.setTopic("events");
     m2.setPartition(0);
     const dst2 = m2.value();
@@ -598,7 +699,7 @@ test "produce hot path: zero general-allocator allocs after cold-path setup" {
     try testing.expectEqual(allocs_after_cold, counter.alloc_count);
 
     // Third batch to be sure.
-    var m3 = try client.acquire();
+    var m3 = try client.acquire(.awaitable);
     try m3.setTopic("events");
     m3.setPartition(0);
     const dst3 = m3.value();
@@ -628,7 +729,7 @@ test "max_batch_bytes splits batches across drains: all eventually ack" {
     const n = 4;
     var handles: [n]Message = undefined;
     for (&handles, 0..) |*m, i| {
-        m.* = try client.acquire();
+        m.* = try client.acquire(.awaitable);
         try m.setTopic("events");
         m.setPartition(@intCast(i % 2)); // partitions 0 and 1
         try m.setKey("k");
@@ -660,7 +761,7 @@ test "single batch exceeding max_batch_bytes fails MESSAGE_TOO_LARGE" {
     var client = try Client.init(testing.allocator, cfg);
     defer client.deinit();
 
-    var m = try client.acquire();
+    var m = try client.acquire(.awaitable);
     try m.setTopic("events");
     m.setPartition(0);
     const dst = m.value();
@@ -697,7 +798,7 @@ test "large batch > 64 KiB frames without RequestBufferTooSmall (#15)" {
     const n = 100;
     var handles: [n]Message = undefined;
     for (&handles) |*m| {
-        m.* = try client.acquire();
+        m.* = try client.acquire(.awaitable);
         try m.setTopic("events");
         m.setPartition(0);
         const dst = m.value();
@@ -738,7 +839,7 @@ test "idempotency ON: batches carry real PID, epoch, and advancing base_sequence
     const n = 5;
     var handles: [n]Message = undefined;
     for (&handles, 0..) |*m, i| {
-        m.* = try client.acquire();
+        m.* = try client.acquire(.awaitable);
         try m.setTopic("events");
         m.setPartition(0);
         const dst = m.value();
@@ -780,7 +881,7 @@ test "idempotency ON: per-partition sequences are independent" {
     // First batch: 3 messages to partition 0.
     var h1: [3]Message = undefined;
     for (&h1, 0..) |*m, i| {
-        m.* = try client.acquire();
+        m.* = try client.acquire(.awaitable);
         try m.setTopic("events");
         m.setPartition(0);
         const dst = m.value();
@@ -792,7 +893,7 @@ test "idempotency ON: per-partition sequences are independent" {
     // Second batch: 2 messages to partition 1.
     var h2: [2]Message = undefined;
     for (&h2, 0..) |*m, i| {
-        m.* = try client.acquire();
+        m.* = try client.acquire(.awaitable);
         try m.setTopic("events");
         m.setPartition(1);
         const dst = m.value();
@@ -804,7 +905,7 @@ test "idempotency ON: per-partition sequences are independent" {
     // Third batch: 2 more messages to partition 0.
     var h3: [2]Message = undefined;
     for (&h3, 0..) |*m, i| {
-        m.* = try client.acquire();
+        m.* = try client.acquire(.awaitable);
         try m.setTopic("events");
         m.setPartition(0);
         const dst = m.value();
@@ -859,7 +960,7 @@ test "idempotency ON: retry reuses the same base_sequence" {
     const n = 3;
     var handles: [n]Message = undefined;
     for (&handles, 0..) |*m, i| {
-        m.* = try client.acquire();
+        m.* = try client.acquire(.awaitable);
         try m.setTopic("events");
         m.setPartition(0);
         const dst = m.value();
@@ -913,7 +1014,7 @@ test "idempotency ON: retry does not merge fresh records into the retried batch"
     // Three records to partition 0 — do NOT await yet.
     var h1: [3]Message = undefined;
     for (&h1, 0..) |*m, i| {
-        m.* = try client.acquire();
+        m.* = try client.acquire(.awaitable);
         try m.setTopic("events");
         m.setPartition(0);
         const dst = m.value();
@@ -928,7 +1029,7 @@ test "idempotency ON: retry does not merge fresh records into the retried batch"
     broker.waitFirstProduce();
     var h2: [2]Message = undefined;
     for (&h2, 0..) |*m, i| {
-        m.* = try client.acquire();
+        m.* = try client.acquire(.awaitable);
         try m.setTopic("events");
         m.setPartition(0);
         const dst = m.value();
@@ -1004,7 +1105,7 @@ test "idempotency OFF: batches carry -1 sentinels, no PID" {
     var client = try Client.init(testing.allocator, cfg);
     defer client.deinit();
 
-    var m = try client.acquire();
+    var m = try client.acquire(.awaitable);
     try m.setTopic("events");
     m.setPartition(0);
     const dst = m.value();
@@ -1047,7 +1148,7 @@ test "idempotency ON: OUT_OF_ORDER_SEQUENCE re-inits PID, resets sequence, retri
     const n = 3;
     var handles: [n]Message = undefined;
     for (&handles, 0..) |*m, i| {
-        m.* = try client.acquire();
+        m.* = try client.acquire(.awaitable);
         try m.setTopic("events");
         m.setPartition(0);
         const dst = m.value();
@@ -1102,7 +1203,7 @@ test "idempotency ON: UNKNOWN_PRODUCER_ID re-inits PID, resets sequence, retries
     const n = 4;
     var handles: [n]Message = undefined;
     for (&handles, 0..) |*m, i| {
-        m.* = try client.acquire();
+        m.* = try client.acquire(.awaitable);
         try m.setTopic("events");
         m.setPartition(0);
         const dst = m.value();
@@ -1148,7 +1249,7 @@ test "idempotency ON: DUPLICATE_SEQUENCE_NUMBER is treated as ack, not failure" 
     const n = 3;
     var handles: [n]Message = undefined;
     for (&handles, 0..) |*m, i| {
-        m.* = try client.acquire();
+        m.* = try client.acquire(.awaitable);
         try m.setTopic("events");
         m.setPartition(0);
         const dst = m.value();
@@ -1179,7 +1280,7 @@ test "idempotency OFF: OUT_OF_ORDER_SEQUENCE fails (not silently recovered)" {
     var client = try Client.init(testing.allocator, cfg);
     defer client.deinit();
 
-    var m = try client.acquire();
+    var m = try client.acquire(.awaitable);
     try m.setTopic("events");
     m.setPartition(0);
     const dst = m.value();
@@ -1206,7 +1307,7 @@ test "idempotency OFF: DUPLICATE_SEQUENCE_NUMBER fails (not treated as ack)" {
     var client = try Client.init(testing.allocator, cfg);
     defer client.deinit();
 
-    var m = try client.acquire();
+    var m = try client.acquire(.awaitable);
     try m.setTopic("events");
     m.setPartition(0);
     const dst = m.value();
@@ -1245,7 +1346,7 @@ test "#2 bootstrap failover: 3 endpoints, only 2nd listening — produce succeed
     const n = 10;
     var handles: [n]Message = undefined;
     for (&handles, 0..) |*m, i| {
-        m.* = try client.acquire();
+        m.* = try client.acquire(.awaitable);
         try m.setTopic("events");
         m.setPartition(null);
         const dst = m.value();
@@ -1274,7 +1375,7 @@ test "#2 all bootstrap down: init fails gracefully, no hang" {
     var client = try Client.init(testing.allocator, cfg);
     defer client.deinit();
 
-    var m = try client.acquire();
+    var m = try client.acquire(.awaitable);
     try m.setTopic("events");
     m.setPartition(0);
     const dst = m.value();
@@ -1311,7 +1412,7 @@ test "#2 reconnect-on-drop: broker drops first Produce, re-dial + retry succeeds
     const n = 5;
     var handles: [n]Message = undefined;
     for (&handles, 0..) |*m, i| {
-        m.* = try client.acquire();
+        m.* = try client.acquire(.awaitable);
         try m.setTopic("events");
         m.setPartition(0);
         const dst = m.value();
@@ -1343,7 +1444,7 @@ test "#2 reconnect backoff: dead broker is not hammered" {
     var client = try Client.init(testing.allocator, cfg);
     defer client.deinit();
 
-    var m = try client.acquire();
+    var m = try client.acquire(.awaitable);
     try m.setTopic("events");
     m.setPartition(0);
     const dst = m.value();
@@ -1379,7 +1480,7 @@ test "#3 linger batching: small burst coalesces into one Produce request" {
     const n = 10;
     var handles: [n]Message = undefined;
     for (&handles, 0..) |*m, i| {
-        m.* = try client.acquire();
+        m.* = try client.acquire(.awaitable);
         try m.setTopic("events");
         m.setPartition(0);
         const dst = m.value();
@@ -1413,7 +1514,7 @@ test "#3 linger=0: each message drains eagerly (regression)" {
     // Produce 3 messages one at a time, awaiting each before committing the
     // next. With linger=0 and no overlap, each must be its own Produce.
     for (0..3) |i| {
-        var m = try client.acquire();
+        var m = try client.acquire(.awaitable);
         try m.setTopic("events");
         m.setPartition(0);
         const dst = m.value();
@@ -1455,7 +1556,7 @@ test "#3 no over-linger under load: full batch drains immediately" {
     // Wait for the producer to be ready (PID acquired, metadata loaded) by
     // producing a warmup message. This ensures the TLS handshake + SCRAM +
     // metadata are done before we start timing.
-    var warmup = try client.acquire();
+    var warmup = try client.acquire(.awaitable);
     try warmup.setTopic("events");
     warmup.setPartition(0);
     try warmup.writeMessage("warmup");
@@ -1468,7 +1569,7 @@ test "#3 no over-linger under load: full batch drains immediately" {
     const n = 15;
     var handles: [n]Message = undefined;
     for (&handles, 0..) |*m, i| {
-        m.* = try client.acquire();
+        m.* = try client.acquire(.awaitable);
         try m.setTopic("events");
         m.setPartition(0);
         const dst = m.value();
@@ -1508,7 +1609,7 @@ test "#3 periodic metadata refresh: increments without errors" {
     defer client.deinit();
 
     // Produce one message to trigger the initial metadata load.
-    var m1 = try client.acquire();
+    var m1 = try client.acquire(.awaitable);
     try m1.setTopic("events");
     m1.setPartition(0);
     const dst = m1.value();
@@ -1523,7 +1624,7 @@ test "#3 periodic metadata refresh: increments without errors" {
     std.Thread.sleep(350 * std.time.ns_per_ms);
 
     // Produce another message to trigger a drain (which checks metadata age).
-    var m2 = try client.acquire();
+    var m2 = try client.acquire(.awaitable);
     try m2.setTopic("events");
     m2.setPartition(0);
     const dst2 = m2.value();
@@ -1551,7 +1652,7 @@ test "#3 periodic metadata refresh: large max_age = no proactive refresh" {
 
     // Produce two messages with a gap between them. Only the initial metadata
     // load should fire (no error-triggered or periodic refresh).
-    var m1 = try client.acquire();
+    var m1 = try client.acquire(.awaitable);
     try m1.setTopic("events");
     m1.setPartition(0);
     const dst = m1.value();
@@ -1563,7 +1664,7 @@ test "#3 periodic metadata refresh: large max_age = no proactive refresh" {
 
     std.Thread.sleep(100 * std.time.ns_per_ms);
 
-    var m2 = try client.acquire();
+    var m2 = try client.acquire(.awaitable);
     try m2.setTopic("events");
     m2.setPartition(0);
     const dst2 = m2.value();
@@ -1605,7 +1706,7 @@ test "#3 silent leader change: producer routes to new leader after refresh" {
     defer client.deinit();
 
     // Produce to node 1 (the initial leader).
-    var m1 = try client.acquire();
+    var m1 = try client.acquire(.awaitable);
     try m1.setTopic("events");
     m1.setPartition(0);
     const dst1 = m1.value();
@@ -1624,7 +1725,7 @@ test "#3 silent leader change: producer routes to new leader after refresh" {
     std.Thread.sleep(250 * std.time.ns_per_ms);
 
     // Produce again — should succeed with the new leader (node 2).
-    var m2 = try client.acquire();
+    var m2 = try client.acquire(.awaitable);
     try m2.setTopic("events");
     m2.setPartition(0);
     const dst2 = m2.value();
@@ -1662,7 +1763,7 @@ test "#4 graceful drain: in-flight records are all acked before shutdown" {
 
     const n = 20;
     for (0..n) |i| {
-        var m = try client.acquire();
+        var m = try client.acquire(.awaitable);
         try m.setTopic("events");
         m.setPartition(@intCast(i % 4));
         const dst = m.value();
@@ -1705,7 +1806,7 @@ test "#4 drain timeout: deinit returns in bounded time, no hang" {
 
     const n = 5;
     for (0..n) |i| {
-        var m = try client.acquire();
+        var m = try client.acquire(.awaitable);
         try m.setTopic("events");
         m.setPartition(0);
         const dst = m.value();
@@ -1747,7 +1848,7 @@ test "#4 no new acquires during drain: acquire returns Shutdown" {
     // Produce one message — the broker gates on the first Produce, so the
     // network thread is blocked in readResponse. We never await it (see below),
     // so the token is const.
-    const m = try client.acquire();
+    const m = try client.acquire(.awaitable);
     try m.setTopic("events");
     m.setPartition(0);
     const dst = m.value();
@@ -1775,7 +1876,7 @@ test "#4 no new acquires during drain: acquire returns Shutdown" {
     // parked in thread.join() (the network thread is stuck in the gated
     // readResponse), so the ring is NOT yet freed — the free only happens in
     // phase 2, after join returns, which cannot happen until we openGate below.
-    try testing.expectError(error.Shutdown, client.tryAcquire());
+    try testing.expectError(error.Shutdown, client.tryAcquire(.awaitable));
 
     // Release the gate so the broker acks the Produce, the network thread
     // finishes the drain and exits, join returns, and deinit frees the ring.
@@ -1811,7 +1912,7 @@ test "#5 sticky: keyless burst coalesces to one partition with default partition
     const n = 10;
     var handles: [n]Message = undefined;
     for (&handles, 0..) |*m, i| {
-        m.* = try client.acquire();
+        m.* = try client.acquire(.awaitable);
         try m.setTopic("events");
         m.setPartition(null); // let the partitioner decide → sticky
         const dst = m.value();
@@ -1849,7 +1950,7 @@ test "#5 sticky: round_robin spreads keyless records across partitions (regressi
     const n = 8;
     var handles: [n]Message = undefined;
     for (&handles, 0..) |*m, i| {
-        m.* = try client.acquire();
+        m.* = try client.acquire(.awaitable);
         try m.setTopic("events");
         m.setPartition(null);
         const dst = m.value();
@@ -1895,7 +1996,7 @@ test "#5 sticky: keyed records use key-hash with default partitioner" {
     const n = 5;
     var handles: [n]Message = undefined;
     for (&handles, 0..) |*m, i| {
-        m.* = try client.acquire();
+        m.* = try client.acquire(.awaitable);
         try m.setTopic("events");
         try m.setKey(key);
         m.setPartition(null);
@@ -1936,7 +2037,7 @@ test "#5 sticky: partition rotates between successive drains" {
     const n1 = 3;
     var h1: [n1]Message = undefined;
     for (&h1, 0..) |*m, i| {
-        m.* = try client.acquire();
+        m.* = try client.acquire(.awaitable);
         try m.setTopic("events");
         m.setPartition(null);
         const dst = m.value();
@@ -1954,7 +2055,7 @@ test "#5 sticky: partition rotates between successive drains" {
     const n2 = 3;
     var h2: [n2]Message = undefined;
     for (&h2, 0..) |*m, i| {
-        m.* = try client.acquire();
+        m.* = try client.acquire(.awaitable);
         try m.setTopic("events");
         m.setPartition(null);
         const dst = m.value();
@@ -1989,7 +2090,7 @@ test "#7 stats: messages_produced, bytes_produced, messages_acked after all acks
     var handles: [n]Message = undefined;
     var total_bytes: u64 = 0;
     for (&handles, 0..) |*m, i| {
-        m.* = try client.acquire();
+        m.* = try client.acquire(.awaitable);
         try m.setTopic("events");
         m.setPartition(null);
         const dst = m.value();
@@ -2024,7 +2125,7 @@ test "#7 stats: fatal errors counted on non-retriable failure" {
     var client = try Client.init(testing.allocator, testConfig(&bootstrap));
     defer client.deinit();
 
-    var m = try client.acquire();
+    var m = try client.acquire(.awaitable);
     try m.setTopic("events");
     m.setPartition(0);
     const dst = m.value();
@@ -2061,7 +2162,7 @@ test "#7 stats: queue_depth reflects pending slots before drain" {
     const n: u32 = 5;
     var handles: [n]Message = undefined;
     for (&handles, 0..) |*m, i| {
-        m.* = try client.acquire();
+        m.* = try client.acquire(.awaitable);
         try m.setTopic("events");
         m.setPartition(0);
         const dst = m.value();
@@ -2111,7 +2212,7 @@ test "#7 stats: retriable errors and connection_drops counted" {
     const n: u32 = 3;
     var handles: [n]Message = undefined;
     for (&handles, 0..) |*m, i| {
-        m.* = try client.acquire();
+        m.* = try client.acquire(.awaitable);
         try m.setTopic("events");
         m.setPartition(0);
         const dst = m.value();

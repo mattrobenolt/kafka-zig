@@ -229,7 +229,7 @@ fn runBench(
 
         // Acquire + fill + commit all messages in this wave.
         for (0..this_wave) |i| {
-            handles[i] = try client.acquire();
+            handles[i] = try client.acquire(.awaitable);
             try handles[i].setTopic("events");
             handles[i].setPartition(null);
             const dst = handles[i].value();
