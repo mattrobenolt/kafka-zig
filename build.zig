@@ -27,10 +27,22 @@ pub fn build(b: *Build) void {
     });
 
     // --- ztls dependency ---
+    // The crypto-backend option selects which libcrypto family ztls compiles
+    // against. The default is "openssl" which includes <openssl/core.h>
+    // (the OpenSSL 3.x provider API). AWS-LC does not ship core.h, so when
+    // building against AWS-LC (as exosphere-zig does in its nix shell), set
+    // crypto-backend=aws-lc to skip the provider API headers.
+    const crypto_backend_str = b.option(
+        []const u8,
+        "crypto_backend",
+        "libcrypto-family backend for ztls: openssl, aws-lc, boringssl",
+    ) orelse if (b.graph.env_map.get("ZTLS_CRYPTO_BACKEND")) |env| env else "openssl";
     const ztls_dep = b.dependency("ztls", .{
         .target = target,
         .optimize = optimize,
+        .@"crypto-backend" = crypto_backend_str,
     });
+    const ztls_mod = ztls_dep.module("ztls");
 
     // --- benchmark dependency ---
     const benchmark_dep = b.dependency("benchmark", .{
@@ -46,7 +58,7 @@ pub fn build(b: *Build) void {
     });
     kafka_mod.addImport("scram", scram_mod);
     kafka_mod.addImport("snappy", snappy_mod);
-    kafka_mod.addImport("ztls", ztls_dep.module("ztls"));
+    kafka_mod.addImport("ztls", ztls_mod);
     kafka_mod.addOptions("build_options", build_options);
 
     if (zstd) {
