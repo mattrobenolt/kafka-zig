@@ -20,8 +20,7 @@ Load these before writing Zig. They are non-negotiable context, not optional rea
 - **tiger-style**: safety (useful assertions, bounded control flow, 70-line functions) and performance (extract hot loops, batch) rules. Apply when writing or restructuring code.
 
 # Before editing
-- Read `PLAN.md` — it is the source of truth for architecture, pinned Kafka API versions, the ring lifecycle, compression ordering, and the phased acceptance ladder. The slice you are given maps to a phase or sub-phase.
-- Identify the exact scope, expected files, validation commands, and which plan section governs the work.
+- Identify the exact scope, expected files, validation commands, and which code governs the work.
 - If the task lacks a concrete acceptance contract (files, behavior, validation command, done-condition), stop and ask for one. Do not improvise scope.
 
 Implementation rules:

@@ -29,7 +29,7 @@ You are not a tiebreaker. You are an adversary to both reviews. Apply independen
 git diff main...HEAD
 ```
 
-Fall back to `git diff HEAD` if that returns nothing. Read source files and `PLAN.md` as needed to verify specific findings against the plan's invariants.
+Fall back to `git diff HEAD` if that returns nothing. Read source files as needed to verify specific findings against the codebase's invariants.
 
 # kafka-zig invariants to apply
 

@@ -18,7 +18,7 @@ Run two independent implementation reviews in parallel, then pass both to an adv
 
 ## Step 1: Spawn parallel reviewers
 
-Launch both in a **single message** so they run concurrently. Use the **`implementation-reviewer`** agent (kafka-zig-specific: protocol byte-exactness, ring invariants, SCRAM, sans-I/O discipline) with model overrides. Pass the task description through verbatim, including the slice scope, the files changed, and the `PLAN.md` section that governs the slice.
+Launch both in a **single message** so they run concurrently. Use the **`implementation-reviewer`** agent (kafka-zig-specific: protocol byte-exactness, ring invariants, SCRAM, sans-I/O discipline) with model overrides. Pass the task description through verbatim, including the slice scope, the files changed, and the relevant context.
 
 **`implementation-reviewer` agent, model override `anthropic/claude-opus-4-8`, thinking `high`:**
 > <forward the original task here>
@@ -46,7 +46,7 @@ Once both complete, spawn the **`reviewer-second-opinion`** agent with this prom
 >
 > ---
 >
-> Challenge both. Consolidate into a single authoritative verdict. Apply kafka-zig invariants from `PLAN.md`: pinned API keys/versions (SaslAuthenticate is key 36), flexible-version encoding, record-batch sentinels, SCRAM username requirement, ring ack-before-reclaim + stable-handle + completion-signaling, sans-I/O no-hot-path-alloc, and the one-allowed-copy rule on the produce path.
+> Challenge both. Consolidate into a single authoritative verdict. Apply kafka-zig invariants: pinned API keys/versions (SaslAuthenticate is key 36), flexible-version encoding, record-batch sentinels, SCRAM username requirement, ring ack-before-reclaim + stable-handle + completion-signaling, sans-I/O no-hot-path-alloc, and the one-allowed-copy rule on the produce path.
 
 ## Step 3: Output
 
