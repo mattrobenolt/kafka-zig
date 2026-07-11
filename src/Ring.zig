@@ -229,6 +229,42 @@ pub const Message = struct {
         try self.ring.commit(self.slot_index, value_len);
     }
 
+    /// Release an acquired-but-uncommitted slot without publishing it. The
+    /// slot is marked `status_stale` so `reclaim` advances over it (reclaim
+    /// already handles stale slots — it bumps generation and frees) instead of
+    /// stalling `read_head` behind a phantom `status_free` slot. For
+    /// `.awaitable` mode the pooled handle is returned to the free list so the
+    /// handle pool doesn't leak. This is the fire-and-forget equivalent of "I
+    /// changed my mind, put the slot back" — the use case is a `tryAcquire`
+    /// that succeeds but then loses its payload (e.g. `setTopic` or the encode
+    /// into `value()` fails) before `commit` (issue #19).
+    ///
+    /// Safe to call on an already-committed or already-cancelled message
+    /// (no-op): once a slot is past `status_free` it belongs to the network
+    /// thread or is already recycled, and a status check gates the store.
+    /// Takes `*Message` because it clears `handle_index` to `handle_nil` so an
+    /// accidental `await` on the cancelled token trips the double-await guard
+    /// instead of double-freeing the handle.
+    pub fn cancel(self: *Message) void {
+        const slot = &self.ring.slots[self.slot_index];
+        // Only an acquired-but-uncommitted slot is ours to retract. A
+        // committed slot (status_pending) belongs to the network thread; a
+        // terminal slot (acked/failed/stale) is reclaim's. Acquire-load to
+        // see the commit's release-store.
+        if (slot.status.load(.acquire) != status_free) return;
+        // Return the handle to the pool before marking the slot stale: the
+        // slot is still status_free, so reclaim can't have reached it (reclaim
+        // breaks on status_free), and the handle is unbound from the network
+        // thread's view until commit publishes it — no awaiter can exist.
+        if (self.handle_index != handle_nil) {
+            self.ring.poolFree(self.handle_index);
+            self.handle_index = handle_nil;
+        }
+        // Release: publishes the stale status so the network thread's
+        // reclaim acquire-load sees it and advances.
+        slot.status.store(status_stale, .release);
+    }
+
     /// Block until the broker acks (or fails) this message. Returns
     /// `error.SendFailed` on a non-retriable broker error, `error.Shutdown` if
     /// the ring is torn down first. Takes `*Message` because it caches the
@@ -1934,6 +1970,98 @@ test "fire_and_forget: tryAcquire never blocks on handle exhaustion" {
     try testing.expectEqual(@as(u64, 1), ring.reclaim());
     // Free the leaked awaitable handles so the ring tears down clean.
     for (&msgs) |*m| try m.await();
+}
+
+test "cancel: fire-and-forget slot retracts without commit, reclaim advances past it" {
+    // The core issue #19 scenario: a fire-and-forget acquire succeeds, then
+    // the caller bails before commit (e.g. setTopic/encode failed). Without
+    // cancel the slot stays status_free below write_head and reclaim stalls
+    // on it forever. cancel marks it stale so reclaim recycles it.
+    var ring = try Ring.init(testing.allocator, tinyConfig(4));
+    defer ring.deinit(testing.allocator);
+
+    var leaked = try ring.acquire(.fire_and_forget);
+    try leaked.setTopic("t");
+    // ...something fails; bail without committing.
+    leaked.cancel();
+    try testing.expectEqual(status_stale, ring.slotAt(0).status.load(.acquire));
+
+    // A subsequent slot commits fine and is reclaimable past the cancelled one.
+    var m = try ring.acquire(.fire_and_forget);
+    try m.setTopic("t");
+    try m.commit(1);
+    try testing.expectEqual(status_pending, ring.slotAt(1).status.load(.acquire));
+
+    // reclaim must advance over the stale slot AND the acked one — ring depth
+    // recovers fully, no permanent stall.
+    try testing.expect(ackOne(&ring, 1));
+    try testing.expectEqual(@as(u64, 2), ring.reclaim());
+    try testing.expectEqual(@as(u64, 2), ring.readHead());
+    try testing.expectEqual(status_free, ring.slotAt(0).status.load(.acquire));
+    try testing.expectEqual(status_free, ring.slotAt(1).status.load(.acquire));
+}
+
+test "cancel: awaitable mode returns the handle to the pool" {
+    // cancel on an awaitable slot must poolFree the handle — otherwise every
+    // cancelled awaitable acquire permanently leaks a handle, and the pool
+    // eventually exhausts even though nothing is in flight.
+    var ring = try Ring.init(testing.allocator, tinyConfig(2));
+    defer ring.deinit(testing.allocator);
+
+    var m = try ring.acquire(.awaitable);
+    try testing.expect(m.handle_index != handle_nil);
+    m.cancel();
+    // Handle returned to the pool: an awaitable acquire succeeds immediately.
+    try testing.expectEqual(status_stale, ring.slotAt(0).status.load(.acquire));
+    var m2 = try ring.tryAcquire(.awaitable);
+    try m2.setTopic("t");
+    try m2.commit(1);
+    try testing.expect(ackOne(&ring, 1));
+    try testing.expectEqual(@as(u64, 2), ring.reclaim());
+    ring.wakeCompletions();
+    try m2.await();
+}
+
+test "cancel: is a no-op on an already-committed message" {
+    // commit publishes the slot to the network thread; a later cancel must not
+    // retract it out from under the consumer. The status gate makes it a no-op.
+    var ring = try Ring.init(testing.allocator, tinyConfig(2));
+    defer ring.deinit(testing.allocator);
+
+    var m = try ring.acquire(.fire_and_forget);
+    try m.setTopic("t");
+    try m.commit(1);
+    try testing.expectEqual(status_pending, ring.slotAt(0).status.load(.acquire));
+    m.cancel(); // must not flip a pending slot to stale.
+    try testing.expectEqual(status_pending, ring.slotAt(0).status.load(.acquire));
+    try testing.expect(ackOne(&ring, 0));
+    try testing.expectEqual(@as(u64, 1), ring.reclaim());
+}
+
+test "cancel: double-cancel is a no-op (idempotent)" {
+    var ring = try Ring.init(testing.allocator, tinyConfig(2));
+    defer ring.deinit(testing.allocator);
+
+    var m = try ring.acquire(.fire_and_forget);
+    m.cancel();
+    try testing.expectEqual(status_stale, ring.slotAt(0).status.load(.acquire));
+    m.cancel(); // already stale — no-op, no assert.
+    try testing.expectEqual(status_stale, ring.slotAt(0).status.load(.acquire));
+    try testing.expectEqual(@as(u64, 1), ring.reclaim());
+}
+
+test "cancel: awaitable cancel sets handle_index nil so await trips the guard" {
+    // After cancel, the token is useless. An accidental await must hit the
+    // handle_nil assert rather than double-freeing the (already-returned)
+    // handle. The sentinel is the testable surface, as with the double-await
+    // guard.
+    var ring = try Ring.init(testing.allocator, tinyConfig(2));
+    defer ring.deinit(testing.allocator);
+
+    var m = try ring.acquire(.awaitable);
+    m.cancel();
+    try testing.expectEqual(handle_nil, m.handle_index);
+    try testing.expectEqual(@as(u64, 1), ring.reclaim());
 }
 
 test {
